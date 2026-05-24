@@ -70,6 +70,14 @@ function loadGlobalProvider(): ProviderConfig {
   return getDefaultProviderConfig();
 }
 
+function formatEvent(ev: { type: string; source?: string; username?: string; message?: string; health?: number }): string {
+  if (ev.type === 'chat') return `[${ev.source || 'bot'}] ${ev.username || '?'}: ${ev.message || ''}`;
+  if (ev.type === 'health') return `[${ev.source || 'bot'}] 血量: ${ev.health}`;
+  if (ev.type === 'playerJoin') return `[${ev.source || 'bot'}] ${ev.username || '?'} 加入了游戏`;
+  if (ev.type === 'playerLeave') return `[${ev.source || 'bot'}] ${ev.username || '?'} 离开了游戏`;
+  return `[${ev.source || 'bot'}] ${ev.type}`;
+}
+
 export default function Conversations() {
   const navigate = useNavigate();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -93,6 +101,83 @@ export default function Conversations() {
   const [eventSources, setEventSources] = useState<EventSourceConfig[]>([]);
   const [subbedSources, setSubbedSources] = useState<string[]>([]);
   const [showEventToggles, setShowEventToggles] = useState(false);
+  const autoReplyRef = useRef<((eventText: string) => Promise<void>) | null>(null);
+  const persistRef = useRef<((msgs: ChatMessage[], sid: string | null) => string) | null>(null);
+
+  // 自动回复
+  const doAutoReply = useCallback(async (eventText: string) => {
+    if (!currentAgent || isStreaming || !activeSessionId) return;
+
+    const agent = currentAgent;
+    const currentMsgs = messages;
+    const prov = { ...loadGlobalProvider() };
+    if (agent.providerOverrides) Object.assign(prov, agent.providerOverrides);
+
+    setIsStreaming(true);
+    const eventMsg: ChatMessage = { role: 'user', content: eventText, timestamp: Date.now() };
+    const newMsgs = [...currentMsgs, eventMsg];
+    setMessages(newMsgs);
+    setStreamThinking('');
+    setStreamText('');
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: newMsgs.map(m => ({ role: m.role, content: m.content })),
+          systemPrompt: agent.systemPrompt || undefined,
+          provider: prov,
+          tools: (() => {
+            if (!agent?.tools?.length) return undefined;
+            const customs = initCustomTools();
+            const BUILTIN_SCHEMAS: Record<string, Record<string, unknown>> = {
+              Read: { file_path: 'string' }, Write: { file_path: 'string', content: 'string' },
+              Edit: { file_path: 'string', old_string: 'string', new_string: 'string' },
+              Bash: { command: 'string' }, Grep: { pattern: 'string' }, Glob: { pattern: 'string' },
+              WebSearch: { query: 'string' }, WebFetch: { url: 'string', prompt: 'string' },
+            };
+            return agent.tools.map(t => {
+              const custom = customs.find(c => c.name === t);
+              if (custom) return { name: t, description: custom.description, input_schema: custom.inputSchema };
+              const schema = BUILTIN_SCHEMAS[t];
+              if (schema) return { name: t, description: t, input_schema: schema };
+              return { name: t, description: t, input_schema: {} };
+            });
+          })(),
+        }),
+      });
+
+      if (res.ok) {
+        const reader = res.body?.getReader(); if (!reader) { setIsStreaming(false); return; }
+        const dec = new TextDecoder(); let buf = ''; let thinking = ''; let text = '';
+        while (true) {
+          const { done, value } = await reader.read(); if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n'); buf = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const d = JSON.parse(line.slice(6));
+              if (d.type === 'delta') {
+                if (d.thinking) { thinking += d.text || ''; setStreamThinking(thinking); }
+                else { text += d.text || ''; setStreamText(text); }
+              } else if (d.type === 'result') {
+                const content = d.text || text || thinking || '';
+                const respMsg: ChatMessage = { role: 'assistant', content, timestamp: Date.now() };
+                const finalMsgs = [...newMsgs, respMsg];
+                setMessages(finalMsgs);
+                setStreamThinking(''); setStreamText('');
+                const sid = persistRef.current?.(finalMsgs, activeSessionId) || '';
+                if (sid) { setActiveSessionId(sid); setSessions(loadSessions()); }
+              }
+            } catch {}
+          }
+        }
+      }
+    } catch {}
+    setIsStreaming(false);
+  }, [currentAgent, isStreaming, activeSessionId, messages]);
 
   // 订阅 EventSource — 当 MCP 服务器部署后，自动桥接 bot 事件到当前会话
   useEffect(() => {
@@ -124,7 +209,12 @@ export default function Conversations() {
         try {
           const data = JSON.parse(e.data);
           if (data.type === 'connected') return;
-          setBotEvents(prev => [...prev.slice(-50), { ...data, timestamp: Date.now() }]);
+          const ev = { ...data, timestamp: Date.now() };
+          setBotEvents(prev => [...prev.slice(-50), ev]);
+          // 事件自动触发 agent 回复
+          if (!isStreaming && currentAgent) {
+            doAutoReply(formatEvent(ev));
+          }
         } catch {}
       };
       evtSource.onerror = () => { /* 自动重连 */ };
@@ -190,6 +280,9 @@ export default function Conversations() {
     saveSessions(updated);
     return id;
   }, [selectedAgentId, currentAgent]);
+
+  // 把 persistSession 存到 ref 供 doAutoReply 使用
+  persistRef.current = persistSession;
 
   // 新建对话
   const handleNew = () => {
