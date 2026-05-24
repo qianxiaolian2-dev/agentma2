@@ -28,7 +28,7 @@ function newTemplate(): AgentTemplate {
   return {
     id: '', name: '', description: '', systemPrompt: '',
     model: 'deepseek-v4-pro[1m]', tools: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'],
-    mcpServers: [], skills: [],
+    mcpServers: [], eventSources: [], skills: [],
     effort: 'high', maxTurns: 50, permissionMode: 'default',
     providerOverrides: {},
     createdAt: Date.now(), updatedAt: Date.now(),
@@ -53,6 +53,12 @@ export default function Agents() {
   // 动态加载技能和 MCP 服务器（非写死）
   const [liveSkills] = useState<SkillInfo[]>(loadSkills);
   const [liveMcp] = useState<{ name: string }[]>(loadMcpServers);
+  const [liveEventSources, setLiveEventSources] = useState<Array<{ name: string; type: string; url: string; enabled: boolean }>>([]);
+
+  useEffect(() => {
+    fetch('/api/events/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'list' }) })
+      .then(r => r.json()).then(data => { if (Array.isArray(data)) setLiveEventSources(data); }).catch(() => {});
+  }, []);
   const [liveCustomTools, setLiveCustomTools] = useState<RegisteredTool[]>(() => initCustomTools());
 
   // 每次页面可见时刷新自定义工具
@@ -117,6 +123,15 @@ export default function Agents() {
       mcpServers: prev.mcpServers.includes(srv)
         ? prev.mcpServers.filter(s => s !== srv)
         : [...prev.mcpServers, srv],
+    }));
+  };
+
+  const toggleEventSource = (name: string) => {
+    setForm(prev => ({
+      ...prev,
+      eventSources: (prev.eventSources || []).includes(name)
+        ? (prev.eventSources || []).filter(s => s !== name)
+        : [...(prev.eventSources || []), name],
     }));
   };
 
@@ -452,6 +467,35 @@ export default function Agents() {
                 )}
               </div>
             </div>
+
+            {/* 事件订阅 (EventSource) */}
+            {liveEventSources.length > 0 && (
+              <div className="form-group">
+                <label>📡 事件订阅 (EventSource) · 已选 {(form.eventSources || []).length} 个</label>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                  {liveEventSources.map(es => (
+                    <label
+                      key={es.name}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 4,
+                        padding: '3px 8px', borderRadius: 4, fontSize: '.76em', cursor: 'pointer',
+                        background: (form.eventSources || []).includes(es.name) ? 'var(--accent-bg)' : 'var(--bg-hover)',
+                        color: (form.eventSources || []).includes(es.name) ? 'var(--accent)' : 'var(--ink-secondary)',
+                        border: `1px solid ${(form.eventSources || []).includes(es.name) ? 'var(--accent)' : 'transparent'}`,
+                      }}
+                    >
+                      <input type="checkbox" checked={(form.eventSources || []).includes(es.name)}
+                        onChange={() => toggleEventSource(es.name)} style={{ width: 'auto', margin: 0 }} />
+                      📡 {es.name}
+                      <span style={{ opacity: .5, fontSize: '.9em' }}>({es.type})</span>
+                    </label>
+                  ))}
+                </div>
+                <div style={{ fontSize: '.7em', color: 'var(--ink-muted)', marginTop: 4 }}>
+                  勾选后，该 Agent 的会话将实时接收事件推送
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>

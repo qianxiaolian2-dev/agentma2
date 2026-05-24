@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { BuiltInTool, RegisteredTool, ToolEndpoint } from '../simulator/types';
-import { BUILT_IN_TOOLS, initCustomTools, saveCustomTools, genMinecraftServerCode } from '../simulator/mock-data';
+import { BUILT_IN_TOOLS, initCustomTools, saveCustomTools } from '../simulator/mock-data';
 import JsonViewer from '../components/common/JsonViewer';
 import { McpServerCard } from '../components/McpServerManager';
 
@@ -142,7 +142,7 @@ export default function Tools() {
             const st = customTools.filter(t => t.mcpServer === srv);
             const ep = st.filter(t => t.endpoint);
             const port = ep[0]?.endpoint?.url ? new URL(ep[0].endpoint.url).port || '3005' : '3005';
-            return <McpServerCard key={srv} server={srv} tools={st} code={genMinecraftServerCode(srv, port)} />;
+            return <McpServerCard key={srv} server={srv} tools={st} />;
           })}
         </div>
       )}

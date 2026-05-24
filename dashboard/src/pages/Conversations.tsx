@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig } from '../simulator/types';
 import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-data';
+import type { EventSourceConfig } from '../simulator/types';
 
 // MCP 服务状态指示灯（自动 ping 端点）
 function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }) {
@@ -86,6 +87,44 @@ export default function Conversations() {
   const sidebarRef = useRef<HTMLDivElement>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(loadGlobalProvider());
+  const currentAgent = templates.find(t => t.id === selectedAgentId);
+
+  const [botEvents, setBotEvents] = useState<Array<{ type: string; source?: string; username?: string; message?: string; timestamp: number }>>([]);
+
+  // 订阅 EventSource — 当 MCP 服务器部署后，自动桥接 bot 事件到当前会话
+  useEffect(() => {
+    if (!activeSessionId) return;
+    const sid = activeSessionId;
+
+    const setup = async () => {
+      // 1. 获取已注册的事件源
+      const srcRes = await fetch('/api/events/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'list' }) });
+      const sources: EventSourceConfig[] = await srcRes.json().catch(() => []);
+      if (!Array.isArray(sources) || sources.length === 0) return;
+
+      // 2. 订阅会话到 Agent 配置的事件源
+      const agentSources = currentAgent?.eventSources || [];
+      for (const s of sources) {
+        if (!s.enabled || !agentSources.includes(s.name)) continue;
+        fetch(`/api/sessions/${sid}/events/subscribe`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceName: s.name }) }).catch(() => {});
+      }
+
+      // 3. 连接 SSE 事件流
+      const evtSource = new EventSource(`/api/sessions/${sid}/events`);
+      evtSource.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.type === 'connected') return;
+          setBotEvents(prev => [...prev.slice(-50), { ...data, timestamp: Date.now() }]);
+        } catch {}
+      };
+      evtSource.onerror = () => { /* 自动重连 */ };
+      return () => evtSource.close();
+    };
+
+    const cleanup = setup();
+    return () => { cleanup.then(fn => fn?.()); };
+  }, [activeSessionId, currentAgent]);
 
   // 加载数据
   // 锁定外层滚动，让内部区域各自独立滚动
@@ -109,9 +148,6 @@ export default function Conversations() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, streamThinking, streamText]);
-
-  // 获取当前选中的 Agent
-  const currentAgent = templates.find(t => t.id === selectedAgentId);
 
   // 保存会话 (同时写入 localStorage + 更新本地 state)
   const persistSession = useCallback((msgs: ChatMessage[], sid: string | null) => {
@@ -486,6 +522,26 @@ export default function Conversations() {
 
             {/* 消息列表 */}
             <div style={{ flex: 1, overflowY: 'auto', padding: '16px 24px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {/* Bot 实时事件 */}
+              {activeSessionId && (
+                <details style={{ fontSize: '.78em' }}>
+                  <summary style={{ color: botEvents.length > 0 ? 'var(--success)' : 'var(--ink-muted)', cursor: 'pointer' }}>📡 实时事件 ({botEvents.length})</summary>
+                  <div style={{ maxHeight: 200, overflowY: 'auto', marginTop: 4 }}>
+                    {botEvents.length === 0 && <div style={{ color: 'var(--ink-muted)', padding: 4 }}>等待 Minecraft 事件...</div>}
+                    {botEvents.slice(-20).reverse().map((ev, i) => (
+                      <div key={i} className="chat-msg thinking" style={{ marginBottom: 4, padding: '4px 10px' }}>
+                        <span className="badge badge-muted">{ev.source}</span>{' '}
+                        {ev.type === 'chat' ? <><b>{ev.username}</b>: {ev.message}</>
+                        : ev.type === 'playerJoin' ? <>{ev.username} 加入了</>
+                        : ev.type === 'playerLeave' ? <>{ev.username} 离开了</>
+                        : ev.type === 'health' ? <>血量 {ev.health}</>
+                        : <>{ev.type}</>}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              )}
+
               {messages.length === 0 && !isStreaming && (
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--ink-muted)' }}>
                   <div style={{ textAlign: 'center' }}>

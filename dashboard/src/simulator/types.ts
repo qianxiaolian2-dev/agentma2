@@ -386,6 +386,7 @@ export interface AgentTemplate {
   model: string;
   tools: string[];
   mcpServers: string[];
+  eventSources: string[];
   skills: string[];
   effort: EffortLevel;
   maxTurns: number;
@@ -430,6 +431,14 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: number;
+}
+
+// --- EventSource (事件源，和 MCP Server 同级抽象) ---
+export interface EventSourceConfig {
+  name: string;
+  type: 'ws';  // 未来可扩展: sse, polling
+  url: string;  // ws://host:port
+  enabled: boolean;
 }
 
 // --- 聊天会话 ---
