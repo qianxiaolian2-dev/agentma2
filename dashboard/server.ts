@@ -50,12 +50,28 @@ app.post('/api/deploy', async (req, res) => {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, code);
 
+    // 初始化 package.json 并安装依赖
+    if (code.includes('require(\'mineflayer\')')) {
+      const pkgJson = { name: `mcp-${server}`, version: '1.0.0', private: true };
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify(pkgJson, null, 2));
+      try {
+        console.log(`[deploy] npm install mineflayer mineflayer-pathfinder in ${dir} ...`);
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn('npm', ['install', 'mineflayer', 'mineflayer-pathfinder'], { cwd: dir, stdio: 'pipe' });
+          child.on('close', code => code === 0 ? resolve() : reject(new Error(`npm exit ${code}`)));
+          child.on('error', reject);
+        });
+        console.log(`[deploy] npm install done`);
+      } catch (e) { console.log(`[deploy] npm install warning: ${(e as Error).message}`); }
+    }
+
+    // 杀掉旧进程
     try { const pid = fs.readFileSync(path.join(dir, 'pid'), 'utf-8'); process.kill(Number(pid)); } catch {}
+
     const proc = spawn('node', [file], { cwd: dir, detached: true, stdio: 'ignore' });
     proc.unref();
     fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
 
-    // 保存工具元数据供后续查询
     if (deployTools) fs.writeFileSync('/tmp/agentma_custom_tools.json', JSON.stringify(deployTools));
 
     console.log(`[deploy] ${server} pid=${proc.pid}`);
