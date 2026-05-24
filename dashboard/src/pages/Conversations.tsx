@@ -90,6 +90,9 @@ export default function Conversations() {
   const currentAgent = templates.find(t => t.id === selectedAgentId);
 
   const [botEvents, setBotEvents] = useState<Array<{ type: string; source?: string; username?: string; message?: string; timestamp: number }>>([]);
+  const [eventSources, setEventSources] = useState<EventSourceConfig[]>([]);
+  const [subbedSources, setSubbedSources] = useState<string[]>([]);
+  const [showEventToggles, setShowEventToggles] = useState(false);
 
   // 订阅 EventSource — 当 MCP 服务器部署后，自动桥接 bot 事件到当前会话
   useEffect(() => {
@@ -102,10 +105,16 @@ export default function Conversations() {
       const sources: EventSourceConfig[] = await srcRes.json().catch(() => []);
       if (!Array.isArray(sources) || sources.length === 0) return;
 
-      // 2. 订阅会话到 Agent 配置的事件源
-      const agentSources = currentAgent?.eventSources || [];
+      // 首次打开自动订阅所有可用源，后续以用户手动选择为准
+      const savedSubs: string[] = (() => { try { const r = localStorage.getItem(`session_subs_${sid}`); return r ? JSON.parse(r) : sources.map((s: EventSourceConfig) => s.name); } catch { return sources.map((s: EventSourceConfig) => s.name); } })();
+      if (!localStorage.getItem(`session_subs_${sid}`)) {
+        localStorage.setItem(`session_subs_${sid}`, JSON.stringify(savedSubs));
+      }
+      setEventSources(sources);
+      setSubbedSources(savedSubs);
+
       for (const s of sources) {
-        if (!s.enabled || !agentSources.includes(s.name)) continue;
+        if (!s.enabled || !savedSubs.includes(s.name)) continue;
         fetch(`/api/sessions/${sid}/events/subscribe`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceName: s.name }) }).catch(() => {});
       }
 
@@ -516,6 +525,30 @@ export default function Conversations() {
                     </>
                   );
                 })()}
+                {/* 事件源开关（会话级） */}
+                {eventSources.length > 0 && (
+                  <span style={{ position: 'relative' }}>
+                    <span className="badge" style={{ cursor: 'pointer', background: subbedSources.length > 0 ? 'var(--success-bg)' : 'var(--bg-hover)', color: subbedSources.length > 0 ? 'var(--success)' : 'var(--ink-muted)', userSelect: 'none' }}
+                      onClick={() => setShowEventToggles(!showEventToggles)}>
+                      📡 {subbedSources.length > 0 ? subbedSources.length : '0'}
+                    </span>
+                    {showEventToggles && (
+                      <div className="fade-in" style={{ position: 'absolute', top: 24, left: 0, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, padding: '6px 10px', zIndex: 20, minWidth: 160, boxShadow: '0 4px 12px rgba(0,0,0,.15)' }}>
+                        {eventSources.map(es => (
+                          <label key={es.name} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0', fontSize: '.8em', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+                            <input type="checkbox" checked={subbedSources.includes(es.name)} onChange={() => {
+                              const next = subbedSources.includes(es.name) ? subbedSources.filter(s => s !== es.name) : [...subbedSources, es.name];
+                              setSubbedSources(next);
+                              localStorage.setItem(`session_subs_${activeSessionId}`, JSON.stringify(next));
+                              fetch(`/api/sessions/${activeSessionId}/events/subscribe`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sourceName: es.name }) }).catch(() => {});
+                            }} style={{ width: 'auto', margin: 0 }} />
+                            📡 {es.name}
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </span>
+                )}
               </div>
               <button className="btn btn-sm" onClick={() => navigate('/agents')}>Agent 市场</button>
             </div>

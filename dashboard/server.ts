@@ -42,7 +42,11 @@ app.get('/api/sessions/:id/events', (req, res) => {
   if (!sessionSSE.has(req.params.id)) sessionSSE.set(req.params.id, new Set());
   sessionSSE.get(req.params.id)!.add(res);
   res.write(`data: ${JSON.stringify({ type: 'connected', sessionId: req.params.id })}\n\n`);
-  req.on('close', () => sessionSSE.get(req.params.id)?.delete(res));
+  console.log(`[sse] session ${req.params.id.slice(0,8)} connected (${sessionSSE.get(req.params.id)!.size} clients)`);
+  req.on('close', () => {
+    sessionSSE.get(req.params.id)?.delete(res);
+    console.log(`[sse] session ${req.params.id.slice(0,8)} disconnected`);
+  });
 });
 
 function pushToSession(sid: string, data: object) {
@@ -61,7 +65,11 @@ async function startBridge(name: string) {
         ws.on('message', (raw: Buffer) => {
           try {
             const ev = JSON.parse(raw.toString());
-            for (const [sid, subs] of sessionSubs) { if (subs.has(name)) pushToSession(sid, { ...ev, source: name }); }
+            let count = 0;
+            for (const [sid, subs] of sessionSubs) {
+              if (subs.has(name)) { pushToSession(sid, { ...ev, source: name }); count++; }
+            }
+            if (count > 0) console.log(`[bridge] ${name} → ${count} sessions, ev=${ev.type}`);
           } catch {}
         });
         ws.on('close', () => setTimeout(connect, 5000));
