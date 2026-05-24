@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>agentma — logo exploration</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link
+  href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600;700&family=Permanent+Marker&family=Rock+Salt&family=Schoolbell&family=Architects+Daughter&family=Gloock&family=JetBrains+Mono:wght@400;500;700&display=swap"
+  rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #efece5; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  /* Make sure design-canvas chrome looks at home. */
+  #root { width: 100vw; height: 100vh; }
+</style>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script src="agentma-paths.js"></script>
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="character.jsx"></script>
+<script type="text/babel" src="logos.jsx"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+  const { DesignCanvas, DCSection, DCArtboard, DCPostIt } = window;
+
+  function App() {
+    const logos = window.LOGOS;
+    // group logos visually
+    const groups = [
+      {
+        id: 'primary',
+        title: 'Primary lockups',
+        subtitle: 'Faithful to the napkin — horizontal & stacked, day and night.',
+        ids: ['napkin', 'darkmode', 'banner', 'stacked'],
+      },
+      {
+        id: 'remix',
+        title: 'Remixes & moods',
+        subtitle: 'Same creature, different rooms.',
+        ids: ['pumpkin', 'sticker', 'tombstone', 'monogram'],
+      },
+      {
+        id: 'system',
+        title: 'System pieces',
+        subtitle: 'Where the brand has to compress: badges, icons, receipts, and a deliberately-crisp counterpoint.',
+        ids: ['seal', 'appicon', 'receipt', 'tech'],
+      },
+    ];
+
+    const byId = Object.fromEntries(logos.map(l => [l.id, l]));
+
+    return (
+      <DesignCanvas>
+        <DCPostIt x={40} y={20} rotate={-2}>
+          {`agentma logo exploration\n\n12 variations on one rule:\nthe sketch lines are immutable.\nEverything else is fair game —\ncolor, framing, type, posture.`}
+        </DCPostIt>
+
+        {groups.map(g => (
+          <DCSection key={g.id} id={g.id} title={g.title} subtitle={g.subtitle}>
+            {g.ids.map(id => {
+              const L = byId[id];
+              const C = L.comp;
+              return (
+                <DCArtboard key={id} id={id} label={L.label} width={L.w} height={L.h}>
+                  <C />
+                </DCArtboard>
+              );
+            })}
+          </DCSection>
+        ))}
+      </DesignCanvas>
+    );
+  }
+
+  // Render after fonts have a chance to load so first paint isn't a fallback.
+  const root = ReactDOM.createRoot(document.getElementById('root'));
+  const start = () => root.render(<App/>);
+  if (document.fonts && document.fonts.ready) {
+    Promise.race([document.fonts.ready, new Promise(r => setTimeout(r, 1500))]).then(start);
+  } else {
+    start();
+  }
+</script>
+</body>
+</html>

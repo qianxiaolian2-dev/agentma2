@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>404 · agentma</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" type="image/svg+xml" href="favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;700&family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --bg: #f4f0e6;
+    --paper: #ece6d7;
+    --ink: #2a1410;
+    --ink-soft: #5a3328;
+    --ink-faint: rgba(42,20,16,0.55);
+    --maroon: #6b2419;
+    --accent: #e8702c;
+    --bad: #c14a2a;
+    --rule: rgba(42,20,16,0.18);
+    --card: #fbf7eb;
+    --dot: rgba(107,36,25,0.13);
+    --hand: "Caveat", cursive;
+    --serif: "Newsreader", Georgia, serif;
+    --mono: "JetBrains Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14110f;
+      --paper: #1a1614;
+      --ink: #f4f0e6;
+      --ink-soft: #cbbfa6;
+      --ink-faint: rgba(244,240,230,0.55);
+      --maroon: #f4f0e6;
+      --accent: #ff8a3d;
+      --rule: rgba(244,240,230,0.18);
+      --card: #1f1a17;
+      --dot: rgba(244,240,230,0.07);
+    }
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: radial-gradient(var(--dot) 1px, transparent 1.2px) var(--bg);
+    background-size: 18px 18px;
+    color: var(--ink);
+    font-family: var(--serif);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: center;
+    gap: 60px;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 60px 32px;
+  }
+  .copy { padding-right: 30px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px;
+    letter-spacing: 0.32em; text-transform: uppercase;
+    color: var(--ink-faint);
+    display: inline-flex; align-items: center; gap: 10px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+
+  h1 {
+    font-family: var(--hand);
+    font-weight: 700;
+    font-size: clamp(120px, 18vw, 240px);
+    line-height: 0.85;
+    letter-spacing: -0.04em;
+    margin: 12px 0 0;
+    color: var(--ink);
+  }
+  h1 .em { color: var(--maroon); }
+  .lede {
+    font-size: 22px;
+    color: var(--ink-soft);
+    line-height: 1.5;
+    max-width: 480px;
+    margin: 28px 0;
+  }
+  .receipt {
+    margin: 28px 0;
+    padding: 16px 20px;
+    background: var(--card);
+    border: 1.5px dashed var(--rule);
+    border-radius: 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink-soft);
+    max-width: 480px;
+  }
+  .receipt-h {
+    font-size: 10px;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-bottom: 8px;
+    display: flex; justify-content: space-between;
+    border-bottom: 1px dashed var(--rule);
+    padding-bottom: 6px;
+  }
+  .receipt code { color: var(--ink); font-weight: 600; }
+
+  .ctas { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 22px;
+    border: 1.5px solid var(--ink);
+    border-radius: 999px;
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    text-decoration: none;
+    color: var(--ink); background: transparent;
+    transition: transform .15s, box-shadow .15s;
+  }
+  .btn:hover { transform: translate(-1px,-1px); box-shadow: 3px 3px 0 0 var(--ink); }
+  .btn-p { background: var(--ink); color: var(--bg); }
+
+  /* art side */
+  .art {
+    position: relative;
+    color: var(--maroon);
+    display: flex; align-items: center; justify-content: center;
+    aspect-ratio: 1;
+  }
+  .art-svg { width: 100%; max-width: 460px; height: auto; display: block; overflow: visible; }
+  .bars {
+    pointer-events: none;
+    color: var(--ink);
+  }
+  .tag-label {
+    position: absolute;
+    bottom: 6%; left: 50%; transform: translateX(-50%) rotate(-1.5deg);
+    background: var(--accent);
+    color: var(--ink);
+    font-family: var(--hand);
+    font-weight: 700;
+    font-size: 28px;
+    padding: 4px 22px;
+    border: 1.5px solid var(--ink);
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+
+  .footer {
+    grid-column: 1 / -1;
+    display: flex; justify-content: space-between;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-faint);
+    letter-spacing: 0.06em;
+    padding-top: 40px;
+    border-top: 1.5px dashed var(--rule);
+    margin-top: 20px;
+  }
+  .lang {
+    background: none; border: none; cursor: pointer;
+    color: var(--ink-soft); font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.06em;
+  }
+  .lang:hover { color: var(--ink); }
+
+  @media (max-width: 860px) {
+    .wrap { grid-template-columns: 1fr; gap: 30px; }
+    .art { order: -1; aspect-ratio: 1.2; }
+    h1 { font-size: clamp(100px, 30vw, 180px); }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="copy">
+    <div class="eyebrow"><span class="dot"></span><span data-i18n="eyebrow">ERROR · 404</span></div>
+    <h1>4<span class="em">0</span>4</h1>
+    <p class="lede" data-i18n="lede">
+      this page got caged. one of our agents probably wandered in here,
+      tripped a guardrail, and we had to pull the plug.
+    </p>
+    <div class="receipt">
+      <div class="receipt-h">
+        <span data-i18n="receiptH">incident · auto-generated</span>
+        <span>#0404</span>
+      </div>
+      <div data-i18n="receiptL1">→ requested · <code id="path-shown">/the-page-you-typed</code></div>
+      <div data-i18n="receiptL2">→ matched · <code>no route</code></div>
+      <div data-i18n="receiptL3">→ action · <code>contain &amp; report</code></div>
+      <div data-i18n="receiptL4">→ status · <code style="color:var(--bad)">caged</code></div>
+    </div>
+    <div class="ctas">
+      <a class="btn btn-p" href="agentma landing page.html"><span data-i18n="ctaHome">← back to safety</span></a>
+      <a class="btn" href="agentma landing page.html#dashboard"><span data-i18n="ctaDash">peek at the dashboard</span></a>
+    </div>
+  </div>
+
+  <div class="art">
+    <svg class="art-svg" viewBox="0 0 650 737" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+      <!-- The character. -->
+      <g style="color: var(--maroon)">
+        <use href="#agentma" style="stroke: currentColor; stroke-width: 3;"></use>
+      </g>
+      <!-- Cage bars in front. -->
+      <g class="bars" stroke="currentColor" stroke-width="6" stroke-linecap="round" fill="none">
+        <path d="M 60 80 Q 325 50 590 80" />
+        <path d="M 60 690 Q 325 720 590 690" />
+        <line x1="100" y1="60" x2="100" y2="700" />
+        <line x1="220" y1="55" x2="220" y2="705" />
+        <line x1="325" y1="50" x2="325" y2="710" />
+        <line x1="430" y1="55" x2="430" y2="705" />
+        <line x1="550" y1="60" x2="550" y2="700" />
+      </g>
+      <!-- Sign hanging from a bar. -->
+    </svg>
+    <div class="tag-label" data-i18n="tagLabel">★ caged for your safety ★</div>
+  </div>
+
+  <div class="footer">
+    <span data-i18n="footerL">agentma · est 2026 · this incident has been logged.</span>
+    <button class="lang" id="lang">中文 →</button>
+  </div>
+</div>
+
+<script src="agentma-paths.js"></script>
+<script>
+  // Inject the character symbol.
+  (function() {
+    const d = window.AGENTMA;
+    const ns = 'http://www.w3.org/2000/svg';
+    const wrap = document.createElementNS(ns, 'svg');
+    wrap.setAttribute('style', 'position:absolute;width:0;height:0;overflow:hidden');
+    wrap.setAttribute('aria-hidden', 'true');
+    const sym = document.createElementNS(ns, 'symbol');
+    sym.setAttribute('id', 'agentma');
+    sym.setAttribute('viewBox', `0 0 ${d.w} ${d.h}`);
+    const g = document.createElementNS(ns, 'g');
+    g.setAttribute('fill', 'none');
+    g.setAttribute('stroke', 'currentColor');
+    g.setAttribute('stroke-linecap', 'round');
+    g.setAttribute('stroke-linejoin', 'round');
+    d.paths.forEach(p => {
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', p);
+      g.appendChild(path);
+    });
+    sym.appendChild(g);
+    wrap.appendChild(sym);
+    document.body.insertBefore(wrap, document.body.firstChild);
+  })();
+
+  // Show the actual path the user tried to hit.
+  try {
+    const path = location.hash ? location.hash.slice(1) : (location.pathname.replace(/\/$/, '') || '/missing');
+    if (path && path !== '/' && path !== '/agentma%20landing%20page.html') {
+      document.getElementById('path-shown').textContent = decodeURIComponent(path);
+    }
+  } catch (e) {}
+
+  // i18n.
+  const i18n = {
+    en: {
+      eyebrow: 'ERROR · 404',
+      lede: 'this page got caged. one of our agents probably wandered in here, tripped a guardrail, and we had to pull the plug.',
+      receiptH: 'incident · auto-generated',
+      receiptL1: '→ requested · ',
+      receiptL2: '→ matched · ',
+      receiptL3: '→ action · ',
+      receiptL4: '→ status · ',
+      ctaHome: '← back to safety',
+      ctaDash: 'peek at the dashboard',
+      tagLabel: '★ caged for your safety ★',
+      footerL: 'agentma · est 2026 · this incident has been logged.',
+      langBtn: '中文 →',
+    },
+    zh: {
+      eyebrow: '错误 · 404',
+      lede: '这个页面被关起来了。我们一个 agent 大概是溜达进来，撞响了护栏，我们只好拉电闸。',
+      receiptH: '事件 · 自动生成',
+      receiptL1: '→ 请求路径 · ',
+      receiptL2: '→ 命中规则 · ',
+      receiptL3: '→ 采取动作 · ',
+      receiptL4: '→ 当前状态 · ',
+      ctaHome: '← 回到安全区',
+      ctaDash: '看看 dashboard',
+      tagLabel: '★ 为你的安全已关停 ★',
+      footerL: 'agentma · est 2026 · 本次事件已记录。',
+      langBtn: 'EN →',
+    },
+  };
+  // Receipt code strings stay english per the original; we set them via DOM.
+  const codes = {
+    en: ['/the-page-you-typed', 'no route', 'contain & report', 'caged'],
+    zh: ['/你输入的路径', '无匹配路由', '隔离并上报', '已关停'],
+  };
+
+  function applyLang(lang) {
+    const dict = i18n[lang];
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      const key = el.dataset.i18n;
+      if (dict[key]) el.textContent = dict[key];
+    });
+    document.documentElement.lang = lang;
+    document.getElementById('lang').textContent = dict.langBtn;
+    // Re-render the path code
+    try {
+      const path = location.hash ? location.hash.slice(1) : null;
+      document.getElementById('path-shown').textContent = path ? decodeURIComponent(path) : codes[lang][0];
+    } catch (e) {}
+    // Re-render the four <code> in receipt
+    const receipt = document.querySelector('.receipt');
+    const codeEls = receipt.querySelectorAll('div:not(.receipt-h) code');
+    if (codeEls.length === 4) {
+      codeEls[1].textContent = codes[lang][1];
+      codeEls[2].textContent = codes[lang][2];
+      codeEls[3].textContent = codes[lang][3];
+    }
+    localStorage.setItem('agentma-lang', lang);
+  }
+  const saved = localStorage.getItem('agentma-lang') ||
+    (navigator.language && navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en');
+  applyLang(saved);
+  document.getElementById('lang').addEventListener('click', () => {
+    applyLang(document.documentElement.lang === 'zh' ? 'en' : 'zh');
+  });
+</script>
+</body>
+</html>

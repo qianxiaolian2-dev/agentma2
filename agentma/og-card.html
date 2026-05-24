@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>agentma · OG card</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; background: #d6cfb6; }
+  .card {
+    width: 1200px; height: 630px;
+    background:
+      radial-gradient(rgba(107,36,25,0.13) 1px, transparent 1.2px) #f4f0e6;
+    background-size: 22px 22px;
+    color: #2a1410;
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr;
+    align-items: center;
+    padding: 70px 80px;
+    box-sizing: border-box;
+    position: relative;
+    overflow: hidden;
+  }
+  .copy { padding-right: 30px; }
+  .eyebrow {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 16px; letter-spacing: 0.32em;
+    color: rgba(42,20,16,0.55);
+    text-transform: uppercase;
+    display: inline-flex; align-items: center; gap: 12px;
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: #e8702c; }
+  h1 {
+    font-family: "Caveat", cursive;
+    font-weight: 700;
+    font-size: 130px;
+    line-height: 0.9;
+    letter-spacing: -0.02em;
+    margin: 28px 0 16px;
+  }
+  .em { color: #6b2419; position: relative; display: inline-block; }
+  .em::after {
+    content: "";
+    position: absolute;
+    left: -4px; right: -4px; bottom: -6px;
+    height: 10px;
+    background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 10' preserveAspectRatio='none'><path d='M 4 6 Q 60 2 120 5 T 236 4' fill='none' stroke='%23e8702c' stroke-width='3' stroke-linecap='round'/></svg>") repeat-x;
+  }
+  .tag {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 22px;
+    color: rgba(42,20,16,0.65);
+    letter-spacing: -0.01em;
+    line-height: 1.4;
+    max-width: 580px;
+    margin-top: 18px;
+  }
+  .url {
+    margin-top: 50px;
+    font-family: "JetBrains Mono", monospace;
+    font-weight: 700;
+    font-size: 22px;
+    color: #6b2419;
+    letter-spacing: 0.05em;
+    display: inline-flex; align-items: center; gap: 12px;
+  }
+  .url-arrow { font-size: 28px; }
+  .art {
+    position: relative;
+    height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    color: #6b2419;
+  }
+  .art svg { width: 100%; max-width: 440px; }
+  .badge {
+    position: absolute;
+    font-family: "Caveat", cursive;
+    font-size: 28px;
+    color: #6b2419;
+    transform: rotate(-3deg);
+  }
+  .badge-1 { top: 20%; right: -10px; }
+  .badge-2 { bottom: 22%; left: -20px; color: #e8702c; }
+  .stripe {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 8px;
+    background: repeating-linear-gradient(
+      45deg, #6b2419 0 12px, transparent 12px 24px
+    );
+    opacity: 0.6;
+  }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div class="copy">
+    <div class="eyebrow"><span class="dot"></span><span>AGENT MANAGEMENT PLATFORM</span></div>
+    <h1>
+      wrangle your<br/>
+      <span class="em">agents.</span>
+    </h1>
+    <div class="tag">spin them up, watch them work in real time, and pull the plug the moment one of them starts acting a little too autonomous.</div>
+    <div class="url"><span class="url-arrow">→</span> agentma.io</div>
+  </div>
+  <div class="art">
+    <svg viewBox="0 0 650 737" preserveAspectRatio="xMidYMid meet">
+      <use href="#agentma" style="stroke: currentColor; stroke-width: 4.5;"></use>
+    </svg>
+    <div class="badge badge-1">← spooky · but managed</div>
+    <div class="badge badge-2">$0.07 / call ↓</div>
+  </div>
+  <div class="stripe"></div>
+</div>
+
+<script src="agentma-paths.js"></script>
+<script>
+  // Inject the symbol so the <use> resolves
+  (function() {
+    const d = window.AGENTMA;
+    const ns = 'http://www.w3.org/2000/svg';
+    const wrap = document.createElementNS(ns, 'svg');
+    wrap.setAttribute('style', 'position:absolute;width:0;height:0');
+    wrap.setAttribute('aria-hidden', 'true');
+    const sym = document.createElementNS(ns, 'symbol');
+    sym.setAttribute('id', 'agentma');
+    sym.setAttribute('viewBox', `0 0 ${d.w} ${d.h}`);
+    const g = document.createElementNS(ns, 'g');
+    g.setAttribute('fill', 'none');
+    g.setAttribute('stroke', 'currentColor');
+    g.setAttribute('stroke-linecap', 'round');
+    g.setAttribute('stroke-linejoin', 'round');
+    d.paths.forEach(p => {
+      const path = document.createElementNS(ns, 'path');
+      path.setAttribute('d', p);
+      g.appendChild(path);
+    });
+    sym.appendChild(g);
+    wrap.appendChild(sym);
+    document.body.insertBefore(wrap, document.body.firstChild);
+  })();
+</script>
+</body>
+</html>

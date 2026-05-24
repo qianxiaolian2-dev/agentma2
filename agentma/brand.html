@@ -1,0 +1,761 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<title>agentma · brand book</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" type="image/svg+xml" href="favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link
+  href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600;700&family=Permanent+Marker&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+  rel="stylesheet">
+
+<style>
+  :root {
+    --bg:        #f4f0e6;
+    --paper:     #ece6d7;
+    --paper-2:   #e3dcc8;
+    --ink:       #2a1410;
+    --ink-soft:  #5a3328;
+    --ink-faint: rgba(42,20,16,0.55);
+    --maroon:    #6b2419;
+    --accent:    #e8702c;
+    --good:      #5a7d3a;
+    --warn:      #c98a1f;
+    --bad:       #c14a2a;
+    --rule:      rgba(42,20,16,0.18);
+    --card:      #fbf7eb;
+    --dot:       rgba(107,36,25,0.13);
+    --hand: "Caveat", cursive;
+    --marker: "Permanent Marker", cursive;
+    --serif: "Newsreader", Georgia, serif;
+    --mono: "JetBrains Mono", monospace;
+  }
+  [data-theme="dark"] {
+    --bg:        #14110f;
+    --paper:     #1a1614;
+    --paper-2:   #221c19;
+    --ink:       #f4f0e6;
+    --ink-soft:  #cbbfa6;
+    --ink-faint: rgba(244,240,230,0.55);
+    --maroon:    #f4f0e6;
+    --accent:    #ff8a3d;
+    --rule:      rgba(244,240,230,0.18);
+    --card:      #1f1a17;
+    --dot:       rgba(244,240,230,0.07);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    background: radial-gradient(var(--dot) 1px, transparent 1.2px) var(--bg);
+    background-size: 18px 18px;
+    color: var(--ink);
+    font-family: var(--serif);
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; text-decoration: none; }
+  ::selection { background: var(--accent); color: var(--bg); }
+
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 32px 100px; }
+
+  /* ─── nav ─── */
+  .nav {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 16px 24px;
+    background: var(--card);
+    border: 1.5px solid var(--ink);
+    border-radius: 14px;
+    box-shadow: 4px 6px 0 0 var(--ink);
+    position: sticky; top: 16px; z-index: 50;
+  }
+  .logo { display: inline-flex; align-items: center; gap: 10px; color: var(--maroon); }
+  .logo-svg { width: 38px; height: 32px; }
+  .logo-text { font-family: var(--hand); font-size: 30px; font-weight: 700; color: var(--maroon); letter-spacing: -0.01em; line-height: 1; transform: translateY(2px); }
+  .nav-right { display: flex; gap: 10px; align-items: center; font-family: var(--mono); font-size: 12px; color: var(--ink-soft); }
+  .toggle {
+    width: 34px; height: 34px; border-radius: 50%;
+    background: transparent; border: 1.5px solid var(--ink); color: var(--ink);
+    cursor: pointer; font-size: 14px;
+    transition: background .15s, transform .2s;
+  }
+  .toggle:hover { background: var(--ink); color: var(--bg); transform: rotate(20deg); }
+
+  /* ─── hero ─── */
+  .hero {
+    margin: 48px 0 64px;
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 40px;
+    align-items: end;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px;
+    letter-spacing: 0.32em; text-transform: uppercase;
+    color: var(--ink-faint);
+    display: inline-flex; align-items: center; gap: 10px;
+  }
+  .eyebrow-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+  .hero h1 {
+    font-family: var(--hand);
+    font-weight: 700;
+    font-size: clamp(80px, 12vw, 156px);
+    line-height: 0.85;
+    letter-spacing: -0.02em;
+    margin: 16px 0 0;
+    color: var(--ink);
+  }
+  .hero h1 .em { color: var(--maroon); }
+  .hero-meta {
+    font-family: var(--mono); font-size: 13px;
+    color: var(--ink-soft);
+    border-left: 2px solid var(--rule);
+    padding-left: 18px;
+    line-height: 1.7;
+    align-self: end;
+  }
+  .hero-meta b { font-weight: 700; color: var(--ink); }
+
+  /* ─── section ─── */
+  section { margin: 80px 0; scroll-margin-top: 100px; }
+  .h2 {
+    font-family: var(--hand);
+    font-weight: 700;
+    font-size: clamp(52px, 8vw, 88px);
+    line-height: 0.9; letter-spacing: -0.01em;
+    margin: 0 0 8px;
+    color: var(--ink);
+  }
+  .h2 .num {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    vertical-align: super;
+    margin-right: 16px;
+  }
+  .sub {
+    font-family: var(--serif);
+    font-size: 18px;
+    color: var(--ink-soft);
+    max-width: 580px;
+    margin: 0 0 36px;
+  }
+
+  /* ─── logos ─── */
+  .logo-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;
+  }
+  .swatch {
+    background: var(--card);
+    border: 1.5px solid var(--ink);
+    border-radius: 14px;
+    box-shadow: 3px 4px 0 0 var(--ink);
+    overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  .swatch-art {
+    display: flex; align-items: center; justify-content: center;
+    padding: 32px 20px;
+    aspect-ratio: 1.4;
+    background: var(--paper);
+    border-bottom: 1.5px solid var(--rule);
+  }
+  .swatch-art.bg-cream { background: var(--bg); }
+  .swatch-art.bg-dark { background: #1a1614; color: #f4f0e6; }
+  .swatch-art.bg-dark .lockup-text, .swatch-art.bg-dark .lockup-tag { color: #f4f0e6; }
+  .swatch-art.bg-orange { background: #ff8a3d; }
+  .swatch-foot {
+    padding: 14px 18px;
+    display: flex; justify-content: space-between; align-items: center;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-faint);
+    letter-spacing: 0.06em;
+  }
+  .swatch-name { color: var(--ink); font-weight: 700; }
+
+  .lockup { display: flex; align-items: center; gap: 12px; }
+  .lockup-svg { color: var(--maroon); height: 64px; }
+  .lockup-text {
+    font-family: var(--hand); font-weight: 700; font-size: 56px;
+    line-height: 0.9; letter-spacing: -0.02em;
+    color: var(--maroon);
+  }
+  .lockup-text.serif { font-family: var(--marker); font-size: 36px; }
+  .lockup-text.mono  { font-family: var(--mono); font-size: 30px; font-weight: 700; letter-spacing: -0.04em; }
+  .lockup-stack { display: flex; flex-direction: column; gap: 4px; }
+  .lockup-tag {
+    font-family: var(--mono); font-size: 10px;
+    color: var(--ink-faint); letter-spacing: 0.25em;
+    text-transform: uppercase;
+  }
+
+  /* ─── do/don't ─── */
+  .rules { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 28px; }
+  .rule {
+    background: var(--card);
+    border: 1.5px solid var(--ink);
+    border-radius: 14px;
+    box-shadow: 3px 4px 0 0 var(--ink);
+    padding: 22px 26px;
+  }
+  .rule-h {
+    font-family: var(--hand); font-weight: 700;
+    font-size: 36px; line-height: 1;
+    color: var(--ink);
+    margin-bottom: 8px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .rule-h.do  .rule-mark { color: var(--good); }
+  .rule-h.dont .rule-mark { color: var(--bad); }
+  .rule-mark { font-size: 30px; font-weight: 700; line-height: 1; }
+  .rule ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+  .rule li {
+    font-family: var(--serif); font-size: 15.5px;
+    color: var(--ink-soft); line-height: 1.45;
+    padding-left: 22px; position: relative;
+  }
+  .rule li::before {
+    content: "·";
+    position: absolute; left: 8px; top: -2px;
+    font-size: 24px; color: var(--ink-faint);
+  }
+
+  /* ─── color tokens ─── */
+  .colors {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+  }
+  .color {
+    background: var(--card);
+    border: 1.5px solid var(--ink);
+    border-radius: 14px;
+    box-shadow: 3px 4px 0 0 var(--ink);
+    overflow: hidden;
+  }
+  .color-chip { aspect-ratio: 1.6; }
+  .color-meta { padding: 14px 18px; }
+  .color-name {
+    font-family: var(--mono); font-weight: 700;
+    font-size: 13px; color: var(--ink);
+    letter-spacing: 0.02em;
+  }
+  .color-hex {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-faint);
+    margin-top: 4px;
+    letter-spacing: 0.06em;
+  }
+  .color-role {
+    margin-top: 8px;
+    font-family: var(--serif); font-size: 13px;
+    color: var(--ink-soft); line-height: 1.4;
+  }
+
+  /* ─── type specimens ─── */
+  .type-grid { display: flex; flex-direction: column; gap: 20px; }
+  .type {
+    background: var(--card);
+    border: 1.5px solid var(--ink);
+    border-radius: 14px;
+    box-shadow: 3px 4px 0 0 var(--ink);
+    padding: 28px 32px;
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: 32px;
+    align-items: center;
+  }
+  .type-meta {
+    font-family: var(--mono); font-size: 12px;
+    color: var(--ink-soft);
+    line-height: 1.7;
+  }
+  .type-meta b { color: var(--ink); font-weight: 700; font-size: 13px; display: block; margin-bottom: 4px; }
+  .type-meta .scale { color: var(--ink-faint); }
+  .type-sample-hand {
+    font-family: var(--hand); font-weight: 700;
+    font-size: 84px; line-height: 0.9;
+    color: var(--ink); letter-spacing: -0.02em;
+  }
+  .type-sample-serif {
+    font-family: var(--serif);
+    font-size: 22px;
+    color: var(--ink); line-height: 1.45;
+  }
+  .type-sample-serif em { color: var(--maroon); }
+  .type-sample-mono {
+    font-family: var(--mono); font-size: 14px;
+    color: var(--ink); line-height: 1.6;
+  }
+  .type-sample-mono .key { color: var(--ink-soft); }
+
+  /* ─── voice ─── */
+  .voice {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
+  }
+  .voice-card {
+    background: var(--card);
+    border: 1.5px solid var(--ink);
+    border-radius: 14px;
+    box-shadow: 3px 4px 0 0 var(--ink);
+    padding: 26px 30px;
+  }
+  .voice-tag {
+    font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.25em; text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-bottom: 10px;
+  }
+  .voice-quote {
+    font-family: var(--hand); font-weight: 700;
+    font-size: 36px; line-height: 1.05;
+    color: var(--ink);
+    margin-bottom: 12px;
+  }
+  .voice-strike .voice-quote {
+    color: var(--ink-faint);
+    text-decoration: line-through;
+    text-decoration-color: var(--bad);
+    text-decoration-thickness: 3px;
+  }
+  .voice-note {
+    font-family: var(--serif); font-size: 15px;
+    color: var(--ink-soft); line-height: 1.5;
+  }
+
+  /* ─── footer ─── */
+  .foot {
+    margin-top: 80px;
+    padding-top: 24px;
+    border-top: 1.5px dashed var(--rule);
+    display: flex; justify-content: space-between; gap: 20px;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-faint);
+    letter-spacing: 0.06em;
+  }
+
+  @media (max-width: 920px) {
+    .hero { grid-template-columns: 1fr; }
+    .logo-grid, .colors { grid-template-columns: 1fr 1fr; }
+    .rules, .voice { grid-template-columns: 1fr; }
+    .type { grid-template-columns: 1fr; }
+    .type-sample-hand { font-size: 56px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ─── nav ─── -->
+  <nav class="nav">
+    <a class="logo" href="agentma landing page.html">
+      <svg class="logo-svg" viewBox="0 0 650 737" preserveAspectRatio="xMidYMid meet">
+        <use href="#agentma" style="stroke: currentColor; stroke-width: 6;" />
+      </svg>
+      <span class="logo-text">agentma</span>
+    </a>
+    <div class="nav-right">
+      <span>brand book · v0.1</span>
+      <button class="toggle" id="theme" aria-label="theme">☾</button>
+    </div>
+  </nav>
+
+  <!-- ─── hero ─── -->
+  <section class="hero">
+    <div>
+      <div class="eyebrow"><span class="eyebrow-dot"></span><span>BRAND BOOK · MAY 2026</span></div>
+      <h1>scary good, <br/><span class="em">on purpose.</span></h1>
+    </div>
+    <div class="hero-meta">
+      <b>agentma</b> is built around a single drawing — a hand-sketched
+      pumpkin-headed creature — and a rule: <b>nothing about the brand looks
+      machine-rendered.</b> Real ink. Real paper. Real teeth. Use this book
+      to keep it that way.
+    </div>
+  </section>
+
+  <!-- ─── 01 LOGO ─── -->
+  <section id="logo">
+    <h2 class="h2"><span class="num">01</span>logo</h2>
+    <p class="sub">
+      One creature. Multiple lockups. Don't redraw it, don't smooth it, don't
+      "vector clean it up". The wobble is the point.
+    </p>
+
+    <div class="logo-grid">
+      <!-- 1: primary -->
+      <div class="swatch">
+        <div class="swatch-art">
+          <div class="lockup">
+            <svg class="lockup-svg" viewBox="0 0 650 737" preserveAspectRatio="xMidYMid meet" style="width:72px"><use href="#agentma" style="stroke: currentColor; stroke-width: 5;"/></svg>
+            <div class="lockup-stack">
+              <span class="lockup-text">agentma</span>
+              <span class="lockup-tag">agent · management · platform</span>
+            </div>
+          </div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">PRIMARY</span><span>Caveat · maroon · cream</span></div>
+      </div>
+
+      <!-- 2: dark mode -->
+      <div class="swatch">
+        <div class="swatch-art bg-dark">
+          <div class="lockup">
+            <svg class="lockup-svg" viewBox="0 0 650 737" preserveAspectRatio="xMidYMid meet" style="width:72px;color:#f4f0e6"><use href="#agentma" style="stroke: currentColor; stroke-width: 5;"/></svg>
+            <div class="lockup-stack">
+              <span class="lockup-text" style="color:#f4f0e6">agentma</span>
+              <span class="lockup-tag" style="color:#ff8a3d">night shift · always on</span>
+            </div>
+          </div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">DARK</span><span>cream lines · ink ground</span></div>
+      </div>
+
+      <!-- 3: head only -->
+      <div class="swatch">
+        <div class="swatch-art" style="background:#ff8a3d">
+          <svg viewBox="40 0 580 460" preserveAspectRatio="xMidYMid meet" style="width:120px; height:96px; color:#1a1614"><use href="#agentma-head" style="stroke: currentColor; stroke-width: 6;"/></svg>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">HEAD-ONLY</span><span>favicons · avatars · 32 – 256 px</span></div>
+      </div>
+
+      <!-- 4: mono wordmark -->
+      <div class="swatch">
+        <div class="swatch-art">
+          <div class="lockup">
+            <svg class="lockup-svg" viewBox="0 0 650 737" preserveAspectRatio="xMidYMid meet" style="width:56px"><use href="#agentma" style="stroke: currentColor; stroke-width: 5;"/></svg>
+            <span class="lockup-text mono">agentma</span>
+          </div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">TECH TAG</span><span>JetBrains Mono · for IDE / SDK</span></div>
+      </div>
+
+      <!-- 5: marker -->
+      <div class="swatch">
+        <div class="swatch-art">
+          <div class="lockup">
+            <svg class="lockup-svg" viewBox="0 0 650 737" preserveAspectRatio="xMidYMid meet" style="width:56px"><use href="#agentma" style="stroke: currentColor; stroke-width: 5;"/></svg>
+            <span class="lockup-text serif">agentma</span>
+          </div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">MARKER</span><span>Permanent Marker · stickers</span></div>
+      </div>
+
+      <!-- 6: monogram -->
+      <div class="swatch">
+        <div class="swatch-art bg-cream">
+          <span style="font-family: var(--hand); font-weight: 700; font-size: 200px; color: var(--maroon); line-height: 0.85;">a</span>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">MONOGRAM</span><span>single-letter · app tile</span></div>
+      </div>
+    </div>
+
+    <div class="rules">
+      <div class="rule">
+        <div class="rule-h do"><span class="rule-mark">✓</span>do</div>
+        <ul>
+          <li>Keep the wobble. The lines are hand-drawn — let them be hand-drawn.</li>
+          <li>Use the cream paper or solid ink as the ground. Both shipped with the system.</li>
+          <li>Pair with a soft underline scribble when the wordmark needs to feel "alive".</li>
+          <li>Shrink the head-only lockup to 32px for favicons. The teeth still read.</li>
+        </ul>
+      </div>
+      <div class="rule">
+        <div class="rule-h dont"><span class="rule-mark">✗</span>don't</div>
+        <ul>
+          <li>Don't re-trace it in Illustrator. The bumps and gaps in the strokes are the brand.</li>
+          <li>Don't add a drop shadow, glow, gradient, or bevel. Flat ink only.</li>
+          <li>Don't rotate the creature past ±5° — it stops feeling like a character and starts feeling like a meme.</li>
+          <li>Don't change the colors. Maroon on cream, cream on ink. Orange is an accent, not a fill.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── 02 COLORS ─── -->
+  <section id="color">
+    <h2 class="h2"><span class="num">02</span>color</h2>
+    <p class="sub">Four core tones plus three signals. Saturation stays low. No gradients, no rainbows.</p>
+
+    <div class="colors">
+      <div class="color">
+        <div class="color-chip" style="background:#f4f0e6"></div>
+        <div class="color-meta">
+          <div class="color-name">cream / paper</div>
+          <div class="color-hex">#f4f0e6 · oklch(94% 0.012 80)</div>
+          <div class="color-role">Default background. Subtle dot grid baked in.</div>
+        </div>
+      </div>
+      <div class="color">
+        <div class="color-chip" style="background:#2a1410"></div>
+        <div class="color-meta">
+          <div class="color-name">ink</div>
+          <div class="color-hex">#2a1410</div>
+          <div class="color-role">Body text, borders, primary buttons. The "pen".</div>
+        </div>
+      </div>
+      <div class="color">
+        <div class="color-chip" style="background:#6b2419"></div>
+        <div class="color-meta">
+          <div class="color-name">maroon</div>
+          <div class="color-hex">#6b2419</div>
+          <div class="color-role">The creature itself. Wordmark. Emphasis.</div>
+        </div>
+      </div>
+      <div class="color">
+        <div class="color-chip" style="background:#e8702c"></div>
+        <div class="color-meta">
+          <div class="color-name">accent / pumpkin</div>
+          <div class="color-hex">#e8702c</div>
+          <div class="color-role">Underlines, dots, highlights. Use sparingly.</div>
+        </div>
+      </div>
+
+      <div class="color">
+        <div class="color-chip" style="background:#5a7d3a"></div>
+        <div class="color-meta">
+          <div class="color-name">good</div>
+          <div class="color-hex">#5a7d3a</div>
+          <div class="color-role">"running", "ok", positive delta.</div>
+        </div>
+      </div>
+      <div class="color">
+        <div class="color-chip" style="background:#c98a1f"></div>
+        <div class="color-meta">
+          <div class="color-name">warn</div>
+          <div class="color-hex">#c98a1f</div>
+          <div class="color-role">"stuck", guardrail flagged, watch this.</div>
+        </div>
+      </div>
+      <div class="color">
+        <div class="color-chip" style="background:#c14a2a"></div>
+        <div class="color-meta">
+          <div class="color-name">bad</div>
+          <div class="color-hex">#c14a2a</div>
+          <div class="color-role">"caged", incident, kill switch.</div>
+        </div>
+      </div>
+      <div class="color">
+        <div class="color-chip" style="background:#1a1614"></div>
+        <div class="color-meta">
+          <div class="color-name">night ink</div>
+          <div class="color-hex">#1a1614</div>
+          <div class="color-role">Dark-mode ground. Slightly warmer than black.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── 03 TYPE ─── -->
+  <section id="type">
+    <h2 class="h2"><span class="num">03</span>type</h2>
+    <p class="sub">Three voices — handwritten, serif, mono. Each does one job, no overlap.</p>
+
+    <div class="type-grid">
+      <div class="type">
+        <div class="type-meta">
+          <b>Caveat</b>
+          <span>Display · headlines · numbers</span>
+          <div class="scale" style="margin-top:8px">
+            Weights · 400 / 700<br/>
+            Use · h1, h2, KPI values<br/>
+            Don't · body text, &lt; 24px
+          </div>
+        </div>
+        <div class="type-sample-hand">wrangle your agents.</div>
+      </div>
+
+      <div class="type">
+        <div class="type-meta">
+          <b>Newsreader</b>
+          <span>Body · ledes · explanations</span>
+          <div class="scale" style="margin-top:8px">
+            Weights · 400 / 500<br/>
+            Use · everything human reads as prose<br/>
+            Don't · headlines (they get hand-written)
+          </div>
+        </div>
+        <div class="type-sample-serif">
+          A reliable serif keeps the page calm under all the
+          handwritten weirdness. Slightly literary — <em>not</em> dry.
+        </div>
+      </div>
+
+      <div class="type">
+        <div class="type-meta">
+          <b>JetBrains Mono</b>
+          <span>Code · meta · UI labels</span>
+          <div class="scale" style="margin-top:8px">
+            Weights · 400 / 600 / 700<br/>
+            Use · timestamps, code, kbd, status<br/>
+            Don't · body sentences
+          </div>
+        </div>
+        <pre class="type-sample-mono" style="margin:0;white-space:pre-wrap">
+<span class="key">12:04:32</span>  tool   pdf.read("invoice-9981.pdf")
+<span class="key">12:04:34</span>  ok     200 · 218kb · $0.004
+<span class="key">12:04:42</span>  guard  write allowed (in allowlist)</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── 04 VOICE ─── -->
+  <section id="voice">
+    <h2 class="h2"><span class="num">04</span>voice</h2>
+    <p class="sub">
+      Confident, slightly haunted, never corporate. Talks to engineers who'd rather skim than be sold to.
+      Short sentences. Lowercase nav. Em-dashes earn their place.
+    </p>
+
+    <div class="voice">
+      <div class="voice-card">
+        <div class="voice-tag">SAY</div>
+        <div class="voice-quote">"wrangle your agents before they wrangle you."</div>
+        <div class="voice-note">Active. Threatens just enough to be funny. Names the problem in 7 words.</div>
+      </div>
+
+      <div class="voice-card voice-strike">
+        <div class="voice-tag">DON'T SAY</div>
+        <div class="voice-quote">"Empowering enterprise AI orchestration."</div>
+        <div class="voice-note">Three words you'd find on a slide. No specifics. No personality. No teeth.</div>
+      </div>
+
+      <div class="voice-card">
+        <div class="voice-tag">SAY</div>
+        <div class="voice-quote">"this one tried to call production stripe at 3am."</div>
+        <div class="voice-note">Concrete moment. Specific time. Specific tool. Reads like a real Slack message.</div>
+      </div>
+
+      <div class="voice-card voice-strike">
+        <div class="voice-tag">DON'T SAY</div>
+        <div class="voice-quote">"Anomalous behavior detected in your AI workflows."</div>
+        <div class="voice-note">Abstract, passive, jargon. Could be any vendor. Could be a fire alarm.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── 05 SYSTEM ─── -->
+  <section id="system">
+    <h2 class="h2"><span class="num">05</span>system</h2>
+    <p class="sub">Small set of motifs that show up everywhere. Use them, don't invent new ones.</p>
+
+    <div class="logo-grid">
+      <div class="swatch">
+        <div class="swatch-art">
+          <div style="position:relative; padding: 14px 22px; background: var(--ink); color: var(--bg); border-radius: 999px; font-family: var(--mono); font-size: 14px; letter-spacing: 0.04em;">
+            primary button
+            <svg viewBox="0 0 80 14" style="position:absolute; left:14px; bottom:-6px; width:60px; color: var(--accent); opacity: 0.85;" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M 2 7 Q 8 2 14 7 T 26 7 T 38 7 T 50 7 T 62 7 T 74 7" /></svg>
+          </div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">SQUIGGLE</span><span>under primary buttons · emphasis</span></div>
+      </div>
+
+      <div class="swatch">
+        <div class="swatch-art">
+          <div style="display:flex; gap:6px; align-items:center;">
+            <span style="width:14px; height:14px; border-radius:50%; background: var(--good); box-shadow: 0 0 0 0 var(--good); animation: pulse 1.6s infinite;"></span>
+            <span style="font-family: var(--mono); font-size: 14px; color: var(--good); letter-spacing: 0.04em;">● running</span>
+          </div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">STATUS DOT</span><span>pulsing · live state · color = tone</span></div>
+      </div>
+
+      <div class="swatch">
+        <div class="swatch-art">
+          <div style="font-family: var(--hand); font-size: 32px; color: var(--accent); display:flex; align-items:center; gap:6px;">
+            <svg viewBox="0 0 100 50" width="80" height="40" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M 4 30 Q 30 10 60 25 T 96 22 M 90 18 L 96 22 L 90 28"/></svg>
+            ← look here
+          </div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">SCRIBBLE ARROW</span><span>annotation · hero · dashboard</span></div>
+      </div>
+
+      <div class="swatch">
+        <div class="swatch-art">
+          <div style="border: 1.5px solid var(--ink); border-radius: 12px; background: var(--card); padding: 14px 18px; box-shadow: 4px 6px 0 0 var(--ink); font-family: var(--mono); font-size: 12px;">
+            card with 4–6px offset shadow
+          </div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">OFFSET SHADOW</span><span>all cards · no blur · solid ink</span></div>
+      </div>
+
+      <div class="swatch">
+        <div class="swatch-art">
+          <div style="font-family: var(--mono); font-size: 11px; padding: 8px 12px; border: 1.5px dashed var(--rule); border-radius: 8px; color: var(--ink-faint); letter-spacing: 0.04em;">- - - - dashed receipt - - - -</div>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">DASHED BORDER</span><span>receipts · meta · "data"</span></div>
+      </div>
+
+      <div class="swatch">
+        <div class="swatch-art">
+          <span style="font-family: var(--hand); font-size: 36px; color: var(--bad); position: relative;">
+            unsupervised
+            <span style="position:absolute; left:-4px; right:-4px; top:54%; height:3px; background: var(--bad); border-radius:2px; transform: rotate(-2deg);"></span>
+          </span>
+        </div>
+        <div class="swatch-foot"><span class="swatch-name">STRIKEOUT</span><span>"before" state · old way</span></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="foot">
+    <span>© 2026 agentma · brand book v0.1 · drawn on a real napkin</span>
+    <span><a href="agentma landing page.html">← back to the site</a></span>
+  </div>
+</div>
+
+<style>
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(90,125,58,0.7); }
+    70%  { box-shadow: 0 0 0 8px rgba(90,125,58,0); }
+    100% { box-shadow: 0 0 0 0 rgba(90,125,58,0); }
+  }
+</style>
+
+<script src="agentma-paths.js"></script>
+<script>
+  // Inject the symbol so <use href="#agentma"> resolves.
+  (function() {
+    const d = window.AGENTMA;
+    const ns = 'http://www.w3.org/2000/svg';
+    const wrap = document.createElementNS(ns, 'svg');
+    wrap.setAttribute('style', 'position:absolute;width:0;height:0;overflow:hidden');
+    wrap.setAttribute('aria-hidden', 'true');
+    function sym(id, vb) {
+      const s = document.createElementNS(ns, 'symbol');
+      s.setAttribute('id', id); s.setAttribute('viewBox', vb);
+      const g = document.createElementNS(ns, 'g');
+      g.setAttribute('fill', 'none');
+      g.setAttribute('stroke', 'currentColor');
+      g.setAttribute('stroke-linecap', 'round');
+      g.setAttribute('stroke-linejoin', 'round');
+      d.paths.forEach(p => {
+        const path = document.createElementNS(ns, 'path');
+        path.setAttribute('d', p);
+        g.appendChild(path);
+      });
+      s.appendChild(g);
+      return s;
+    }
+    wrap.appendChild(sym('agentma', `0 0 ${d.w} ${d.h}`));
+    wrap.appendChild(sym('agentma-head', '40 0 580 460'));
+    document.body.insertBefore(wrap, document.body.firstChild);
+  })();
+
+  // Theme toggle.
+  const btn = document.getElementById('theme');
+  const saved = localStorage.getItem('agentma-theme') || 'light';
+  document.documentElement.setAttribute('data-theme', saved);
+  btn.textContent = saved === 'dark' ? '☀' : '☾';
+  btn.addEventListener('click', () => {
+    const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    btn.textContent = next === 'dark' ? '☀' : '☾';
+    localStorage.setItem('agentma-theme', next);
+  });
+</script>
+</body>
+</html>
