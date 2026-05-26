@@ -7,6 +7,8 @@ import { spawn } from 'node:child_process';
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
+// 生产模式：serve 前端静态文件
+app.use(express.static(path.join(import.meta.dirname, 'dist')));
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 
 // ═══ EventSource ═══
@@ -299,6 +301,14 @@ function recoverDeployedServers() {
 }
 
 const PORT = 3001;
+// SPA fallback
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/dist')) return next();
+  const indexPath = path.join(import.meta.dirname, 'dist', 'index.html');
+  if (fs.existsSync(indexPath)) res.sendFile(indexPath);
+  else next();
+});
+
 app.listen(PORT, () => {
   console.log(`[agentma] http://localhost:${PORT}`);
   recoverDeployedServers();

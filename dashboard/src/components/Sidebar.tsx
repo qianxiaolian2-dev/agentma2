@@ -29,7 +29,7 @@ const SECTIONS = [
   },
 ];
 
-export default function Sidebar() {
+export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   return (
     <nav className="sidebar">
       <div className="sidebar-logo">🐾 AgentMa</div>
@@ -41,6 +41,7 @@ export default function Sidebar() {
               key={item.path}
               to={item.path}
               end={item.path === '/'}
+              onClick={onNavigate}
               className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
             >
               <span>{item.icon}</span>
