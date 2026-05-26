@@ -9,6 +9,7 @@ const SECTIONS = [
       { path: '/conversations', label: '会话', icon: '💬' },
       { path: '/agents', label: 'Agent 市场', icon: '🤖' },
       { path: '/playground', label: 'Playground', icon: '▶' },
+      { path: '/account', label: '账户管理', icon: '👤' },
       { path: '/settings', label: '全局设置', icon: '⚙' },
     ],
   },

@@ -309,19 +309,21 @@ app.use((req, res, next) => {
   else next();
 });
 
-// ═══ Auth ═══
+// ═══ Account System ═══
 import crypto from 'node:crypto';
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
 function hashPw(pw: string) { return crypto.createHash('sha256').update(pw + 'agentma').digest('hex'); }
-function loadUsers(): Map<string, any> { try { return new Map(JSON.parse(fs.readFileSync('/tmp/agentma_users.json', 'utf-8'))); } catch { return new Map(); } }
-function saveUsers(u: Map<string, any>) { fs.writeFileSync('/tmp/agentma_users.json', JSON.stringify(Array.from(u.entries()))); }
+
+function loadStore<T>(file: string, def: T): T {
+  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { return def; }
+}
+function saveStore(file: string, data: any) { fs.writeFileSync(file, JSON.stringify(data)); }
 
 function signJWT(obj: object): string {
   const h = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
   const b = Buffer.from(JSON.stringify({ ...obj, exp: Math.floor(Date.now()/1000) + 7*86400 })).toString('base64url');
-  const s = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url');
-  return `${h}.${b}.${s}`;
+  return `${h}.${b}.${crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url')}`;
 }
 function verifyJWT(t: string): any {
   const [h, b, s] = t.split('.'); if (!h || !b || !s) return null;
@@ -329,24 +331,64 @@ function verifyJWT(t: string): any {
   const p = JSON.parse(Buffer.from(b, 'base64url').toString());
   return p.exp > Math.floor(Date.now()/1000) ? p : null;
 }
+function authMiddleware(req: any, res: any, next: any) {
+  const t = (req.headers.authorization || '').replace('Bearer ', '');
+  const p = verifyJWT(t);
+  if (!p) { res.status(401).json({ error: '未登录' }); return; }
+  req.auth = p;
+  next();
+}
+function requireAdmin(req: any, res: any, next: any) {
+  const users = loadStore<Record<string, any>>('/tmp/agentma_users.json', {});
+  const u = users[req.auth.sub];
+  if (!u || u.role !== 'tenant_admin') { res.status(403).json({ error: '需要管理员权限' }); return; }
+  next();
+}
 
+// Data stores
+type UserRow = { email: string; name: string; passwordHash: string; tenantId: string; role: string; createdAt: number };
+type TenantRow = { id: string; name: string; region: string; plan: string; status: string; createdAt: number };
+type QuotaRow = { tenantId: string; monthlyActiveSecondsLimit: number; monthlyActiveSecondsUsed: number; weeklyRunCountLimit: number; weeklyRunCountUsed: number; maxConcurrentRuns: number; perRunMaxActiveHours: number; perRunMaxWallClockHours: number; perRunMaxLlmTokens: number; perRunMaxToolCalls: number };
+type ApiKeyRow = { id: string; tenantId: string; name: string; keyHash: string; keyPrefix: string; scopes: string[]; createdBy: string; createdAt: number; revokedAt: number | null };
+type TeamRow = { id: string; tenantId: string; name: string; createdAt: number };
+type MemberRow = { teamId: string; userId: string; role: string };
+type AuditRow = { id: string; tenantId: string; action: string; actor: string; actorType: string; resource: string; diff: any; createdAt: number };
+
+function audit(tenantId: string, action: string, actor: string, actorType: string, resource: string, diff?: any) {
+  const logs = loadStore<AuditRow[]>('/tmp/agentma_audit.json', []);
+  logs.unshift({ id: crypto.randomUUID(), tenantId, action, actor, actorType, resource, diff, createdAt: Date.now() });
+  if (logs.length > 1000) logs.length = 1000;
+  saveStore('/tmp/agentma_audit.json', logs);
+}
+
+// ═══ Auth Routes ═══
 app.post('/api/auth/register', (req, res) => {
   const { name, email, password } = req.body || {};
   if (!email || !password || password.length < 6) { res.status(400).json({ error: '邮箱和密码至少 6 位' }); return; }
-  const users = loadUsers();
-  if (Array.from(users.values()).find((u: any) => u.email === email)) { res.status(409).json({ error: '邮箱已注册' }); return; }
+  const users = loadStore<Record<string, UserRow>>('/tmp/agentma_users.json', {});
+  if (Object.values(users).find((u: any) => u.email === email)) { res.status(409).json({ error: '邮箱已注册' }); return; }
   const tenantId = crypto.randomUUID();
-  users.set(email, { email, name: name || email.split('@')[0], passwordHash: hashPw(password), tenantId });
-  saveUsers(users);
+  users[email] = { email, name: name || email.split('@')[0], passwordHash: hashPw(password), tenantId, role: 'tenant_admin', createdAt: Date.now() };
+  saveStore('/tmp/agentma_users.json', users);
+  // Create tenant
+  const tenants = loadStore<Record<string, TenantRow>>('/tmp/agentma_tenants.json', {});
+  tenants[tenantId] = { id: tenantId, name: `${name || email}'s Workspace`, region: 'us', plan: 'free', status: 'active', createdAt: Date.now() };
+  saveStore('/tmp/agentma_tenants.json', tenants);
+  // Create quotas
+  const quotas = loadStore<Record<string, QuotaRow>>('/tmp/agentma_quotas.json', {});
+  quotas[tenantId] = { tenantId, monthlyActiveSecondsLimit: 36000, monthlyActiveSecondsUsed: 0, weeklyRunCountLimit: 50, weeklyRunCountUsed: 0, maxConcurrentRuns: 3, perRunMaxActiveHours: 4, perRunMaxWallClockHours: 6, perRunMaxLlmTokens: 5000000, perRunMaxToolCalls: 10000 };
+  saveStore('/tmp/agentma_quotas.json', quotas);
   const token = signJWT({ sub: email, tenantId });
+  audit(tenantId, 'register', email, 'user', `tenant:${tenantId}`);
   res.json({ token, email, name: name || email.split('@')[0], tenantId });
 });
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body || {};
-  const users = loadUsers();
-  const u = users.get(email);
+  const users = loadStore<Record<string, UserRow>>('/tmp/agentma_users.json', {});
+  const u = users[email];
   if (!u || u.passwordHash !== hashPw(password)) { res.status(401).json({ error: '邮箱或密码错误' }); return; }
+  audit(u.tenantId, 'login', email, 'user', `user:${email}`);
   res.json({ token: signJWT({ sub: email, tenantId: u.tenantId }), email: u.email, name: u.name, tenantId: u.tenantId });
 });
 
@@ -354,7 +396,156 @@ app.get('/api/auth/me', (req, res) => {
   const t = (req.headers.authorization || '').replace('Bearer ', '');
   const p = verifyJWT(t);
   if (!p) { res.status(401).json({ error: '未登录' }); return; }
-  res.json({ email: p.sub, tenantId: p.tenantId });
+  const users = loadStore<Record<string, UserRow>>('/tmp/agentma_users.json', {});
+  const u = users[p.sub];
+  const tenants = loadStore<Record<string, TenantRow>>('/tmp/agentma_tenants.json', {});
+  const tnt = tenants[p.tenantId];
+  res.json({ email: p.sub, tenantId: p.tenantId, name: u?.name, role: u?.role, plan: tnt?.plan, region: tnt?.region });
+});
+
+// ═══ Tenant Routes ═══
+app.get('/api/tenant', authMiddleware, (req: any, res) => {
+  const tenants = loadStore<Record<string, TenantRow>>('/tmp/agentma_tenants.json', {});
+  const t = tenants[req.auth.tenantId];
+  if (!t) { res.status(404).json({ error: 'not found' }); return; }
+  res.json(t);
+});
+
+app.patch('/api/tenant', authMiddleware, requireAdmin, (req: any, res) => {
+  const tenants = loadStore<Record<string, TenantRow>>('/tmp/agentma_tenants.json', {});
+  const t = tenants[req.auth.tenantId];
+  if (!t) { res.status(404).json({ error: 'not found' }); return; }
+  const { name, plan } = req.body || {};
+  if (name) t.name = name;
+  if (plan && ['free', 'pro', 'enterprise'].includes(plan)) t.plan = plan;
+  saveStore('/tmp/agentma_tenants.json', tenants);
+  audit(req.auth.tenantId, 'update_tenant', req.auth.sub, 'user', `tenant:${req.auth.tenantId}`);
+  res.json(t);
+});
+
+// ═══ Users Routes ═══
+app.get('/api/users', authMiddleware, (req: any, res) => {
+  const users = loadStore<Record<string, UserRow>>('/tmp/agentma_users.json', {});
+  const list = Object.values(users).filter((u: any) => u.tenantId === req.auth.tenantId).map(({ passwordHash, ...u }) => u);
+  res.json(list);
+});
+
+app.patch('/api/users/:email', authMiddleware, requireAdmin, (req: any, res) => {
+  const users = loadStore<Record<string, UserRow>>('/tmp/agentma_users.json', {});
+  const u = users[req.params.email];
+  if (!u || u.tenantId !== req.auth.tenantId) { res.status(404).json({ error: 'not found' }); return; }
+  if (req.body.role) u.role = req.body.role;
+  saveStore('/tmp/agentma_users.json', users);
+  audit(req.auth.tenantId, 'update_user_role', req.auth.sub, 'user', `user:${req.params.email}`, { role: u.role });
+  const { passwordHash, ...rest } = u;
+  res.json(rest);
+});
+
+app.delete('/api/users/:email', authMiddleware, requireAdmin, (req: any, res) => {
+  if (req.params.email === req.auth.sub) { res.status(400).json({ error: '不能删除自己' }); return; }
+  const users = loadStore<Record<string, UserRow>>('/tmp/agentma_users.json', {});
+  const u = users[req.params.email];
+  if (!u || u.tenantId !== req.auth.tenantId) { res.status(404).json({ error: 'not found' }); return; }
+  delete users[req.params.email];
+  saveStore('/tmp/agentma_users.json', users);
+  audit(req.auth.tenantId, 'delete_user', req.auth.sub, 'user', `user:${req.params.email}`);
+  res.json({ ok: true });
+});
+
+// ═══ API Keys Routes ═══
+app.get('/api/api-keys', authMiddleware, (req: any, res) => {
+  const keys = loadStore<ApiKeyRow[]>('/tmp/agentma_apikeys.json', []);
+  res.json(keys.filter(k => k.tenantId === req.auth.tenantId && !k.revokedAt).map(({ keyHash, ...k }) => k));
+});
+
+app.post('/api/api-keys', authMiddleware, requireAdmin, (req: any, res) => {
+  const raw = `sk-tenant_${crypto.randomBytes(24).toString('hex')}`;
+  const hash = crypto.createHash('sha256').update(raw).digest('hex');
+  const key: ApiKeyRow = {
+    id: crypto.randomUUID(), tenantId: req.auth.tenantId, name: req.body.name || 'API Key',
+    keyHash: hash, keyPrefix: raw.slice(0, 18) + '...', scopes: req.body.scopes || [],
+    createdBy: req.auth.sub, createdAt: Date.now(), revokedAt: null,
+  };
+  const keys = loadStore<ApiKeyRow[]>('/tmp/agentma_apikeys.json', []);
+  keys.push(key);
+  saveStore('/tmp/agentma_apikeys.json', keys);
+  audit(req.auth.tenantId, 'create_api_key', req.auth.sub, 'user', `apikey:${key.id}`);
+  res.json({ ...key, rawKey: raw });
+});
+
+app.delete('/api/api-keys/:id', authMiddleware, requireAdmin, (req: any, res) => {
+  const keys = loadStore<ApiKeyRow[]>('/tmp/agentma_apikeys.json', []);
+  const k = keys.find(k => k.id === req.params.id && k.tenantId === req.auth.tenantId);
+  if (!k) { res.status(404).json({ error: 'not found' }); return; }
+  k.revokedAt = Date.now();
+  saveStore('/tmp/agentma_apikeys.json', keys);
+  audit(req.auth.tenantId, 'revoke_api_key', req.auth.sub, 'user', `apikey:${k.id}`);
+  res.json({ ok: true });
+});
+
+// ═══ Quota Routes ═══
+app.get('/api/quota', authMiddleware, (req: any, res) => {
+  const quotas = loadStore<Record<string, QuotaRow>>('/tmp/agentma_quotas.json', {});
+  const q = quotas[req.auth.tenantId] || { tenantId: req.auth.tenantId, monthlyActiveSecondsLimit: 36000, monthlyActiveSecondsUsed: 0, weeklyRunCountLimit: 50, weeklyRunCountUsed: 0, maxConcurrentRuns: 3, perRunMaxActiveHours: 4, perRunMaxWallClockHours: 6 };
+  res.json(q);
+});
+
+app.patch('/api/quota', authMiddleware, requireAdmin, (req: any, res) => {
+  const quotas = loadStore<Record<string, QuotaRow>>('/tmp/agentma_quotas.json', {});
+  const q = quotas[req.auth.tenantId];
+  if (!q) { res.status(404).json({ error: 'not found' }); return; }
+  const fields = ['monthlyActiveSecondsLimit', 'weeklyRunCountLimit', 'maxConcurrentRuns', 'perRunMaxActiveHours', 'perRunMaxWallClockHours', 'perRunMaxLlmTokens', 'perRunMaxToolCalls'];
+  for (const f of fields) if (req.body[f] !== undefined) (q as any)[f] = Number(req.body[f]);
+  saveStore('/tmp/agentma_quotas.json', quotas);
+  audit(req.auth.tenantId, 'update_quota', req.auth.sub, 'user', `quota:${req.auth.tenantId}`, req.body);
+  res.json(q);
+});
+
+// ═══ Teams Routes ═══
+app.post('/api/teams', authMiddleware, (req: any, res) => {
+  const teams = loadStore<TeamRow[]>('/tmp/agentma_teams.json', []);
+  const team: TeamRow = { id: crypto.randomUUID(), tenantId: req.auth.tenantId, name: req.body.name, createdAt: Date.now() };
+  teams.push(team);
+  saveStore('/tmp/agentma_teams.json', teams);
+  audit(req.auth.tenantId, 'create_team', req.auth.sub, 'user', `team:${team.id}`);
+  res.json(team);
+});
+
+app.get('/api/teams', authMiddleware, (req: any, res) => {
+  const teams = loadStore<TeamRow[]>('/tmp/agentma_teams.json', []);
+  const members = loadStore<MemberRow[]>('/tmp/agentma_members.json', []);
+  res.json(teams.filter(t => t.tenantId === req.auth.tenantId).map(t => ({ ...t, memberCount: members.filter(m => m.teamId === t.id).length })));
+});
+
+app.get('/api/teams/:id/members', authMiddleware, (req: any, res) => {
+  const members = loadStore<MemberRow[]>('/tmp/agentma_members.json', []);
+  const users = loadStore<Record<string, UserRow>>('/tmp/agentma_users.json', {});
+  res.json(members.filter(m => m.teamId === req.params.id).map(m => ({ ...m, email: m.userId, name: users[m.userId]?.name || m.userId })));
+});
+
+app.post('/api/teams/:id/members', authMiddleware, (req: any, res) => {
+  const members = loadStore<MemberRow[]>('/tmp/agentma_members.json', []);
+  if (members.find(m => m.teamId === req.params.id && m.userId === req.body.userId)) { res.status(409).json({ error: '已存在' }); return; }
+  const m: MemberRow = { teamId: req.params.id, userId: req.body.userId, role: req.body.role || 'member' };
+  members.push(m);
+  saveStore('/tmp/agentma_members.json', members);
+  audit(req.auth.tenantId, 'add_member', req.auth.sub, 'user', `team:${req.params.id}`, { userId: req.body.userId });
+  res.json(m);
+});
+
+app.delete('/api/teams/:id/members/:userId', authMiddleware, (req: any, res) => {
+  let members = loadStore<MemberRow[]>('/tmp/agentma_members.json', []);
+  members = members.filter(m => !(m.teamId === req.params.id && m.userId === req.params.userId));
+  saveStore('/tmp/agentma_members.json', members);
+  audit(req.auth.tenantId, 'remove_member', req.auth.sub, 'user', `team:${req.params.id}`);
+  res.json({ ok: true });
+});
+
+// ═══ Audit Logs Routes ═══
+app.get('/api/audit-logs', authMiddleware, (req: any, res) => {
+  const logs = loadStore<AuditRow[]>('/tmp/agentma_audit.json', []);
+  const filtered = logs.filter(l => l.tenantId === req.auth.tenantId).slice(0, 50);
+  res.json(filtered);
 });
 
 app.listen(PORT, () => {

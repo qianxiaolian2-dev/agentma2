@@ -16,6 +16,7 @@ import Subagents from './pages/Subagents';
 import Permissions from './pages/Permissions';
 import Observability from './pages/Observability';
 import Settings from './pages/Settings';
+import Account from './pages/Account';
 
 export default function App() {
   return (
@@ -39,6 +40,7 @@ export default function App() {
                 <Route path="/permissions" element={<Permissions />} />
                 <Route path="/observability" element={<Observability />} />
                 <Route path="/settings" element={<Settings />} />
+                <Route path="/account" element={<Account />} />
               </Routes>
             </Layout>
           </AuthGuard>
