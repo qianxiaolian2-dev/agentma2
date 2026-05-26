@@ -1,4 +1,5 @@
 import { NavLink } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
 
 const SECTIONS = [
   {
@@ -30,26 +31,33 @@ const SECTIONS = [
 ];
 
 export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
+  const { user, logout } = useAuth();
   return (
-    <nav className="sidebar">
+    <nav className="sidebar" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <div className="sidebar-logo">🐾 AgentMa</div>
-      {SECTIONS.map(section => (
-        <div className="sidebar-section" key={section.title}>
-          <div className="sidebar-section-title">{section.title}</div>
-          {section.items.map(item => (
-            <NavLink
-              key={item.path}
-              to={item.path}
-              end={item.path === '/'}
-              onClick={onNavigate}
-              className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
-            >
-              <span>{item.icon}</span>
-              <span>{item.label}</span>
-            </NavLink>
-          ))}
-        </div>
-      ))}
+      <div style={{ flex: 1, overflow: 'auto' }}>
+        {SECTIONS.map(section => (
+          <div className="sidebar-section" key={section.title}>
+            <div className="sidebar-section-title">{section.title}</div>
+            {section.items.map(item => (
+              <NavLink
+                key={item.path}
+                to={item.path}
+                end={item.path === '/'}
+                onClick={onNavigate}
+                className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
+              >
+                <span>{item.icon}</span>
+                <span>{item.label}</span>
+              </NavLink>
+            ))}
+          </div>
+        ))}
+      </div>
+      <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border)', fontSize: '.8em' }}>
+        {user && <div style={{ marginBottom: 6, color: 'var(--ink-secondary)' }}>{user.email}</div>}
+        <button className="btn btn-sm" onClick={logout} style={{ width: '100%' }}>登出</button>
+      </div>
     </nav>
   );
 }

@@ -1,5 +1,8 @@
 import { Routes, Route } from 'react-router-dom';
+import { AuthProvider } from './contexts/AuthContext';
+import AuthGuard from './components/AuthGuard';
 import Layout from './components/Layout';
+import Login from './pages/Login';
 import Overview from './pages/Overview';
 import Playground from './pages/Playground';
 import Agents from './pages/Agents';
@@ -16,22 +19,31 @@ import Settings from './pages/Settings';
 
 export default function App() {
   return (
-    <Layout>
+    <AuthProvider>
       <Routes>
-        <Route path="/" element={<Overview />} />
-        <Route path="/playground" element={<Playground />} />
-        <Route path="/agents" element={<Agents />} />
-        <Route path="/agents/:id/chat" element={<AgentChat />} />
-        <Route path="/conversations" element={<Conversations />} />
-        <Route path="/sessions" element={<Sessions />} />
-        <Route path="/tools" element={<Tools />} />
-        <Route path="/skills" element={<Skills />} />
-        <Route path="/hooks" element={<Hooks />} />
-        <Route path="/subagents" element={<Subagents />} />
-        <Route path="/permissions" element={<Permissions />} />
-        <Route path="/observability" element={<Observability />} />
-        <Route path="/settings" element={<Settings />} />
+        <Route path="/login" element={<Login />} />
+        <Route path="/*" element={
+          <AuthGuard>
+            <Layout>
+              <Routes>
+                <Route path="/" element={<Overview />} />
+                <Route path="/playground" element={<Playground />} />
+                <Route path="/agents" element={<Agents />} />
+                <Route path="/agents/:id/chat" element={<AgentChat />} />
+                <Route path="/conversations" element={<Conversations />} />
+                <Route path="/sessions" element={<Sessions />} />
+                <Route path="/tools" element={<Tools />} />
+                <Route path="/skills" element={<Skills />} />
+                <Route path="/hooks" element={<Hooks />} />
+                <Route path="/subagents" element={<Subagents />} />
+                <Route path="/permissions" element={<Permissions />} />
+                <Route path="/observability" element={<Observability />} />
+                <Route path="/settings" element={<Settings />} />
+              </Routes>
+            </Layout>
+          </AuthGuard>
+        } />
       </Routes>
-    </Layout>
+    </AuthProvider>
   );
 }

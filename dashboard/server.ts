@@ -309,6 +309,54 @@ app.use((req, res, next) => {
   else next();
 });
 
+// ═══ Auth ═══
+import crypto from 'node:crypto';
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+
+function hashPw(pw: string) { return crypto.createHash('sha256').update(pw + 'agentma').digest('hex'); }
+function loadUsers(): Map<string, any> { try { return new Map(JSON.parse(fs.readFileSync('/tmp/agentma_users.json', 'utf-8'))); } catch { return new Map(); } }
+function saveUsers(u: Map<string, any>) { fs.writeFileSync('/tmp/agentma_users.json', JSON.stringify(Array.from(u.entries()))); }
+
+function signJWT(obj: object): string {
+  const h = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const b = Buffer.from(JSON.stringify({ ...obj, exp: Math.floor(Date.now()/1000) + 7*86400 })).toString('base64url');
+  const s = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url');
+  return `${h}.${b}.${s}`;
+}
+function verifyJWT(t: string): any {
+  const [h, b, s] = t.split('.'); if (!h || !b || !s) return null;
+  if (crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url') !== s) return null;
+  const p = JSON.parse(Buffer.from(b, 'base64url').toString());
+  return p.exp > Math.floor(Date.now()/1000) ? p : null;
+}
+
+app.post('/api/auth/register', (req, res) => {
+  const { name, email, password } = req.body || {};
+  if (!email || !password || password.length < 6) { res.status(400).json({ error: '邮箱和密码至少 6 位' }); return; }
+  const users = loadUsers();
+  if (Array.from(users.values()).find((u: any) => u.email === email)) { res.status(409).json({ error: '邮箱已注册' }); return; }
+  const tenantId = crypto.randomUUID();
+  users.set(email, { email, name: name || email.split('@')[0], passwordHash: hashPw(password), tenantId });
+  saveUsers(users);
+  const token = signJWT({ sub: email, tenantId });
+  res.json({ token, email, name: name || email.split('@')[0], tenantId });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const { email, password } = req.body || {};
+  const users = loadUsers();
+  const u = users.get(email);
+  if (!u || u.passwordHash !== hashPw(password)) { res.status(401).json({ error: '邮箱或密码错误' }); return; }
+  res.json({ token: signJWT({ sub: email, tenantId: u.tenantId }), email: u.email, name: u.name, tenantId: u.tenantId });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  const t = (req.headers.authorization || '').replace('Bearer ', '');
+  const p = verifyJWT(t);
+  if (!p) { res.status(401).json({ error: '未登录' }); return; }
+  res.json({ email: p.sub, tenantId: p.tenantId });
+});
+
 app.listen(PORT, () => {
   console.log(`[agentma] http://localhost:${PORT}`);
   recoverDeployedServers();
