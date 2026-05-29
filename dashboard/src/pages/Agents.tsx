@@ -1,37 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { AgentTemplate, EffortLevel, PermissionMode, SkillInfo, RegisteredTool } from '../simulator/types';
 import { BUILT_IN_TOOLS, EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, MOCK_MCP_SERVERS, initCustomTools } from '../simulator/mock-data';
-import { getAuthHeaders } from '../utils/client-runtime';
-
-const LS_AGENTS = 'agentma_templates';
-
-// Instant paint from the local cache; the tenant-shared server copy is fetched on mount and is authoritative.
-function loadCachedTemplates(): AgentTemplate[] {
-  try { const raw = localStorage.getItem(LS_AGENTS); if (raw) return JSON.parse(raw); } catch {}
-  return [];
-}
-
-// Mirror to localStorage so other pages (Conversations / AgentChat) that read the cache stay in sync.
-function cacheTemplates(list: AgentTemplate[]) {
-  try { localStorage.setItem(LS_AGENTS, JSON.stringify(list)); } catch {}
-}
-
-async function fetchTemplates(): Promise<AgentTemplate[]> {
-  const r = await fetch('/api/agents', { headers: getAuthHeaders() });
-  if (!r.ok) throw new Error(`GET /api/agents ${r.status}`);
-  const list = await r.json();
-  return Array.isArray(list) ? list : [];
-}
-
-async function saveTemplates(list: AgentTemplate[]) {
-  cacheTemplates(list);
-  await fetch('/api/agents', {
-    method: 'PUT',
-    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify(list),
-  });
-}
+import { useAuth } from '../contexts/AuthContext';
+import { bootstrapAgentTemplates, loadCachedAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
 
 function loadSkills(): SkillInfo[] {
   try { const raw = localStorage.getItem('agentma_skills'); if (raw) return JSON.parse(raw); } catch {}
@@ -66,10 +38,13 @@ const TOOL_CATEGORIES = [
 
 export default function Agents() {
   const navigate = useNavigate();
-  const [templates, setTemplates] = useState<AgentTemplate[]>(loadCachedTemplates);
-  const didLoad = useRef(false);
+  const { user } = useAuth();
+  const [templates, setTemplates] = useState<AgentTemplate[]>([]);
   const [form, setForm] = useState<AgentTemplate>(newTemplate());
   const [isEditing, setIsEditing] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState('');
   // 动态加载技能和 MCP 服务器（非写死）
   const [liveSkills] = useState<SkillInfo[]>(loadSkills);
   const [liveMcp] = useState<{ name: string }[]>(loadMcpServers);
@@ -91,19 +66,43 @@ export default function Agents() {
     return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('storage', onStorage); };
   }, []);
 
-  // Load tenant-shared agents from the server on mount (overrides the local cache).
   useEffect(() => {
-    fetchTemplates()
-      .then(list => { setTemplates(list); cacheTemplates(list); })
-      .catch(() => {})
-      .finally(() => { didLoad.current = true; });
-  }, []);
+    if (!user?.tenantId) return;
 
-  // Persist changes to the server (and mirror to cache); skip until the initial load completes.
+    let cancelled = false;
+    setTemplates(loadCachedAgentTemplates(user.tenantId));
+    setIsLoading(true);
+
+    void bootstrapAgentTemplates(user.tenantId, user.role === 'tenant_admin')
+      .then((list) => {
+        if (cancelled) return;
+        setTemplates(list);
+        setError('');
+      })
+      .catch((loadError) => {
+        if (cancelled) return;
+        setError((loadError as Error).message || '加载 Agent 失败');
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [user?.tenantId, user?.role]);
+
   useEffect(() => {
-    if (!didLoad.current) return;
-    void saveTemplates(templates).catch(() => {});
-  }, [templates]);
+    if (!form.id) return;
+    const current = templates.find((template) => template.id === form.id);
+    if (current) {
+      setForm(current);
+      setIsEditing(true);
+      return;
+    }
+    if (isEditing) {
+      setForm(newTemplate());
+      setIsEditing(false);
+    }
+  }, [templates, form.id, isEditing]);
 
   const handleSelect = (t: AgentTemplate) => {
     setForm({ ...t });
@@ -115,8 +114,8 @@ export default function Agents() {
     setIsEditing(false);
   };
 
-  const handleSave = () => {
-    if (!form.name.trim()) return;
+  const handleSave = async () => {
+    if (!form.name.trim() || !user?.tenantId) return;
     const now = Date.now();
     const saved: AgentTemplate = {
       ...form,
@@ -125,19 +124,38 @@ export default function Agents() {
       createdAt: form.createdAt || now,
       updatedAt: now,
     };
+    const nextTemplates = isEditing
+      ? templates.map(t => t.id === saved.id ? saved : t)
+      : [saved, ...templates];
 
-    if (isEditing) {
-      setTemplates(prev => prev.map(t => t.id === saved.id ? saved : t));
-    } else {
-      setTemplates(prev => [saved, ...prev]);
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      setTemplates(persisted);
+      setForm(persisted.find((template) => template.id === saved.id) || saved);
+      setIsEditing(true);
+      setError('');
+    } catch (saveError) {
+      setError((saveError as Error).message || '保存 Agent 失败');
+    } finally {
+      setIsSaving(false);
     }
-    setForm(saved);
-    setIsEditing(true);
   };
 
-  const handleDelete = (id: string) => {
-    setTemplates(prev => prev.filter(t => t.id !== id));
-    if (form.id === id) { setForm(newTemplate()); setIsEditing(false); }
+  const handleDelete = async (id: string) => {
+    if (!user?.tenantId) return;
+    const nextTemplates = templates.filter(t => t.id !== id);
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      setTemplates(persisted);
+      setError('');
+      if (form.id === id) { setForm(newTemplate()); setIsEditing(false); }
+    } catch (saveError) {
+      setError((saveError as Error).message || '删除 Agent 失败');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const toggleTool = (tool: string) => {
@@ -187,14 +205,24 @@ export default function Agents() {
         <p>创建可复用的 Agent 配置模版，选择工具和技能，保存后开启多轮对话</p>
       </div>
 
+      {error && (
+        <div className="card" style={{ marginBottom: 16, borderColor: 'var(--danger)', color: 'var(--danger)' }}>
+          {error}
+        </div>
+      )}
+
       <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: 20 }}>
         {/* 模板列表 */}
         <div>
-          <button className="btn btn-primary mb-4" onClick={handleNew} style={{ width: '100%' }}>
+          <button className="btn btn-primary mb-4" onClick={handleNew} style={{ width: '100%' }} disabled={isSaving}>
             + 新建 Agent
           </button>
 
-          {templates.length === 0 ? (
+          {isLoading ? (
+            <div className="card" style={{ textAlign: 'center', color: 'var(--ink-muted)', padding: 40 }}>
+              加载中...
+            </div>
+          ) : templates.length === 0 ? (
             <div className="card" style={{ textAlign: 'center', color: 'var(--ink-muted)', padding: 40 }}>
               暂无 Agent，点击上方按钮创建
             </div>
@@ -234,11 +262,13 @@ export default function Agents() {
               <div className="flex gap-2">
                 {isEditing && (
                   <>
-                    <button className="btn btn-sm btn-primary" onClick={() => startChat(form)}>💬 开始对话</button>
-                    <button className="btn btn-sm btn-danger" onClick={() => handleDelete(form.id)}>删除</button>
+                    <button className="btn btn-sm btn-primary" onClick={() => startChat(form)} disabled={isSaving}>💬 开始对话</button>
+                    <button className="btn btn-sm btn-danger" onClick={() => { void handleDelete(form.id); }} disabled={isSaving}>删除</button>
                   </>
                 )}
-                <button className="btn btn-sm btn-primary" onClick={handleSave}>收养</button>
+                <button className="btn btn-sm btn-primary" onClick={() => { void handleSave(); }} disabled={isSaving}>
+                  {isSaving ? '保存中...' : '收养'}
+                </button>
               </div>
             </div>
 

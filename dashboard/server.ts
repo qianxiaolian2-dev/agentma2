@@ -419,7 +419,7 @@ app.post('/api/auth/register', (req, res) => {
   const result = registerUser(name || email.split('@')[0], email, password);
   if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
   const token = signJWT({ sub: result.user.email, tenantId: result.tenantId });
-  res.json({ token, email: result.user.email, name: result.user.name, tenantId: result.tenantId });
+  res.json({ token, email: result.user.email, name: result.user.name, tenantId: result.tenantId, role: result.user.role });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -431,6 +431,7 @@ app.post('/api/auth/login', (req, res) => {
     email: result.user.email,
     name: result.user.name,
     tenantId: result.user.tenantId,
+    role: result.user.role,
   });
 });
 

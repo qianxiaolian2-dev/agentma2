@@ -1,10 +1,11 @@
-import { createContext, useContext, useState, useCallback, ReactNode } from 'react';
-import { getStoredAuthToken } from '../utils/client-runtime';
+import { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
+import { getAuthHeaders, getStoredAuthToken, getStoredAuthUser } from '../utils/client-runtime';
 
 interface User {
   email: string;
   name: string;
   tenantId?: string;
+  role?: 'tenant_admin' | 'team_admin' | 'member';
 }
 
 interface AuthContextType {
@@ -28,15 +29,41 @@ function saveUser(user: User) { localStorage.setItem('agentma_user', JSON.string
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(() => {
     const t = getStoredAuthToken();
-    const u = localStorage.getItem('agentma_user');
+    const u = getStoredAuthUser();
     return t && u ? t : null;
   });
   const [user, setUser] = useState<User | null>(() => {
     const t = getStoredAuthToken();
-    const u = localStorage.getItem('agentma_user');
+    const u = getStoredAuthUser();
     if (!t || !u) return null;
-    try { return JSON.parse(u) as User; } catch { return null; }
+    return u;
   });
+
+  useEffect(() => {
+    if (!token) return;
+    if (user?.tenantId && user?.role) return;
+
+    let cancelled = false;
+    const hydrate = async () => {
+      try {
+        const res = await fetch('/api/auth/me', { headers: getAuthHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        const nextUser: User = {
+          email: data.email || user?.email || '',
+          name: data.name || user?.name || '',
+          tenantId: data.tenantId || user?.tenantId,
+          role: data.role || user?.role,
+        };
+        if (cancelled) return;
+        saveUser(nextUser);
+        setUser(nextUser);
+      } catch {}
+    };
+
+    void hydrate();
+    return () => { cancelled = true; };
+  }, [token, user]);
 
   const login = useCallback(async (email: string, password: string) => {
     try {
@@ -49,9 +76,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!res.ok) return { ok: false, error: data.error || '登录失败' };
       clearApiKey();
       saveJwt(data.token);
-      saveUser({ email: data.email, name: data.name, tenantId: data.tenantId });
+      saveUser({ email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
       setToken(data.token);
-      setUser({ email: data.email, name: data.name, tenantId: data.tenantId });
+      setUser({ email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
       return { ok: true };
     } catch (e) { return { ok: false, error: (e as Error).message }; }
   }, []);
@@ -67,9 +94,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!res.ok) return { ok: false, error: data.error || '注册失败' };
       clearApiKey();
       saveJwt(data.token);
-      saveUser({ email: data.email, name: data.name, tenantId: data.tenantId });
+      saveUser({ email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
       setToken(data.token);
-      setUser({ email: data.email, name: data.name, tenantId: data.tenantId });
+      setUser({ email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
       return { ok: true };
     } catch (e) { return { ok: false, error: (e as Error).message }; }
   }, []);
@@ -83,9 +110,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!res.ok) return { ok: false, error: 'API 密钥无效' };
       clearJwt();
       saveApiKey(key);
-      saveUser({ email: data.email || '', name: data.name || '', tenantId: data.tenantId });
+      saveUser({ email: data.email || '', name: data.name || '', tenantId: data.tenantId, role: data.role });
       setToken(key);
-      setUser({ email: data.email || '', name: data.name || '', tenantId: data.tenantId });
+      setUser({ email: data.email || '', name: data.name || '', tenantId: data.tenantId, role: data.role });
       return { ok: true };
     } catch (e) { return { ok: false, error: (e as Error).message }; }
   }, []);

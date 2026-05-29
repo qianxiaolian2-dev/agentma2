@@ -4,6 +4,8 @@ import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig } from '..
 import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
 import { getEndpointProbeBlockReason } from '../utils/client-runtime';
+import { useAuth } from '../contexts/AuthContext';
+import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import {
   bootstrapChatSessions,
   deleteChatSession as deleteChatSessionApi,
@@ -63,11 +65,6 @@ function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }
   );
 }
 
-const LS_AGENTS = 'agentma_templates';
-function loadTemplates(): AgentTemplate[] {
-  try { const raw = localStorage.getItem(LS_AGENTS); if (raw) return JSON.parse(raw); } catch {}
-  return [];
-}
 function loadGlobalProvider(): ProviderConfig {
   try {
     const raw = localStorage.getItem('agentma_provider_config');
@@ -86,8 +83,9 @@ function formatEvent(ev: { type: string; source?: string; username?: string; mes
 
 export default function Conversations() {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [templates, setTemplates] = useState<AgentTemplate[]>([]);
+  const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
   const [selectedAgentId, setSelectedAgentId] = useState('');
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
 
@@ -241,8 +239,16 @@ export default function Conversations() {
 
   useEffect(() => {
     let cancelled = false;
-    const templatesList = loadTemplates();
-    setTemplates(templatesList);
+    if (user?.tenantId) {
+      setTemplates(loadCachedAgentTemplates(user.tenantId));
+      void bootstrapAgentTemplates(user.tenantId, user.role === 'tenant_admin')
+        .then((list) => {
+          if (!cancelled) setTemplates(list);
+        })
+        .catch((error) => {
+          console.error('failed to load agent templates', error);
+        });
+    }
 
     (async () => {
       try {
@@ -254,7 +260,7 @@ export default function Conversations() {
     })();
 
     return () => { cancelled = true; };
-  }, []);
+  }, [user?.tenantId, user?.role]);
 
   useEffect(() => {
     if (selectedAgentId) return;
@@ -746,9 +752,9 @@ export default function Conversations() {
                   value={input}
                   onChange={e => setInput(e.target.value)}
                   onKeyDown={e => {
-                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+                    if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); handleSend(); }
                   }}
-                  placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+                  placeholder="输入消息，Enter 换行，Shift+Enter 发送"
                   rows={1}
                   disabled={isStreaming}
                 />

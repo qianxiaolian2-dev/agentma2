@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import type { AgentTemplate, ChatMessage, ChatSession, ProviderConfig } from '../simulator/types';
 import { getDefaultProviderConfig } from '../simulator/mock-data';
+import { useAuth } from '../contexts/AuthContext';
+import { bootstrapAgentTemplates, getCachedAgentTemplateById } from '../utils/agent-templates';
 import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
 
 function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
@@ -16,20 +18,10 @@ function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConf
   return getDefaultProviderConfig();
 }
 
-function loadTemplate(id: string): AgentTemplate | null {
-  try {
-    const raw = localStorage.getItem('agentma_templates');
-    if (raw) {
-      const list: AgentTemplate[] = JSON.parse(raw);
-      return list.find(t => t.id === id) || null;
-    }
-  } catch {}
-  return null;
-}
-
 export default function AgentChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [searchParams] = useSearchParams();
   const resumeSessionId = searchParams.get('session');
   const [template, setTemplate] = useState<AgentTemplate | null>(null);
@@ -46,20 +38,32 @@ export default function AgentChat() {
   // 加载模板 + 恢复会话
   useEffect(() => {
     let cancelled = false;
-    if (!id) return;
-    const tpl = loadTemplate(id);
-    if (!tpl) { navigate('/agents'); return; }
-    setTemplate(tpl);
+    if (!id || !user?.tenantId) return;
 
-    // 合并全局 + Agent 级别的 provider 配置
-    provider.current = loadProvider(tpl.providerOverrides);
-    // 如果模板没有覆盖 model，且 provider 也没有，用模板的 model
-    if (!provider.current.ANTHROPIC_MODEL && tpl.model) {
-      provider.current.ANTHROPIC_MODEL = tpl.model;
+    const cachedTemplate = getCachedAgentTemplateById(user.tenantId, id);
+    if (cachedTemplate) {
+      setTemplate(cachedTemplate);
+      provider.current = loadProvider(cachedTemplate.providerOverrides);
+      if (!provider.current.ANTHROPIC_MODEL && cachedTemplate.model) {
+        provider.current.ANTHROPIC_MODEL = cachedTemplate.model;
+      }
     }
 
     (async () => {
       try {
+        const templateList = await bootstrapAgentTemplates(user.tenantId, user.role === 'tenant_admin');
+        const serverTemplate = templateList.find((template) => template.id === id) || null;
+        if (!serverTemplate) {
+          if (!cancelled) navigate('/agents');
+          return;
+        }
+        if (cancelled) return;
+        setTemplate(serverTemplate);
+        provider.current = loadProvider(serverTemplate.providerOverrides);
+        if (!provider.current.ANTHROPIC_MODEL && serverTemplate.model) {
+          provider.current.ANTHROPIC_MODEL = serverTemplate.model;
+        }
+
         const sessions = await bootstrapChatSessions();
         const existingSession = resumeSessionId
           ? sessions.find((session) => session.id === resumeSessionId)
@@ -85,7 +89,7 @@ export default function AgentChat() {
     })();
 
     return () => { cancelled = true; };
-  }, [id, navigate, resumeSessionId]);
+  }, [id, navigate, resumeSessionId, user?.tenantId, user?.role]);
 
   const persistSession = useCallback(async (nextMessages: ChatMessage[]) => {
     if (!template || !id || nextMessages.length === 0) return '';
@@ -289,12 +293,12 @@ export default function AgentChat() {
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => {
-              if (e.key === 'Enter' && !e.shiftKey) {
+              if (e.key === 'Enter' && e.shiftKey) {
                 e.preventDefault();
                 handleSend();
               }
             }}
-            placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+            placeholder="输入消息，Enter 换行，Shift+Enter 发送"
             rows={1}
             disabled={isStreaming}
           />
