@@ -34,7 +34,7 @@ const SECTIONS = [
 export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const { user, logout } = useAuth();
   return (
-    <nav className="sidebar" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <nav className="sidebar-body" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <div className="sidebar-logo">🐾 AgentMa</div>
       <div style={{ flex: 1, overflow: 'auto' }}>
         {SECTIONS.map(section => (

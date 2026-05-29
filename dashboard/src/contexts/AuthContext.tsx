@@ -1,4 +1,5 @@
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import { createContext, useContext, useState, useCallback, ReactNode } from 'react';
+import { getStoredAuthToken } from '../utils/client-runtime';
 
 interface User {
   email: string;
@@ -19,20 +20,23 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | null>(null);
 
 function saveJwt(token: string) { localStorage.setItem('agentma_jwt', token); }
+function clearJwt() { localStorage.removeItem('agentma_jwt'); }
+function saveApiKey(key: string) { localStorage.setItem('agentma_api_key', key); }
+function clearApiKey() { localStorage.removeItem('agentma_api_key'); }
 function saveUser(user: User) { localStorage.setItem('agentma_user', JSON.stringify(user)); }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(null);
-
-  useEffect(() => {
-    const t = localStorage.getItem('agentma_jwt');
+  const [token, setToken] = useState<string | null>(() => {
+    const t = getStoredAuthToken();
     const u = localStorage.getItem('agentma_user');
-    if (t && u) {
-      setToken(t);
-      try { setUser(JSON.parse(u)); } catch { setUser(null); }
-    }
-  }, []);
+    return t && u ? t : null;
+  });
+  const [user, setUser] = useState<User | null>(() => {
+    const t = getStoredAuthToken();
+    const u = localStorage.getItem('agentma_user');
+    if (!t || !u) return null;
+    try { return JSON.parse(u) as User; } catch { return null; }
+  });
 
   const login = useCallback(async (email: string, password: string) => {
     try {
@@ -43,6 +47,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
       const data = await res.json();
       if (!res.ok) return { ok: false, error: data.error || '登录失败' };
+      clearApiKey();
       saveJwt(data.token);
       saveUser({ email: data.email, name: data.name, tenantId: data.tenantId });
       setToken(data.token);
@@ -60,6 +65,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
       const data = await res.json();
       if (!res.ok) return { ok: false, error: data.error || '注册失败' };
+      clearApiKey();
       saveJwt(data.token);
       saveUser({ email: data.email, name: data.name, tenantId: data.tenantId });
       setToken(data.token);
@@ -75,7 +81,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       });
       const data = await res.json();
       if (!res.ok) return { ok: false, error: 'API 密钥无效' };
-      localStorage.setItem('agentma_api_key', key);
+      clearJwt();
+      saveApiKey(key);
+      saveUser({ email: data.email || '', name: data.name || '', tenantId: data.tenantId });
       setToken(key);
       setUser({ email: data.email || '', name: data.name || '', tenantId: data.tenantId });
       return { ok: true };

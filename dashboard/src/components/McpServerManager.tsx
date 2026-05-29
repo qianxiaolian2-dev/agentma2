@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import type { RegisteredTool } from '../simulator/types';
 import { genMinecraftServerCode } from '../simulator/mock-data';
 import StatusBadge from './common/StatusBadge';
+import { getEndpointProbeBlockReason } from '../utils/client-runtime';
 
 export function McpServerCard({ server, tools }: { server: string; tools: RegisteredTool[] }) {
   const [showCode, setShowCode] = useState(false);
@@ -14,6 +15,11 @@ export function McpServerCard({ server, tools }: { server: string; tools: Regist
   const checkStatus = useCallback(async () => {
     if (endpoints.length === 0) return;
     const url = endpoints[0].endpoint!.url;
+    const blockedReason = getEndpointProbeBlockReason(url);
+    if (blockedReason) {
+      setStatus('offline');
+      return;
+    }
     const base = url.replace(/\/api\/[^/]+$/, '');
     try {
       const controller = new AbortController();

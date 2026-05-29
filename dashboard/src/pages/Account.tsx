@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import JsonViewer from '../components/common/JsonViewer';
+import { getAuthHeaders } from '../utils/client-runtime';
+
+const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
 
 export default function Account() {
   const { user, token } = useAuth();
@@ -35,9 +38,9 @@ export default function Account() {
 function TenantInfo() {
   const [tenant, setTenant] = useState<any>(null);
   const [name, setName] = useState('');
-  useEffect(() => { fetch('/api/tenant').then(r => r.json()).then(d => { setTenant(d); setName(d.name || ''); }); }, []);
+  useEffect(() => { fetch('/api/tenant', { headers: getAuthHeaders() }).then(r => r.json()).then(d => { setTenant(d); setName(d.name || ''); }); }, []);
   const save = async () => {
-    await fetch('/api/tenant', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+    await fetch('/api/tenant', { method: 'PATCH', headers: jsonAuthHeaders(), body: JSON.stringify({ name }) });
     setTenant({ ...tenant, name });
   };
   if (!tenant) return null;
@@ -49,7 +52,7 @@ function TenantInfo() {
         <div className="form-group"><label>ID</label><input value={tenant.id} readOnly /></div>
         <div className="form-group"><label>区域</label><input value={tenant.region} readOnly /></div>
         <div className="form-group"><label>套餐</label>
-          <select value={tenant.plan} onChange={e => { const p = e.target.value; fetch('/api/tenant', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan: p }) }).then(() => setTenant({ ...tenant, plan: p })); }}>
+          <select value={tenant.plan} onChange={e => { const p = e.target.value; fetch('/api/tenant', { method: 'PATCH', headers: jsonAuthHeaders(), body: JSON.stringify({ plan: p }) }).then(() => setTenant({ ...tenant, plan: p })); }}>
             <option value="free">Free</option><option value="pro">Pro</option><option value="enterprise">Enterprise</option>
           </select>
         </div>
@@ -62,14 +65,14 @@ function TenantInfo() {
 
 function UserManager() {
   const [users, setUsers] = useState<any[]>([]);
-  useEffect(() => { fetch('/api/users').then(r => r.json()).then(setUsers); }, []);
+  useEffect(() => { fetch('/api/users', { headers: getAuthHeaders() }).then(r => r.json()).then(setUsers); }, []);
   const changeRole = async (email: string, role: string) => {
-    await fetch(`/api/users/${encodeURIComponent(email)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }) });
+    await fetch(`/api/users/${encodeURIComponent(email)}`, { method: 'PATCH', headers: jsonAuthHeaders(), body: JSON.stringify({ role }) });
     setUsers(users.map((u: any) => u.email === email ? { ...u, role } : u));
   };
   const remove = async (email: string) => {
     if (!confirm('确定删除用户 ' + email + '？')) return;
-    await fetch(`/api/users/${encodeURIComponent(email)}`, { method: 'DELETE' });
+    await fetch(`/api/users/${encodeURIComponent(email)}`, { method: 'DELETE', headers: getAuthHeaders() });
     setUsers(users.filter((u: any) => u.email !== email));
   };
   return (
@@ -103,17 +106,17 @@ function ApiKeyManager() {
   const [newName, setNewName] = useState('');
   const [newScopes, setNewScopes] = useState<string[]>([]);
   const [rawKey, setRawKey] = useState('');
-  useEffect(() => { fetch('/api/api-keys').then(r => r.json()).then(setKeys); }, []);
+  useEffect(() => { fetch('/api/api-keys', { headers: getAuthHeaders() }).then(r => r.json()).then(setKeys); }, []);
 
   const create = async () => {
-    const r = await fetch('/api/api-keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: newName, scopes: newScopes }) });
+    const r = await fetch('/api/api-keys', { method: 'POST', headers: jsonAuthHeaders(), body: JSON.stringify({ name: newName, scopes: newScopes }) });
     const k = await r.json();
     setKeys([...keys, k]);
     setRawKey(k.rawKey);
     setNewName(''); setNewScopes([]);
   };
   const revoke = async (id: string) => {
-    await fetch(`/api/api-keys/${id}`, { method: 'DELETE' });
+    await fetch(`/api/api-keys/${id}`, { method: 'DELETE', headers: getAuthHeaders() });
     setKeys(keys.filter((k: any) => k.id !== id));
   };
 
@@ -161,25 +164,25 @@ function TeamManager() {
   const [members, setMembers] = useState<any[]>([]);
   const [newName, setNewName] = useState('');
   const [addEmail, setAddEmail] = useState('');
-  useEffect(() => { fetch('/api/teams').then(r => r.json()).then(setTeams); }, []);
+  useEffect(() => { fetch('/api/teams', { headers: getAuthHeaders() }).then(r => r.json()).then(setTeams); }, []);
 
   const create = async () => {
-    const r = await fetch('/api/teams', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: newName }) });
+    const r = await fetch('/api/teams', { method: 'POST', headers: jsonAuthHeaders(), body: JSON.stringify({ name: newName }) });
     const t = await r.json();
     setTeams([...teams, t]); setNewName('');
   };
   const select = async (t: any) => {
     setSel(t);
-    const r = await fetch(`/api/teams/${t.id}/members`);
+    const r = await fetch(`/api/teams/${t.id}/members`, { headers: getAuthHeaders() });
     setMembers(await r.json());
   };
   const addMember = async () => {
-    await fetch(`/api/teams/${sel.id}/members`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: addEmail, role: 'member' }) });
+    await fetch(`/api/teams/${sel.id}/members`, { method: 'POST', headers: jsonAuthHeaders(), body: JSON.stringify({ userId: addEmail, role: 'member' }) });
     setAddEmail('');
     select(sel);
   };
   const removeMember = async (uid: string) => {
-    await fetch(`/api/teams/${sel.id}/members/${uid}`, { method: 'DELETE' });
+    await fetch(`/api/teams/${sel.id}/members/${uid}`, { method: 'DELETE', headers: getAuthHeaders() });
     select(sel);
   };
 
@@ -215,10 +218,10 @@ function QuotaManager() {
   const [quota, setQuota] = useState<any>(null);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState<any>({});
-  useEffect(() => { fetch('/api/quota').then(r => r.json()).then(d => { setQuota(d); setForm(d); }); }, []);
+  useEffect(() => { fetch('/api/quota', { headers: getAuthHeaders() }).then(r => r.json()).then(d => { setQuota(d); setForm(d); }); }, []);
 
   const save = async () => {
-    const r = await fetch('/api/quota', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form) });
+    const r = await fetch('/api/quota', { method: 'PATCH', headers: jsonAuthHeaders(), body: JSON.stringify(form) });
     setQuota(await r.json()); setEditing(false);
   };
 
@@ -258,7 +261,7 @@ function QuotaManager() {
 
 function AuditLogs() {
   const [logs, setLogs] = useState<any[]>([]);
-  useEffect(() => { fetch('/api/audit-logs').then(r => r.json()).then(setLogs); }, []);
+  useEffect(() => { fetch('/api/audit-logs', { headers: getAuthHeaders() }).then(r => r.json()).then(setLogs); }, []);
   return (
     <div className="card">
       <div className="card-header">审计日志 ({logs.length})</div>

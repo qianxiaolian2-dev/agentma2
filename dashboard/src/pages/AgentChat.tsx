@@ -2,8 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import type { AgentTemplate, ChatMessage, ChatSession, ProviderConfig } from '../simulator/types';
 import { getDefaultProviderConfig } from '../simulator/mock-data';
-
-const LS_SESSIONS = 'agentma_chat_sessions';
+import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
 
 function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
   try {
@@ -28,15 +27,6 @@ function loadTemplate(id: string): AgentTemplate | null {
   return null;
 }
 
-function loadSessions(): ChatSession[] {
-  try { const raw = localStorage.getItem(LS_SESSIONS); if (raw) return JSON.parse(raw); } catch {}
-  return [];
-}
-
-function saveSessions(list: ChatSession[]) {
-  localStorage.setItem(LS_SESSIONS, JSON.stringify(list));
-}
-
 export default function AgentChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -47,6 +37,7 @@ export default function AgentChat() {
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [sessionId, setSessionId] = useState<string>('');
+  const [sessionMeta, setSessionMeta] = useState<ChatSession | null>(null);
   const [streamThinking, setStreamThinking] = useState('');
   const [streamText, setStreamText] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -54,6 +45,7 @@ export default function AgentChat() {
 
   // 加载模板 + 恢复会话
   useEffect(() => {
+    let cancelled = false;
     if (!id) return;
     const tpl = loadTemplate(id);
     if (!tpl) { navigate('/agents'); return; }
@@ -66,42 +58,64 @@ export default function AgentChat() {
       provider.current.ANTHROPIC_MODEL = tpl.model;
     }
 
-    const sessions = loadSessions();
-    // 优先按 URL 参数中的 session ID 恢复，否则找该模板最近的一个会话
-    const existingSession = resumeSessionId
-      ? sessions.find(s => s.id === resumeSessionId)
-      : sessions.filter(s => s.templateId === id && s.messages.length > 0)
-          .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    (async () => {
+      try {
+        const sessions = await bootstrapChatSessions();
+        const existingSession = resumeSessionId
+          ? sessions.find((session) => session.id === resumeSessionId)
+          : sessions
+              .filter((session) => session.templateId === id && session.messages.length > 0)
+              .sort((a, b) => b.updatedAt - a.updatedAt)[0];
 
-    if (existingSession) {
-      setSessionId(existingSession.id);
-      setMessages(existingSession.messages);
-    }
-  }, [id, navigate]);
+        if (cancelled) return;
 
-  // 保存会话
-  useEffect(() => {
-    if (!template || messages.length === 0) return;
+        if (existingSession) {
+          setSessionId(existingSession.id);
+          setSessionMeta(existingSession);
+          setMessages(existingSession.messages);
+          return;
+        }
 
-    const sessions = loadSessions();
+        setSessionId('');
+        setSessionMeta(null);
+        setMessages([]);
+      } catch (error) {
+        console.error('failed to load chat sessions', error);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [id, navigate, resumeSessionId]);
+
+  const persistSession = useCallback(async (nextMessages: ChatMessage[]) => {
+    if (!template || !id || nextMessages.length === 0) return '';
+
     const now = Date.now();
-    const session: ChatSession = {
-      id: sessionId || `chat-${id}-${now}`,
-      templateId: id!,
-      title: messages[0]?.content?.slice(0, 40) || '新对话',
-      messages,
-      model: template.model,
-      createdAt: sessionId ? (sessions.find(s => s.id === sessionId)?.createdAt || now) : now,
+    const nextId = sessionId || `chat-${id}-${now}`;
+    const draft: ChatSession = {
+      id: nextId,
+      templateId: id,
+      title: sessionMeta?.title || nextMessages[0]?.content?.slice(0, 40) || '新对话',
+      messages: nextMessages,
+      model: template.model || provider.current.ANTHROPIC_MODEL || sessionMeta?.model || '',
+      pinned: sessionMeta?.pinned,
+      createdAt: sessionMeta?.createdAt || now,
       updatedAt: now,
     };
 
-    const updated = sessionId
-      ? sessions.map(s => s.id === sessionId ? session : s)
-      : [session, ...sessions];
+    setSessionId(nextId);
+    setSessionMeta(draft);
 
-    saveSessions(updated);
-    if (!sessionId) setSessionId(session.id);
-  }, [messages, sessionId, id, template]);
+    try {
+      const saved = await saveChatSessionApi(draft);
+      setSessionId(saved.id);
+      setSessionMeta(saved);
+      return saved.id;
+    } catch (error) {
+      console.error('failed to persist chat session', error);
+      return nextId;
+    }
+  }, [template, id, sessionId, sessionMeta]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -132,11 +146,13 @@ export default function AgentChat() {
       });
 
       if (!res.ok) {
-        setMessages(prev => [...prev, {
+        const finalMessages = [...newMessages, {
           role: 'assistant',
           content: `API 错误: ${res.status}`,
           timestamp: Date.now(),
-        }]);
+        }];
+        setMessages(finalMessages);
+        await persistSession(finalMessages);
         setIsStreaming(false);
         return;
       }
@@ -173,19 +189,23 @@ export default function AgentChat() {
             } else if (data.type === 'result') {
               // 完成 — 追加最终消息
               const finalContent = text || thinking || data.text || '';
-              setMessages(prev => [...prev, {
+              const finalMessages = [...newMessages, {
                 role: 'assistant',
                 content: finalContent,
                 timestamp: Date.now(),
-              }]);
+              }];
+              setMessages(finalMessages);
+              await persistSession(finalMessages);
               setStreamThinking('');
               setStreamText('');
             } else if (data.type === 'error') {
-              setMessages(prev => [...prev, {
+              const finalMessages = [...newMessages, {
                 role: 'assistant',
                 content: `错误: ${data.message}`,
                 timestamp: Date.now(),
-              }]);
+              }];
+              setMessages(finalMessages);
+              await persistSession(finalMessages);
               setStreamThinking('');
               setStreamText('');
             }
@@ -193,14 +213,16 @@ export default function AgentChat() {
         }
       }
     } catch (e) {
-      setMessages(prev => [...prev, {
+      const finalMessages = [...newMessages, {
         role: 'assistant',
         content: `连接失败: ${(e as Error).message}`,
         timestamp: Date.now(),
-      }]);
+      }];
+      setMessages(finalMessages);
+      await persistSession(finalMessages);
     }
     setIsStreaming(false);
-  }, [input, isStreaming, template, messages]);
+  }, [input, isStreaming, template, messages, persistSession]);
 
   if (!template) {
     return <div className="page-header"><h1>加载中...</h1></div>;

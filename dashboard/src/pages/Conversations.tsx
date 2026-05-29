@@ -3,6 +3,13 @@ import { useNavigate } from 'react-router-dom';
 import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig } from '../simulator/types';
 import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
+import { getEndpointProbeBlockReason } from '../utils/client-runtime';
+import {
+  bootstrapChatSessions,
+  deleteChatSession as deleteChatSessionApi,
+  patchChatSession,
+  saveChatSession as saveChatSessionApi,
+} from '../utils/chat-sessions';
 
 // MCP 服务状态指示灯（自动 ping 端点）
 function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }) {
@@ -25,6 +32,14 @@ function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }
   useEffect(() => {
     let cancelled = false;
     const check = async () => {
+      const blockedReason = getEndpointProbeBlockReason(endpoint);
+      if (blockedReason) {
+        if (!cancelled) {
+          setStatus('offline');
+          setDetail(blockedReason);
+        }
+        return;
+      }
       // 试 /api/health
       const base = endpoint.replace(/\/api\/[^/]+$/, '');
       let ok = await doPing(base + '/api/health');
@@ -48,19 +63,10 @@ function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }
   );
 }
 
-const LS_SESSIONS = 'agentma_chat_sessions';
 const LS_AGENTS = 'agentma_templates';
-
-function loadSessions(): ChatSession[] {
-  try { const raw = localStorage.getItem(LS_SESSIONS); if (raw) return JSON.parse(raw); } catch {}
-  return [];
-}
 function loadTemplates(): AgentTemplate[] {
   try { const raw = localStorage.getItem(LS_AGENTS); if (raw) return JSON.parse(raw); } catch {}
   return [];
-}
-function saveSessions(list: ChatSession[]) {
-  localStorage.setItem(LS_SESSIONS, JSON.stringify(list));
 }
 function loadGlobalProvider(): ProviderConfig {
   try {
@@ -102,7 +108,7 @@ export default function Conversations() {
   const [subbedSources, setSubbedSources] = useState<string[]>([]);
   const [showEventToggles, setShowEventToggles] = useState(false);
   const autoReplyRef = useRef<((eventText: string) => Promise<void>) | null>(null);
-  const persistRef = useRef<((msgs: ChatMessage[], sid: string | null) => string) | null>(null);
+  const persistRef = useRef<((msgs: ChatMessage[], sid: string | null) => Promise<string>) | null>(null);
 
   // 自动回复
   const doAutoReply = useCallback(async (eventText: string) => {
@@ -168,8 +174,8 @@ export default function Conversations() {
                 const finalMsgs = [...newMsgs, respMsg];
                 setMessages(finalMsgs);
                 setStreamThinking(''); setStreamText('');
-                const sid = persistRef.current?.(finalMsgs, activeSessionId) || '';
-                if (sid) { setActiveSessionId(sid); setSessions(loadSessions()); }
+                const sid = await (persistRef.current?.(finalMsgs, activeSessionId) || Promise.resolve(''));
+                if (sid) setActiveSessionId(sid);
               }
             } catch {}
           }
@@ -234,52 +240,71 @@ export default function Conversations() {
   }, []);
 
   useEffect(() => {
-    const s = loadSessions();
-    const t = loadTemplates();
-    setSessions(s);
-    setTemplates(t);
-    const lastId = s.length > 0
-      ? [...s].sort((a, b) => b.updatedAt - a.updatedAt)[0].templateId
-      : t[0]?.id || '';
-    if (lastId) setSelectedAgentId(lastId);
+    let cancelled = false;
+    const templatesList = loadTemplates();
+    setTemplates(templatesList);
+
+    (async () => {
+      try {
+        const savedSessions = await bootstrapChatSessions();
+        if (!cancelled) setSessions(savedSessions);
+      } catch (error) {
+        console.error('failed to load chat sessions', error);
+      }
+    })();
+
+    return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (selectedAgentId) return;
+    const lastId = sessions.length > 0
+      ? [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)[0].templateId
+      : templates[0]?.id || '';
+    if (lastId) setSelectedAgentId(lastId);
+  }, [sessions, templates, selectedAgentId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, streamThinking, streamText]);
 
-  // 保存会话 (同时写入 localStorage + 更新本地 state)
-  const persistSession = useCallback((msgs: ChatMessage[], sid: string | null) => {
+  // 保存会话（服务端持久化 + 本地状态同步）
+  const persistSession = useCallback(async (msgs: ChatMessage[], sid: string | null) => {
     if (!selectedAgentId || msgs.length === 0) return '';
     const now = Date.now();
     const id = sid || `chat-${Date.now()}`;
-    const session: ChatSession = {
+    const existing = sid ? sessions.find((session) => session.id === sid) : undefined;
+    const draft: ChatSession = {
       id,
       templateId: selectedAgentId,
-      title: msgs[0]?.content?.slice(0, 40) || '新对话',
+      title: existing?.title || msgs[0]?.content?.slice(0, 40) || '新对话',
       messages: msgs,
-      model: currentAgent?.model || provider.current.ANTHROPIC_MODEL || '',
-      createdAt: now,
+      model: currentAgent?.model || provider.current.ANTHROPIC_MODEL || existing?.model || '',
+      pinned: existing?.pinned,
+      createdAt: existing?.createdAt || now,
       updatedAt: now,
     };
-    // 本地更新：已有会话原位更新，新会话插入顶部
     setSessions(prev => {
-      const existing = prev.find(s => s.id === id);
-      if (existing) {
-        // 已有会话：原地更新，保持位置不变
-        return prev.map(s => s.id === id ? { ...session, createdAt: existing.createdAt } : s);
+      const existingSession = prev.find((session) => session.id === id);
+      if (existingSession) {
+        return prev.map((session) => session.id === id ? { ...draft, createdAt: existingSession.createdAt } : session);
       }
-      // 新会话：插入顶部
-      return [session, ...prev];
+      return [draft, ...prev];
     });
-    // 异步写 localStorage
-    const all = loadSessions();
-    const updated = sid
-      ? all.map(s => s.id === sid ? { ...session, createdAt: all.find(a => a.id === sid)?.createdAt || now } : s)
-      : [{ ...session, createdAt: now }, ...all];
-    saveSessions(updated);
-    return id;
-  }, [selectedAgentId, currentAgent]);
+
+    try {
+      const saved = await saveChatSessionApi(draft);
+      setSessions(prev => {
+        const exists = prev.some((session) => session.id === saved.id);
+        if (!exists) return [saved, ...prev];
+        return prev.map((session) => session.id === saved.id ? saved : session);
+      });
+      return saved.id;
+    } catch (error) {
+      console.error('failed to persist chat session', error);
+      return id;
+    }
+  }, [selectedAgentId, currentAgent, sessions]);
 
   // 把 persistSession 存到 ref 供 doAutoReply 使用
   persistRef.current = persistSession;
@@ -322,31 +347,46 @@ export default function Conversations() {
     setEditTitle(s.title || s.messages[0]?.content?.slice(0, 40) || '');
   };
 
-  const handleRename = (id: string) => {
-    if (!editTitle.trim()) return;
-    setSessions(prev => prev.map(s => s.id === id ? { ...s, title: editTitle.trim() } : s));
+  const handleRename = async (id: string) => {
+    const nextTitle = editTitle.trim();
+    if (!nextTitle) return;
+    setSessions(prev => prev.map(s => s.id === id ? { ...s, title: nextTitle } : s));
     setEditingId(null);
-    // 同步 localStorage
-    const all = loadSessions();
-    saveSessions(all.map(s => s.id === id ? { ...s, title: editTitle.trim() } : s));
+    try {
+      const saved = await patchChatSession(id, { title: nextTitle });
+      setSessions(prev => prev.map(s => s.id === id ? saved : s));
+    } catch (error) {
+      console.error('failed to rename chat session', error);
+    }
   };
 
   // 置顶
-  const handlePin = (id: string, e: React.MouseEvent) => {
+  const handlePin = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    setSessions(prev => prev.map(s => s.id === id ? { ...s, pinned: !s.pinned } : s));
-    const all = loadSessions();
-    saveSessions(all.map(s => s.id === id ? { ...s, pinned: !s.pinned } : s));
+    const current = sessions.find((session) => session.id === id);
+    const nextPinned = !current?.pinned;
+    setSessions(prev => prev.map(s => s.id === id ? { ...s, pinned: nextPinned } : s));
+    try {
+      const saved = await patchChatSession(id, { pinned: nextPinned });
+      setSessions(prev => prev.map(s => s.id === id ? saved : s));
+    } catch (error) {
+      console.error('failed to pin chat session', error);
+    }
   };
 
   // 删除会话
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     const updated = sessions.filter(s => s.id !== id);
-    saveSessions(updated);
     setSessions(updated);
     if (activeSessionId === id) {
       setActiveSessionId(null);
       setMessages([]);
+    }
+    try {
+      await deleteChatSessionApi(id);
+    } catch (error) {
+      console.error('failed to delete chat session', error);
+      setSessions(sessions);
     }
   };
 
@@ -408,7 +448,7 @@ export default function Conversations() {
         const errMsg: ChatMessage = { role: 'assistant', content: `API 错误: ${res.status}`, timestamp: Date.now() };
         const finalMsgs = [...newMsgs, errMsg];
         setMessages(finalMsgs);
-        const sid = persistSession(finalMsgs, activeSessionId);
+        const sid = await persistSession(finalMsgs, activeSessionId);
         if (sid) setActiveSessionId(sid);
         setIsStreaming(false);
         return;
@@ -440,13 +480,16 @@ export default function Conversations() {
               const respMsg: ChatMessage = { role: 'assistant', content, timestamp: Date.now() };
               const finalMsgs = [...newMsgs, respMsg];
               setMessages(finalMsgs);
-              const sid = persistSession(finalMsgs, activeSessionId);
+              const sid = await persistSession(finalMsgs, activeSessionId);
               if (sid) setActiveSessionId(sid);
               setStreamThinking('');
               setStreamText('');
             } else if (data.type === 'error') {
               const err: ChatMessage = { role: 'assistant', content: `错误: ${data.message}`, timestamp: Date.now() };
-              setMessages([...newMsgs, err]);
+              const finalMsgs = [...newMsgs, err];
+              setMessages(finalMsgs);
+              const sid = await persistSession(finalMsgs, activeSessionId);
+              if (sid) setActiveSessionId(sid);
               setStreamThinking('');
               setStreamText('');
             }
@@ -455,7 +498,10 @@ export default function Conversations() {
       }
     } catch (e) {
       const err: ChatMessage = { role: 'assistant', content: `连接失败: ${(e as Error).message}`, timestamp: Date.now() };
-      setMessages([...newMsgs, err]);
+      const finalMsgs = [...newMsgs, err];
+      setMessages(finalMsgs);
+      const sid = await persistSession(finalMsgs, activeSessionId);
+      if (sid) setActiveSessionId(sid);
     }
     setIsStreaming(false);
   }, [input, isStreaming, currentAgent, messages, activeSessionId, persistSession]);
@@ -519,10 +565,10 @@ export default function Conversations() {
                       value={editTitle}
                       onChange={e => setEditTitle(e.target.value)}
                       onKeyDown={e => {
-                        if (e.key === 'Enter') handleRename(s.id);
+                        if (e.key === 'Enter') void handleRename(s.id);
                         if (e.key === 'Escape') setEditingId(null);
                       }}
-                      onBlur={() => handleRename(s.id)}
+                      onBlur={() => { void handleRename(s.id); }}
                       onClick={e => e.stopPropagation()}
                       style={{ fontSize: '.82em', padding: '3px 6px', flex: 1 }}
                     />
@@ -537,7 +583,7 @@ export default function Conversations() {
                     </div>
                   )}
                   <span
-                    onClick={e => handlePin(s.id, e)}
+                    onClick={e => { void handlePin(s.id, e); }}
                     style={{ cursor: 'pointer', fontSize: '.85em', opacity: s.pinned ? 1 : .3, marginLeft: 4 }}
                     title={s.pinned ? '取消置顶' : '置顶'}
                   >📌</span>
@@ -551,7 +597,7 @@ export default function Conversations() {
                   <button
                     className="btn btn-sm"
                     style={{ padding: '0 6px', fontSize: '.85em', color: 'var(--danger)' }}
-                    onClick={e => { e.stopPropagation(); handleDelete(s.id); }}
+                    onClick={e => { e.stopPropagation(); void handleDelete(s.id); }}
                   >删除</button>
                 </div>
               </div>

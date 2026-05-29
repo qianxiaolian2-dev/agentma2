@@ -1,17 +1,36 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { AgentTemplate, EffortLevel, PermissionMode, SkillInfo, RegisteredTool } from '../simulator/types';
 import { BUILT_IN_TOOLS, EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, MOCK_MCP_SERVERS, initCustomTools } from '../simulator/mock-data';
+import { getAuthHeaders } from '../utils/client-runtime';
 
 const LS_AGENTS = 'agentma_templates';
 
-function loadTemplates(): AgentTemplate[] {
+// Instant paint from the local cache; the tenant-shared server copy is fetched on mount and is authoritative.
+function loadCachedTemplates(): AgentTemplate[] {
   try { const raw = localStorage.getItem(LS_AGENTS); if (raw) return JSON.parse(raw); } catch {}
   return [];
 }
 
-function saveTemplates(list: AgentTemplate[]) {
-  localStorage.setItem(LS_AGENTS, JSON.stringify(list));
+// Mirror to localStorage so other pages (Conversations / AgentChat) that read the cache stay in sync.
+function cacheTemplates(list: AgentTemplate[]) {
+  try { localStorage.setItem(LS_AGENTS, JSON.stringify(list)); } catch {}
+}
+
+async function fetchTemplates(): Promise<AgentTemplate[]> {
+  const r = await fetch('/api/agents', { headers: getAuthHeaders() });
+  if (!r.ok) throw new Error(`GET /api/agents ${r.status}`);
+  const list = await r.json();
+  return Array.isArray(list) ? list : [];
+}
+
+async function saveTemplates(list: AgentTemplate[]) {
+  cacheTemplates(list);
+  await fetch('/api/agents', {
+    method: 'PUT',
+    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(list),
+  });
 }
 
 function loadSkills(): SkillInfo[] {
@@ -47,7 +66,8 @@ const TOOL_CATEGORIES = [
 
 export default function Agents() {
   const navigate = useNavigate();
-  const [templates, setTemplates] = useState<AgentTemplate[]>(loadTemplates);
+  const [templates, setTemplates] = useState<AgentTemplate[]>(loadCachedTemplates);
+  const didLoad = useRef(false);
   const [form, setForm] = useState<AgentTemplate>(newTemplate());
   const [isEditing, setIsEditing] = useState(false);
   // 动态加载技能和 MCP 服务器（非写死）
@@ -71,7 +91,19 @@ export default function Agents() {
     return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('storage', onStorage); };
   }, []);
 
-  useEffect(() => { saveTemplates(templates); }, [templates]);
+  // Load tenant-shared agents from the server on mount (overrides the local cache).
+  useEffect(() => {
+    fetchTemplates()
+      .then(list => { setTemplates(list); cacheTemplates(list); })
+      .catch(() => {})
+      .finally(() => { didLoad.current = true; });
+  }, []);
+
+  // Persist changes to the server (and mirror to cache); skip until the initial load completes.
+  useEffect(() => {
+    if (!didLoad.current) return;
+    void saveTemplates(templates).catch(() => {});
+  }, [templates]);
 
   const handleSelect = (t: AgentTemplate) => {
     setForm({ ...t });
