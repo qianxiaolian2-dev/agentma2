@@ -1,0 +1,401 @@
+# Dashboard API 文档
+
+本文档描述 `dashboard/server.ts` 当前暴露的 HTTP 接口，重点覆盖鉴权、聊天、会话历史和租户侧管理接口。
+
+Base URL：
+
+- 本地：`http://127.0.0.1:3001`
+- 线上：`https://dandelion.skin`
+
+## 鉴权
+
+受保护接口统一使用：
+
+```http
+Authorization: Bearer <jwt-or-api-key>
+```
+
+- 密码登录后拿到的是 JWT
+- API Key 登录时可直接把 API Key 作为 Bearer Token
+
+## 1. 健康检查
+
+### `GET /api/health`
+
+返回服务健康状态。
+
+响应示例：
+
+```json
+{
+  "status": "ok"
+}
+```
+
+## 2. 认证
+
+### `POST /api/auth/register`
+
+注册租户和首个管理员账号。
+
+请求体：
+
+```json
+{
+  "name": "Admin",
+  "email": "admin@example.com",
+  "password": "secret123"
+}
+```
+
+响应示例：
+
+```json
+{
+  "token": "<jwt>",
+  "email": "admin@example.com",
+  "name": "Admin",
+  "tenantId": "tenant-uuid"
+}
+```
+
+### `POST /api/auth/login`
+
+密码登录。
+
+请求体：
+
+```json
+{
+  "email": "admin@example.com",
+  "password": "secret123"
+}
+```
+
+响应示例：
+
+```json
+{
+  "token": "<jwt>",
+  "email": "admin@example.com",
+  "name": "Admin",
+  "tenantId": "tenant-uuid"
+}
+```
+
+### `GET /api/auth/me`
+
+读取当前登录身份。
+
+响应示例：
+
+```json
+{
+  "email": "admin@example.com",
+  "tenantId": "tenant-uuid",
+  "name": "Admin",
+  "role": "tenant_admin",
+  "plan": "free",
+  "region": "us"
+}
+```
+
+## 3. 聊天
+
+### `POST /api/chat`
+
+把前端消息转发到上游 Anthropic 兼容模型接口，并以 SSE 流返回结果。
+
+请求体：
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "你好" }
+  ],
+  "systemPrompt": "你是一个助手",
+  "provider": {
+    "ANTHROPIC_AUTH_TOKEN": "sk-xxx",
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+    "ANTHROPIC_MODEL": "deepseek-v4-pro"
+  }
+}
+```
+
+返回格式：
+
+- `Content-Type: text/event-stream`
+- 事件体统一为 `data: {...}\n\n`
+
+常见事件：
+
+```json
+{ "type": "system", "subtype": "init", "model": "..." }
+{ "type": "delta", "text": "partial text" }
+{ "type": "delta", "text": "thinking text", "thinking": true }
+{ "type": "result", "subtype": "success", "text": "final text" }
+{ "type": "error", "message": "API 404: ..." }
+```
+
+说明：
+
+- 该接口本身不保存聊天历史
+- 聊天历史持久化通过下文的 `chat-sessions` 接口完成
+
+## 4. 聊天历史
+
+当前聊天历史已持久化到 SQLite：
+
+- 数据库：`~/Library/Application Support/agentma2/dashboard.sqlite`
+- 表：`chat_sessions`、`chat_messages`
+
+隔离规则：
+
+- 按 `tenant_id + owner_sub` 隔离
+- 不同租户、不同登录身份互相不可见
+
+### `GET /api/chat-sessions`
+
+返回当前登录用户可见的全部会话，按 `pinned DESC, updatedAt DESC` 排序。
+
+响应示例：
+
+```json
+[
+  {
+    "id": "chat-123",
+    "templateId": "agent-1",
+    "title": "帮我看一下日志",
+    "messages": [
+      { "role": "user", "content": "帮我看一下日志", "timestamp": 1780081794000 },
+      { "role": "assistant", "content": "可以，把日志贴出来。", "timestamp": 1780081795000 }
+    ],
+    "model": "deepseek-v4-pro",
+    "pinned": false,
+    "createdAt": 1780081794000,
+    "updatedAt": 1780081795000
+  }
+]
+```
+
+### `GET /api/chat-sessions/:id`
+
+读取单个会话全文。
+
+成功响应与列表中的单项结构一致。
+
+### `POST /api/chat-sessions`
+
+创建会话，或按 `id` 对现有会话做整段覆盖保存。
+
+请求体：
+
+```json
+{
+  "id": "chat-123",
+  "templateId": "agent-1",
+  "title": "帮我看一下日志",
+  "messages": [
+    { "role": "user", "content": "帮我看一下日志", "timestamp": 1780081794000 },
+    { "role": "assistant", "content": "可以，把日志贴出来。", "timestamp": 1780081795000 }
+  ],
+  "model": "deepseek-v4-pro",
+  "pinned": false,
+  "createdAt": 1780081794000,
+  "updatedAt": 1780081795000
+}
+```
+
+说明：
+
+- `templateId` 必填
+- `messages` 会整体替换，不是增量追加
+- 若 `id` 不存在则创建，存在则更新
+
+### `PATCH /api/chat-sessions/:id`
+
+更新会话元数据，不改消息正文。
+
+当前支持字段：
+
+```json
+{
+  "title": "新标题",
+  "pinned": true,
+  "templateId": "agent-2",
+  "model": "claude-sonnet"
+}
+```
+
+### `DELETE /api/chat-sessions/:id`
+
+删除会话及其全部消息。
+
+响应示例：
+
+```json
+{
+  "ok": true
+}
+```
+
+### 当前限制
+
+- `GET /api/chat-sessions` 会直接返回完整消息数组，数据量大时会偏重
+- `POST /api/chat-sessions` 采用整段覆盖写入，不是 append-only
+- 暂未提供分页、搜索、摘要列表、单独消息追加接口
+
+如果后续要给外部系统正式接入，建议下一版拆成：
+
+- `GET /api/chat-sessions` 只返回摘要
+- `GET /api/chat-sessions/:id/messages`
+- `POST /api/chat-sessions/:id/messages`
+- 分页和过滤参数
+
+## 5. 租户与账号
+
+### `GET /api/tenant`
+
+读取当前租户信息。
+
+### `PATCH /api/tenant`
+
+管理员更新租户字段。
+
+请求体示例：
+
+```json
+{
+  "name": "New Workspace Name",
+  "plan": "pro"
+}
+```
+
+### `GET /api/users`
+
+列出当前租户用户。
+
+### `PATCH /api/users/:email`
+
+管理员更新用户角色。
+
+请求体示例：
+
+```json
+{
+  "role": "team_admin"
+}
+```
+
+可选值：
+
+- `tenant_admin`
+- `team_admin`
+- `member`
+
+### `DELETE /api/users/:email`
+
+管理员删除指定用户。
+
+## 6. API Key
+
+### `GET /api/api-keys`
+
+列出当前租户有效 API Key。
+
+### `POST /api/api-keys`
+
+管理员创建 API Key。
+
+请求体示例：
+
+```json
+{
+  "name": "CI Key",
+  "scopes": ["chat", "sessions:read", "sessions:write"]
+}
+```
+
+### `DELETE /api/api-keys/:id`
+
+管理员吊销 API Key。
+
+## 7. 配额
+
+### `GET /api/quota`
+
+读取当前租户配额。
+
+### `PATCH /api/quota`
+
+管理员更新配额。
+
+请求体按字段局部更新，支持：
+
+- `monthlyActiveSecondsLimit`
+- `weeklyRunCountLimit`
+- `maxConcurrentRuns`
+- `perRunMaxActiveHours`
+- `perRunMaxWallClockHours`
+- `perRunMaxLlmTokens`
+- `perRunMaxToolCalls`
+
+## 8. 团队
+
+### `POST /api/teams`
+
+创建团队。
+
+### `GET /api/teams`
+
+列出团队。
+
+### `GET /api/teams/:id/members`
+
+列出团队成员。
+
+### `POST /api/teams/:id/members`
+
+添加成员。
+
+请求体示例：
+
+```json
+{
+  "userId": "member@example.com",
+  "role": "member"
+}
+```
+
+### `DELETE /api/teams/:id/members/:userId`
+
+移除成员。
+
+## 9. 审计日志
+
+### `GET /api/audit-logs`
+
+读取当前租户最近 50 条审计日志。
+
+## 10. Agent 模板
+
+### `GET /api/agents`
+
+读取当前租户共享的 Agent 模板列表。
+
+### `PUT /api/agents`
+
+整段替换当前租户的 Agent 模板列表。
+
+## 11. 事件与部署
+
+这部分接口主要服务当前站内的 MCP/事件桥接，不是稳定公开 API。
+
+- `GET /api/events/health`
+- `GET /api/deploy/status/:server`
+- `POST /api/events/sources`
+- `POST /api/sessions/:id/events/subscribe`
+- `GET /api/sessions/:id/events`
+- `POST /api/deploy`
+
+如需对外开放，建议单独做版本化和权限收敛。

@@ -1,73 +1,63 @@
-# React + TypeScript + Vite
+# AgentMa Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+当前 `dashboard/` 是一个前后端合一的单机部署项目：
 
-Currently, two official plugins are available:
+- 前端：React + Vite
+- 后端：Express
+- 持久化：SQLite
+- 线上地址：`https://dandelion.skin`
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## 目录
 
-## React Compiler
+- 接口文档：[`docs/api.md`](./docs/api.md)
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 本地运行
 
-## Expanding the ESLint configuration
+安装依赖：
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+启动后端：
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run server
 ```
+
+启动前端开发环境：
+
+```bash
+npm run dev
+```
+
+默认端口：
+
+- 前端：`5173`
+- 后端：`3001`
+
+## 构建
+
+仅构建前端静态资源：
+
+```bash
+npx vite build
+```
+
+说明：
+
+- 仓库当前 `npm run build` 仍会受到现存 TypeScript 问题影响
+- 线上部署实际依赖 `dashboard/dist/` 和本地常驻的 `server.ts`
+
+## 数据位置
+
+- SQLite：`~/Library/Application Support/agentma2/dashboard.sqlite`
+- JWT Secret：`~/Library/Application Support/agentma2/jwt-secret`
+
+## 聊天历史
+
+聊天历史现在已落到 SQLite，不再以浏览器 `localStorage` 作为主存。
+
+对应接口见：
+
+- [`docs/api.md#4-聊天历史`](./docs/api.md)
