@@ -169,6 +169,18 @@ app.post('/api/deploy', async (req, res) => {
   })();
 });
 
+// Provider price table (USD per million tokens). Edit to match your provider's actual rates.
+// Note: the SDK's own total_cost_usd assumes Claude pricing and is wrong for deepseek/minimax.
+const MODEL_PRICES: Record<string, { in: number; out: number }> = {
+  'deepseek-chat':     { in: 0.27, out: 1.10 },
+  'deepseek-reasoner': { in: 0.55, out: 2.19 },
+};
+function estimateCostUsd(model: string, inputTokens: number, outputTokens: number) {
+  const p = MODEL_PRICES[model];
+  if (!p) return 0;
+  return (inputTokens * p.in + outputTokens * p.out) / 1_000_000;
+}
+
 // Wrap any custom HTTP-endpoint tools (mineflayer-* etc.) as an SDK MCP server so they
 // keep working under the real Agent SDK loop. Schemas come from the request body's
 // `tools` array; endpoints come from /tmp/agentma_custom_tools.json.
@@ -326,8 +338,9 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   }
 
   const durationMs = Date.now() - startTime;
-  try { recordAgentRun(req.auth.tenantId, { sub: req.auth.sub, model, durationMs, inputTokens: inTok, outputTokens: outTok, status }); } catch {}
-  send({ type: 'result', subtype: status, text: finalText, usage: { input_tokens: inTok, output_tokens: outTok }, duration_ms: durationMs, model });
+  const costUsd = estimateCostUsd(model, inTok, outTok);
+  try { recordAgentRun(req.auth.tenantId, { sub: req.auth.sub, model, durationMs, inputTokens: inTok, outputTokens: outTok, costUsd, status }); } catch {}
+  send({ type: 'result', subtype: status, text: finalText, usage: { input_tokens: inTok, output_tokens: outTok }, duration_ms: durationMs, cost_usd: costUsd, model });
   res.end();
 });
 
@@ -640,8 +653,9 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   }
 
   const durationMs = Date.now() - startTime;
-  try { recordAgentRun(req.auth.tenantId, { sub: req.auth.sub, model, durationMs, inputTokens: inTok, outputTokens: outTok, status }); } catch {}
-  send({ type: 'result', subtype: status, text: finalText, usage: { input_tokens: inTok, output_tokens: outTok }, duration_ms: durationMs, model });
+  const costUsd = estimateCostUsd(model, inTok, outTok);
+  try { recordAgentRun(req.auth.tenantId, { sub: req.auth.sub, model, durationMs, inputTokens: inTok, outputTokens: outTok, costUsd, status }); } catch {}
+  send({ type: 'result', subtype: status, text: finalText, usage: { input_tokens: inTok, output_tokens: outTok }, duration_ms: durationMs, cost_usd: costUsd, model });
   res.end();
 });
 
