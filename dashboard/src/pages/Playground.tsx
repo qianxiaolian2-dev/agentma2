@@ -4,6 +4,7 @@ import { getDefaultOptions, getDefaultProviderConfig } from '../simulator/mock-d
 import { PERMISSION_MODES, EFFORT_LEVELS } from '../simulator/mock-data';
 import StreamDisplay from '../components/common/StreamDisplay';
 import JsonViewer from '../components/common/JsonViewer';
+import { getAuthHeaders } from '../utils/client-runtime';
 
 function loadProvider(): ProviderConfig {
   try {
@@ -47,10 +48,18 @@ export default function Playground() {
     abortRef.current = controller;
 
     try {
-      const response = await fetch(`/api/chat`, {
+      const response = await fetch(`/api/agents/run`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, provider }),
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          prompt,
+          template: {
+            tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+            model: provider.ANTHROPIC_MODEL,
+            maxTurns: 20,
+          },
+          provider,
+        }),
         signal: controller.signal,
       });
 
@@ -264,7 +273,7 @@ export default function Playground() {
 
       {/* 流式消息展示 */}
       <div className="section">
-        <div className="section-title">流式消息输出 (SSE from /api/chat)</div>
+        <div className="section-title">流式消息输出 (SSE from /api/agents/run · Claude Agent SDK)</div>
         <StreamDisplay messages={messages} isStreaming={isStreaming} />
       </div>
     </div>

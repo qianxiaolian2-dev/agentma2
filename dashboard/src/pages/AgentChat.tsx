@@ -4,7 +4,7 @@ import type { AgentTemplate, ChatMessage, ChatSession, ProviderConfig } from '..
 import { getDefaultProviderConfig } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, getCachedAgentTemplateById } from '../utils/agent-templates';
-import { isUsingApiKeyAuth } from '../utils/client-runtime';
+import { isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
 import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
 
 function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
@@ -142,7 +142,7 @@ export default function AgentChat() {
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           messages: newMessages.map(m => ({ role: m.role, content: m.content })),
           systemPrompt: template.systemPrompt || undefined,

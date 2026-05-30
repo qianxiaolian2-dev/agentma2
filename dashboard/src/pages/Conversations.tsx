@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig } from '../simulator/types';
 import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
-import { getEndpointProbeBlockReason, isUsingApiKeyAuth } from '../utils/client-runtime';
+import { getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import {
@@ -127,7 +127,7 @@ export default function Conversations() {
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           messages: newMsgs.map(m => ({ role: m.role, content: m.content })),
           systemPrompt: agent.systemPrompt || undefined,
@@ -417,7 +417,7 @@ export default function Conversations() {
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           messages: newMsgs.map(m => ({ role: m.role, content: m.content })),
           systemPrompt: currentAgent.systemPrompt || undefined,

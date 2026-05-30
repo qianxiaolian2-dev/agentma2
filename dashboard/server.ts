@@ -25,6 +25,7 @@ import {
   loginUser,
   registerUser,
   removeTeamMember,
+  recordAgentRun,
   replaceAgentTemplates,
   revokeApiKey,
   saveChatSession,
@@ -34,6 +35,8 @@ import {
   updateTenant,
   updateUserRole,
 } from './server-store.ts';
+import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -223,135 +226,165 @@ function resolveAnthropicMessagesUrl(rawBaseUrl?: string) {
   }
 }
 
-app.post('/api/chat', async (req, res) => {
-  const { prompt, messages: inputMessages, systemPrompt, provider, tools } = req.body as any;
+// Wrap any custom HTTP-endpoint tools (mineflayer-* etc.) as an SDK MCP server so they
+// keep working under the real Agent SDK loop. Schemas come from the request body's
+// `tools` array; endpoints come from /tmp/agentma_custom_tools.json.
+function buildCustomToolsMcp(requestTools: any[]) {
+  if (!Array.isArray(requestTools) || !requestTools.length) return null;
+  let endpoints: any[] = [];
+  try { endpoints = JSON.parse(fs.readFileSync('/tmp/agentma_custom_tools.json', 'utf-8')); } catch {}
+  const byName: Record<string, any> = {};
+  for (const e of endpoints) if (e?.endpoint && e.name) byName[e.name] = e;
 
-  type Msg = { role: string; content: unknown };
-  const convMsgs: Msg[] = [];
-  if (inputMessages?.length) {
-    for (const m of inputMessages) {
-      const c = typeof m.content === 'string' ? m.content : '';
-      // 跳过包含工具调用痕迹的消息（这些是上次 agent loop 的中间产物）
-      if (!c) continue;
-      if (c.includes('"type":"tool_use"') || c.includes('"type":"tool_result"') || c.includes('[调用工具:') || c.includes('[工具 ') || c.startsWith('[{')) continue;
-      convMsgs.push({ role: m.role, content: c });
+  const sdkTools: any[] = [];
+  for (const t of requestTools) {
+    if (!t?.name || !byName[t.name]) continue;
+    const ct = byName[t.name];
+    const schema: Record<string, any> = {};
+    for (const [k, v] of Object.entries(t.input_schema || {})) {
+      let tn = String(v); const opt = tn.endsWith('?'); if (opt) tn = tn.slice(0, -1);
+      let zt: any = tn === 'number' ? z.number() : tn === 'boolean' ? z.boolean() : z.string();
+      if (opt) zt = zt.optional();
+      schema[k] = zt;
     }
-  } else if (prompt) {
-    convMsgs.push({ role: 'user', content: prompt });
-  } else { res.status(400).json({ error: 'need prompt or messages' }); return; }
+    sdkTools.push(tool(t.name, t.description || `Custom tool: ${t.name}`, schema, async (args: any) => {
+      let url = ct.endpoint.url;
+      let body = ct.endpoint.bodyTemplate || '{}';
+      for (const [k, v] of Object.entries(args || {})) {
+        url = url.replace(`{{${k}}}`, encodeURIComponent(String(v)));
+        body = body.replace(`{{${k}}}`, String(v));
+      }
+      try {
+        const r = await fetch(url, {
+          method: ct.endpoint.method,
+          headers: { 'Content-Type': 'application/json', ...(ct.endpoint.headers || {}) },
+          body: ct.endpoint.method !== 'GET' ? body : undefined,
+        });
+        return { content: [{ type: 'text', text: (await r.text()).slice(0, 4000) }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: `err: ${(e as Error).message}` }], isError: true };
+      }
+    }));
+  }
+  if (!sdkTools.length) return null;
+  return createSdkMcpServer({ name: 'custom', version: '1.0.0', tools: sdkTools });
+}
 
-  if (systemPrompt) {
-    const idx = convMsgs.findIndex(m => m.role === 'user');
-    if (idx >= 0) convMsgs[idx] = { role: 'user', content: `[System]\n${systemPrompt}\n\n${convMsgs[idx].content}` };
+app.post('/api/chat', authMiddleware, async (req: any, res) => {
+  const { prompt, messages: inputMessages, systemPrompt, provider, tools: requestTools } = req.body || {};
+
+  // Build the run prompt + effective system prompt from messages (or single prompt).
+  // Multi-turn history is folded into systemPrompt so the model sees prior context.
+  let runPrompt = '';
+  let effectiveSystemPrompt = typeof systemPrompt === 'string' ? systemPrompt : '';
+  if (Array.isArray(inputMessages) && inputMessages.length) {
+    const filtered: Array<{ role: string; content: string }> = [];
+    for (const m of inputMessages) {
+      const c = typeof m?.content === 'string' ? m.content : '';
+      if (!c) continue;
+      if (c.includes('"type":"tool_use"') || c.includes('"type":"tool_result"') || c.startsWith('[{')) continue;
+      filtered.push({ role: String(m.role || 'user'), content: c });
+    }
+    if (!filtered.length) { res.status(400).json({ error: 'no usable messages' }); return; }
+    runPrompt = filtered[filtered.length - 1].content;
+    if (filtered.length > 1) {
+      const history = filtered.slice(0, -1).map(m => `${m.role}: ${m.content}`).join('\n\n');
+      effectiveSystemPrompt = [effectiveSystemPrompt, `[Conversation history]\n${history}`].filter(Boolean).join('\n\n');
+    }
+  } else if (typeof prompt === 'string' && prompt.trim()) {
+    runPrompt = prompt;
+  } else {
+    res.status(400).json({ error: 'need prompt or messages' }); return;
   }
 
-  const { baseUrl, upstreamUrl } = resolveAnthropicMessagesUrl(provider?.ANTHROPIC_BASE_URL);
-  const model = provider?.ANTHROPIC_MODEL || 'deepseek-v4-pro[1m]';
+  const baseUrl = provider?.ANTHROPIC_BASE_URL || '';
   const apiKey = provider?.ANTHROPIC_AUTH_TOKEN || '';
+  const model = provider?.ANTHROPIC_MODEL || 'deepseek-chat';
   if (!apiKey) { res.status(400).json({ error: 'no ANTHROPIC_AUTH_TOKEN' }); return; }
 
-  res.setHeader('Content-Type', 'text/event-stream'); res.setHeader('Cache-Control', 'no-cache'); res.setHeader('Connection', 'keep-alive'); res.setHeader('X-Accel-Buffering', 'no'); res.flushHeaders();
-  const send = (data: unknown) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  const send = (d: unknown) => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch {} };
 
-  send({ type: 'system', subtype: 'init', model, tools: (tools || []).map((t: any) => t.name) });
-
-  const startTime = Date.now();
-  let totalText = '', totalIn = 0, totalOut = 0;
-  const MAX = 10;
-
-  // 加载自定义工具 endpoint
-  let customTools: any[] = [];
-  try { customTools = JSON.parse(fs.readFileSync('/tmp/agentma_custom_tools.json', 'utf-8')); } catch {}
-
-  for (let loop = 0; loop < MAX; loop++) {
-    const body: any = { model, max_tokens: 4096, stream: true, messages: convMsgs };
-    if (tools?.length) {
-      body.tools = tools.map((t: any) => {
-        const raw = t.input_schema || {};
-        const props: any = {}; const req: string[] = [];
-        for (const [k, v] of Object.entries(raw)) {
-          let tn = String(v); if (tn.endsWith('?')) { tn = tn.slice(0, -1); } else req.push(k);
-          props[k] = { type: tn === 'number' ? 'number' : tn === 'boolean' ? 'boolean' : 'string' };
-        }
-        return { name: t.name, description: t.description, input_schema: { type: 'object', properties: props, required: req } };
-      });
+  const customMcp = buildCustomToolsMcp(Array.isArray(requestTools) ? requestTools : []);
+  // Map allowedTools: built-in names pass through; names matching a custom endpoint get mcp__custom__ prefix.
+  let allowedTools: string[];
+  if (Array.isArray(requestTools) && requestTools.length) {
+    const customNames = new Set<string>();
+    if (customMcp) {
+      let endpoints: any[] = [];
+      try { endpoints = JSON.parse(fs.readFileSync('/tmp/agentma_custom_tools.json', 'utf-8')); } catch {}
+      for (const e of endpoints) if (e?.endpoint && e.name) customNames.add(e.name);
     }
-
-    const apiRes = await fetch(upstreamUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }, body: JSON.stringify(body) });
-    if (!apiRes.ok) {
-      const e = await apiRes.text();
-      const hint = apiRes.status === 404 ? `；上游地址=${upstreamUrl}` : '';
-      send({ type: 'error', message: `API ${apiRes.status}: ${e.slice(0, 500)}${hint}` });
-      res.end();
-      return;
-    }
-
-    const reader = apiRes.body?.getReader(); if (!reader) { send({ type: 'error', message: 'no body' }); res.end(); return; }
-    const dec = new TextDecoder(); let buf = '';
-    const blocks: any[] = [];
-    let cur: any = null, streamText = '';
-
-    while (true) {
-      const { done, value } = await reader.read(); if (done) break;
-      buf += dec.decode(value, { stream: true }); const lines = buf.split('\n'); buf = lines.pop() || '';
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue; const j = line.slice(6).trim(); if (!j || j === '[DONE]') continue;
-        try {
-          const ev = JSON.parse(j);
-          if (ev.type === 'content_block_start') {
-            const cb = ev.content_block || {};
-            cur = { type: cb.type || 'text', id: cb.id, name: cb.name };
-          }
-          else if (ev.type === 'content_block_delta') {
-            const d = ev.delta;
-            if (d?.type === 'text_delta' && cur) { cur.text = (cur.text || '') + (d.text || ''); streamText += d.text || ''; send({ type: 'delta', text: d.text || '' }); }
-            else if (d?.type === 'thinking_delta') send({ type: 'delta', text: d.thinking || '', thinking: true });
-            else if (d?.type === 'input_json_delta' && cur) cur.input = (cur.input || '') + (d.partial_json || '');
-          } else if (ev.type === 'content_block_stop' && cur) {
-            const saved: any = { type: cur.type, text: cur.text, id: cur.id, name: cur.name, input: cur.input };
-            if (cur.type === 'tool_use' && cur.input) { try { saved.input = JSON.parse(cur.input as string); } catch { saved.input = {}; } }
-            blocks.push(saved); cur = null;
-          } else if (ev.type === 'message_start') totalIn += ev.message?.usage?.input_tokens || 0;
-          else if (ev.type === 'message_delta') totalOut += ev.usage?.output_tokens || 0;
-        } catch {}
-      }
-    }
-
-    totalText += streamText;
-    const toolBlocks = blocks.filter((b: any) => b.type === 'tool_use');
-    if (toolBlocks.length === 0) break;
-
-    // assistant msg（保留 thinking 块，DeepSeek 要求回传）
-    const ac = blocks.map((b: any) => {
-      if (b.type === 'text') return { type: 'text', text: b.text || '' };
-      if (b.type === 'thinking') return { type: 'thinking', thinking: b.text || '' };
-      if (!b.name) return { type: 'text', text: `[unknown tool]` };
-      return { type: 'tool_use', id: b.id || `toolu_${Date.now()}`, name: b.name, input: b.input || {} };
-    });
-    convMsgs.push({ role: 'assistant', content: ac });
-
-    const toolResults: any[] = [];
-    for (const tb of toolBlocks) {
-      send({ type: 'delta', text: `\n🔧 ${tb.name}(${JSON.stringify(tb.input).slice(0, 120)})\n` });
-      const ct = customTools.find((c: any) => c.name === tb.name);
-      let result = '';
-      if (ct?.endpoint) {
-        try {
-          let url = ct.endpoint.url; let rbody = ct.endpoint.bodyTemplate || '{}';
-          for (const [k, v] of Object.entries(tb.input || {})) { url = url.replace(`{{${k}}}` , encodeURIComponent(String(v))); rbody = rbody.replace(`{{${k}}}`, String(v)); }
-          const r = await fetch(url, { method: ct.endpoint.method, headers: { 'Content-Type': 'application/json', ...(ct.endpoint.headers || {}) }, body: ct.endpoint.method !== 'GET' ? rbody : undefined });
-          result = await r.text();
-        } catch (e) { result = `err: ${(e as Error).message}`; }
-      } else { result = `[builtin] ${tb.name} called: ${JSON.stringify(tb.input)}`; }
-      send({ type: 'delta', text: `📤 ${result.slice(0, 200)}\n` });
-      toolResults.push({ type: 'tool_result', tool_use_id: tb.id, content: result.slice(0, 1000) });
-    }
-    // 所有 tool_result 放入同一个 user 消息（Anthropic 协议要求）
-    convMsgs.push({ role: 'user', content: toolResults });
+    allowedTools = requestTools
+      .map((t: any) => t?.name)
+      .filter(Boolean)
+      .map((n: string) => customNames.has(n) ? `mcp__custom__${n}` : n);
+  } else {
+    allowedTools = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'];
   }
 
-  const dur = Date.now() - startTime;
-  send({ type: 'result', subtype: 'success', text: totalText, duration_ms: dur, stop_reason: 'end_turn', usage: { input_tokens: totalIn, output_tokens: totalOut }, model });
+  const cwd = path.join('/tmp', `agentma-chat-${req.auth.tenantId}-${Date.now()}`);
+  fs.mkdirSync(cwd, { recursive: true });
+
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v != null) env[k] = String(v);
+  if (baseUrl) env.ANTHROPIC_BASE_URL = baseUrl;
+  env.ANTHROPIC_API_KEY = apiKey;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+
+  const startTime = Date.now();
+  let inTok = 0, outTok = 0, finalText = '', status = 'success';
+
+  try {
+    for await (const msg of query({
+      prompt: runPrompt,
+      options: {
+        model,
+        allowedTools,
+        permissionMode: 'bypassPermissions',
+        maxTurns: 20,
+        cwd,
+        settingSources: [],
+        env,
+        ...(customMcp ? { mcpServers: { custom: customMcp } } : {}),
+        ...(effectiveSystemPrompt && effectiveSystemPrompt.trim() ? { systemPrompt: effectiveSystemPrompt } : {}),
+      },
+    })) {
+      const m = msg as any;
+      if (m.type === 'system' && m.subtype === 'init') {
+        send({ type: 'system', subtype: 'init', model: m.model, tools: (m.tools || []).length, cwd });
+      } else if (m.type === 'assistant') {
+        for (const b of m.message?.content || []) {
+          if (b.type === 'text' && b.text) { finalText += b.text; send({ type: 'delta', text: b.text }); }
+          else if (b.type === 'tool_use') send({ type: 'delta', text: `\n🔧 ${b.name}(${JSON.stringify(b.input).slice(0, 150)})\n` });
+        }
+      } else if (m.type === 'user') {
+        for (const b of m.message?.content || []) {
+          if (b.type === 'tool_result') {
+            const t = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+            send({ type: 'delta', text: `📤 ${t.slice(0, 300)}\n` });
+          }
+        }
+      } else if (m.type === 'result') {
+        status = m.subtype || 'success';
+        if (m.result) finalText = m.result;
+        const u = m.usage || {};
+        inTok = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+        outTok = u.output_tokens || 0;
+      }
+    }
+  } catch (e) {
+    status = 'error';
+    send({ type: 'error', message: (e as Error).message });
+  }
+
+  const durationMs = Date.now() - startTime;
+  try { recordAgentRun(req.auth.tenantId, { sub: req.auth.sub, model, durationMs, inputTokens: inTok, outputTokens: outTok, status }); } catch {}
+  send({ type: 'result', subtype: status, text: finalText, usage: { input_tokens: inTok, output_tokens: outTok }, duration_ms: durationMs, model });
   res.end();
 });
 
@@ -587,6 +620,86 @@ app.delete('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
   const ok = deleteChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id);
   if (!ok) { res.status(404).json({ error: 'not found' }); return; }
   res.json({ ok: true });
+});
+
+// ═══ Agent Run (real SDK execution; P1 first slice) ═══
+app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
+  const { prompt, template, provider } = req.body || {};
+  if (!prompt || typeof prompt !== 'string') { res.status(400).json({ error: 'need prompt' }); return; }
+  const tmpl = template || {};
+  const baseUrl = provider?.ANTHROPIC_BASE_URL || tmpl?.providerOverrides?.ANTHROPIC_BASE_URL || '';
+  const apiKey = provider?.ANTHROPIC_AUTH_TOKEN || tmpl?.providerOverrides?.ANTHROPIC_AUTH_TOKEN || '';
+  const model = tmpl?.providerOverrides?.ANTHROPIC_MODEL || tmpl?.model || provider?.ANTHROPIC_MODEL || 'deepseek-chat';
+  if (!apiKey) { res.status(400).json({ error: 'no api key' }); return; }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  const send = (d: unknown) => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch {} };
+
+  // P1: per-run scratch cwd. Real container isolation = P3.
+  const cwd = path.join('/tmp', `agentma-run-${req.auth.tenantId}-${Date.now()}`);
+  fs.mkdirSync(cwd, { recursive: true });
+
+  // Per-call env (concurrency-safe; never mutate process.env)
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v != null) env[k] = String(v);
+  if (baseUrl) env.ANTHROPIC_BASE_URL = baseUrl;
+  env.ANTHROPIC_API_KEY = apiKey;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+
+  const allowedTools: string[] = (Array.isArray(tmpl?.tools) && tmpl.tools.length) ? tmpl.tools : ['Read', 'Bash'];
+  const startTime = Date.now();
+  let inTok = 0, outTok = 0, finalText = '', status = 'success';
+
+  try {
+    for await (const msg of query({
+      prompt,
+      options: {
+        model,
+        allowedTools,
+        permissionMode: 'bypassPermissions',  // P1: no interactive approver server-side. Real canUseTool = P2.
+        maxTurns: Number(tmpl?.maxTurns) || 20,
+        cwd,
+        settingSources: [],   // isolate from host ~/.claude (multi-tenant safety)
+        env,
+        ...(typeof tmpl?.systemPrompt === 'string' && tmpl.systemPrompt.trim() ? { systemPrompt: tmpl.systemPrompt } : {}),
+      },
+    })) {
+      const m = msg as any;
+      if (m.type === 'system' && m.subtype === 'init') {
+        send({ type: 'system', subtype: 'init', model: m.model, tools: (m.tools || []).length, cwd });
+      } else if (m.type === 'assistant') {
+        for (const b of m.message?.content || []) {
+          if (b.type === 'text' && b.text) { finalText += b.text; send({ type: 'delta', text: b.text }); }
+          else if (b.type === 'tool_use') send({ type: 'delta', text: `\n🔧 ${b.name}(${JSON.stringify(b.input).slice(0, 150)})\n` });
+        }
+      } else if (m.type === 'user') {
+        for (const b of m.message?.content || []) {
+          if (b.type === 'tool_result') {
+            const t = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+            send({ type: 'delta', text: `📤 ${t.slice(0, 300)}\n` });
+          }
+        }
+      } else if (m.type === 'result') {
+        status = m.subtype || 'success';
+        if (m.result) finalText = m.result;
+        const u = m.usage || {};
+        inTok = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+        outTok = u.output_tokens || 0;
+      }
+    }
+  } catch (e) {
+    status = 'error';
+    send({ type: 'error', message: (e as Error).message });
+  }
+
+  const durationMs = Date.now() - startTime;
+  try { recordAgentRun(req.auth.tenantId, { sub: req.auth.sub, model, durationMs, inputTokens: inTok, outputTokens: outTok, status }); } catch {}
+  send({ type: 'result', subtype: status, text: finalText, usage: { input_tokens: inTok, output_tokens: outTok }, duration_ms: durationMs, model });
+  res.end();
 });
 
 app.listen(PORT, () => {

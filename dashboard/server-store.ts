@@ -1154,3 +1154,11 @@ export function replaceAgentTemplates(tenantId: string, templates: Array<Record<
   }
   return listAgentTemplates(tenantId);
 }
+
+// ═══ Agent Runs (real SDK execution metering) ═══
+export function recordAgentRun(tenantId: string, info: { sub: string; model: string; durationMs: number; inputTokens: number; outputTokens: number; status: string }) {
+  ensureQuotaForTenant(tenantId);
+  const seconds = Math.max(0, Math.round(info.durationMs / 1000));
+  db.prepare('UPDATE quotas SET weekly_run_count_used = weekly_run_count_used + 1, monthly_active_seconds_used = monthly_active_seconds_used + ? WHERE tenant_id = ?').run(seconds, tenantId);
+  audit(tenantId, 'agent_run', info.sub, 'user', `run:${info.model}`, { model: info.model, durationMs: info.durationMs, inputTokens: info.inputTokens, outputTokens: info.outputTokens, status: info.status });
+}
