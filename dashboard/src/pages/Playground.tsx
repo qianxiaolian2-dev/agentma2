@@ -5,6 +5,7 @@ import { PERMISSION_MODES, EFFORT_LEVELS } from '../simulator/mock-data';
 import StreamDisplay from '../components/common/StreamDisplay';
 import JsonViewer from '../components/common/JsonViewer';
 import { getAuthHeaders } from '../utils/client-runtime';
+import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
 
 function loadProvider(): ProviderConfig {
   try {
@@ -22,6 +23,7 @@ export default function Playground() {
   const [provider] = useState<ProviderConfig>(loadProvider);
   const [showOptions, setShowOptions] = useState(false);
   const [resultSummary, setResultSummary] = useState<Record<string, unknown> | null>(null);
+  const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const abortRef = useRef<AbortController | null>(null);
 
@@ -44,6 +46,7 @@ export default function Playground() {
     setIsStreaming(true);
     setMessages([]);
     setResultSummary(null);
+    setPendingPermissions([]);
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -127,6 +130,14 @@ export default function Playground() {
                 duration_ms: data.duration_ms, result: data.text?.slice(0, 300) || '',
                 stop_reason: data.stop_reason, usage: data.usage, model: data.model,
               }]);
+            } else if (dataType === 'permission_request') {
+              setPendingPermissions(prev => [...prev, {
+                reqId: data.reqId, toolName: data.toolName, input: data.input,
+                title: data.title, displayName: data.displayName, description: data.description,
+                toolUseID: data.toolUseID,
+              }]);
+            } else if (dataType === 'permission_resolved') {
+              if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (dataType === 'error') {
               setMessages(prev => [...prev, { type: 'system', subtype: 'error', result: data.message || '未知错误' }]);
             }
@@ -270,6 +281,12 @@ export default function Playground() {
           </div>
         </div>
       )}
+
+      {/* 权限审批 */}
+      <PermissionPromptList
+        pending={pendingPermissions}
+        onResolved={(reqId) => setPendingPermissions(prev => prev.filter(p => p.reqId !== reqId))}
+      />
 
       {/* 流式消息展示 */}
       <div className="section">

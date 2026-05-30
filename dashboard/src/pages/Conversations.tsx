@@ -4,6 +4,7 @@ import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig } from '..
 import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
 import { getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
+import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import {
@@ -94,6 +95,7 @@ export default function Conversations() {
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamThinking, setStreamThinking] = useState('');
+  const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [streamText, setStreamText] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
@@ -174,6 +176,14 @@ export default function Conversations() {
                 setStreamThinking(''); setStreamText('');
                 const sid = await (persistRef.current?.(finalMsgs, activeSessionId) || Promise.resolve(''));
                 if (sid) setActiveSessionId(sid);
+              } else if (d.type === 'permission_request') {
+                setPendingPermissions(prev => [...prev, {
+                  reqId: d.reqId, toolName: d.toolName, input: d.input,
+                  title: d.title, displayName: d.displayName, description: d.description,
+                  toolUseID: d.toolUseID,
+                }]);
+              } else if (d.type === 'permission_resolved') {
+                if (d.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
               }
             } catch {}
           }
@@ -490,6 +500,14 @@ export default function Conversations() {
               if (sid) setActiveSessionId(sid);
               setStreamThinking('');
               setStreamText('');
+            } else if (data.type === 'permission_request') {
+              setPendingPermissions(prev => [...prev, {
+                reqId: data.reqId, toolName: data.toolName, input: data.input,
+                title: data.title, displayName: data.displayName, description: data.description,
+                toolUseID: data.toolUseID,
+              }]);
+            } else if (data.type === 'permission_resolved') {
+              if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (data.type === 'error') {
               const err: ChatMessage = { role: 'assistant', content: `错误: ${data.message}`, timestamp: Date.now() };
               const finalMsgs = [...newMsgs, err];
@@ -740,6 +758,13 @@ export default function Conversations() {
                 <div className="chat-msg assistant pulse">...</div>
               )}
               <div ref={bottomRef} />
+            </div>
+
+            <div style={{ padding: '0 20px' }}>
+              <PermissionPromptList
+                pending={pendingPermissions}
+                onResolved={(reqId) => setPendingPermissions(prev => prev.filter(p => p.reqId !== reqId))}
+              />
             </div>
 
             {/* 输入区域 */}

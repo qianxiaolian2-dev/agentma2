@@ -5,6 +5,7 @@ import { getDefaultProviderConfig } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, getCachedAgentTemplateById } from '../utils/agent-templates';
 import { isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
+import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
 import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
 
 function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
@@ -33,6 +34,7 @@ export default function AgentChat() {
   const [sessionMeta, setSessionMeta] = useState<ChatSession | null>(null);
   const [streamThinking, setStreamThinking] = useState('');
   const [streamText, setStreamText] = useState('');
+  const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(loadProvider());
 
@@ -203,6 +205,14 @@ export default function AgentChat() {
               await persistSession(finalMessages);
               setStreamThinking('');
               setStreamText('');
+            } else if (data.type === 'permission_request') {
+              setPendingPermissions(prev => [...prev, {
+                reqId: data.reqId, toolName: data.toolName, input: data.input,
+                title: data.title, displayName: data.displayName, description: data.description,
+                toolUseID: data.toolUseID,
+              }]);
+            } else if (data.type === 'permission_resolved') {
+              if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (data.type === 'error') {
               const finalMessages = [...newMessages, {
                 role: 'assistant',
@@ -287,6 +297,13 @@ export default function AgentChat() {
           )}
 
           <div ref={bottomRef} />
+        </div>
+
+        <div style={{ padding: '0 12px' }}>
+          <PermissionPromptList
+            pending={pendingPermissions}
+            onResolved={(reqId) => setPendingPermissions(prev => prev.filter(p => p.reqId !== reqId))}
+          />
         </div>
 
         <div className="chat-input-area">
