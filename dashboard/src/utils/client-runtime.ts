@@ -3,6 +3,11 @@ export function getStoredAuthToken(): string | null {
   return localStorage.getItem('agentma_jwt') || localStorage.getItem('agentma_api_key');
 }
 
+export function isUsingApiKeyAuth(): boolean {
+  if (typeof window === 'undefined') return false;
+  return Boolean(localStorage.getItem('agentma_api_key'));
+}
+
 export type StoredAuthUser = {
   email: string;
   name: string;

@@ -412,6 +412,11 @@ function requireAdmin(req: any, res: any, next: any) {
   next();
 }
 
+function getChatOwnerSub(auth: { sub: string; authType: 'jwt' | 'api_key'; apiKeyId?: string }) {
+  if (auth.authType === 'api_key' && auth.apiKeyId) return `api_key:${auth.apiKeyId}`;
+  return auth.sub;
+}
+
 // ═══ Auth Routes ═══
 app.post('/api/auth/register', (req, res) => {
   const { name, email, password } = req.body || {};
@@ -557,29 +562,29 @@ app.put('/api/agents', authMiddleware, (req: any, res) => {
 
 // ═══ Chat Sessions Routes ═══
 app.get('/api/chat-sessions', authMiddleware, (req: any, res) => {
-  res.json(listChatSessions(req.auth.tenantId, req.auth.sub));
+  res.json(listChatSessions(req.auth.tenantId, getChatOwnerSub(req.auth)));
 });
 
 app.get('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
-  const session = getChatSession(req.auth.tenantId, req.auth.sub, req.params.id);
+  const session = getChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id);
   if (!session) { res.status(404).json({ error: 'not found' }); return; }
   res.json(session);
 });
 
 app.post('/api/chat-sessions', authMiddleware, (req: any, res) => {
-  const result = saveChatSession(req.auth.tenantId, req.auth.sub, req.body || {});
+  const result = saveChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.body || {});
   if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
   res.json(result.session);
 });
 
 app.patch('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
-  const session = updateChatSession(req.auth.tenantId, req.auth.sub, req.params.id, req.body || {});
+  const session = updateChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id, req.body || {});
   if (!session) { res.status(404).json({ error: 'not found' }); return; }
   res.json(session);
 });
 
 app.delete('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
-  const ok = deleteChatSession(req.auth.tenantId, req.auth.sub, req.params.id);
+  const ok = deleteChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id);
   if (!ok) { res.status(404).json({ error: 'not found' }); return; }
   res.json({ ok: true });
 });

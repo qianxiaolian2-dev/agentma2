@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig } from '../simulator/types';
 import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
-import { getEndpointProbeBlockReason } from '../utils/client-runtime';
+import { getEndpointProbeBlockReason, isUsingApiKeyAuth } from '../utils/client-runtime';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import {
@@ -252,7 +252,7 @@ export default function Conversations() {
 
     (async () => {
       try {
-        const savedSessions = await bootstrapChatSessions();
+        const savedSessions = await bootstrapChatSessions(!isUsingApiKeyAuth());
         if (!cancelled) setSessions(savedSessions);
       } catch (error) {
         console.error('failed to load chat sessions', error);

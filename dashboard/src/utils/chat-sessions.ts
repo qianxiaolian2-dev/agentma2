@@ -129,9 +129,11 @@ export async function deleteChatSession(sessionId: string): Promise<void> {
   await readJson(res);
 }
 
-export async function bootstrapChatSessions(): Promise<ChatSession[]> {
+export async function bootstrapChatSessions(allowLegacyImport = true): Promise<ChatSession[]> {
   const remoteSessions = await listChatSessions();
   if (remoteSessions.length > 0) return remoteSessions;
+
+  if (!allowLegacyImport) return [];
 
   const legacySessions = loadLegacyChatSessions();
   if (legacySessions.length === 0) return [];

@@ -4,6 +4,7 @@ import type { AgentTemplate, ChatMessage, ChatSession, ProviderConfig } from '..
 import { getDefaultProviderConfig } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, getCachedAgentTemplateById } from '../utils/agent-templates';
+import { isUsingApiKeyAuth } from '../utils/client-runtime';
 import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
 
 function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
@@ -64,7 +65,7 @@ export default function AgentChat() {
           provider.current.ANTHROPIC_MODEL = serverTemplate.model;
         }
 
-        const sessions = await bootstrapChatSessions();
+        const sessions = await bootstrapChatSessions(!isUsingApiKeyAuth());
         const existingSession = resumeSessionId
           ? sessions.find((session) => session.id === resumeSessionId)
           : sessions
