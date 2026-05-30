@@ -169,63 +169,6 @@ app.post('/api/deploy', async (req, res) => {
   })();
 });
 
-// ═══ Chat (agent loop) ═══
-interface ProviderConfig { ANTHROPIC_AUTH_TOKEN: string; ANTHROPIC_BASE_URL: string; ANTHROPIC_MODEL: string; }
-interface ToolDef { name: string; description: string; input_schema: Record<string, unknown>; }
-
-function normalizeAnthropicBaseUrl(rawBaseUrl?: string) {
-  const fallback = 'https://api.deepseek.com/anthropic';
-  const input = (rawBaseUrl || fallback).trim();
-  try {
-    const url = new URL(input);
-    const host = url.hostname.toLowerCase();
-    let pathname = url.pathname.replace(/\/+$/, '') || '/';
-
-    if (pathname.endsWith('/messages')) pathname = pathname.slice(0, -'/messages'.length) || '/';
-
-    if (host === 'api.deepseek.com') {
-      const lowerPath = pathname.toLowerCase();
-      const openaiLike = lowerPath === '/'
-        || lowerPath === '/v1'
-        || lowerPath === '/chat/completions'
-        || lowerPath === '/v1/chat/completions';
-      if (openaiLike || !lowerPath.startsWith('/anthropic')) pathname = '/anthropic';
-    }
-
-    url.pathname = pathname;
-    return url.toString().replace(/\/$/, '');
-  } catch {
-    return input.replace(/\/$/, '') || fallback;
-  }
-}
-
-function resolveAnthropicMessagesUrl(rawBaseUrl?: string) {
-  const baseUrl = normalizeAnthropicBaseUrl(rawBaseUrl);
-  try {
-    const url = new URL(baseUrl);
-    const host = url.hostname.toLowerCase();
-    let pathname = url.pathname.replace(/\/+$/, '') || '/';
-
-    if (host === 'api.minimax.io' || host === 'api.minimaxi.com') {
-      if (!pathname.toLowerCase().startsWith('/anthropic')) pathname = '/anthropic';
-      if (!pathname.toLowerCase().endsWith('/v1')) pathname = `${pathname}/v1`;
-      url.pathname = `${pathname}/messages`;
-      return { baseUrl, upstreamUrl: url.toString() };
-    }
-
-    if (host === 'api.anthropic.com') {
-      if (!pathname.toLowerCase().endsWith('/v1')) pathname = `${pathname === '/' ? '' : pathname}/v1`;
-      url.pathname = `${pathname}/messages`;
-      return { baseUrl, upstreamUrl: url.toString() };
-    }
-
-    url.pathname = `${pathname}/messages`;
-    return { baseUrl, upstreamUrl: url.toString() };
-  } catch {
-    return { baseUrl, upstreamUrl: `${baseUrl}/messages` };
-  }
-}
-
 // Wrap any custom HTTP-endpoint tools (mineflayer-* etc.) as an SDK MCP server so they
 // keep working under the real Agent SDK loop. Schemas come from the request body's
 // `tools` array; endpoints come from /tmp/agentma_custom_tools.json.
