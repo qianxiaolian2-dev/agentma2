@@ -1,5 +1,9 @@
+import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { SLASH_COMMANDS, MODELS, generateMockAgents, BUILT_IN_TOOLS, HOOK_EVENTS } from '../simulator/mock-data';
+import { SLASH_COMMANDS, MODELS, BUILT_IN_TOOLS, HOOK_EVENTS } from '../simulator/mock-data';
+import { useAuth } from '../contexts/AuthContext';
+import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
+import type { AgentTemplate } from '../simulator/types';
 
 const SECTIONS = [
   { path: '/conversations', title: '会话', desc: '多轮对话，Agent 按模板配置执行任务', icon: '💬', color: '#7c3aed' },
@@ -15,7 +19,17 @@ const SECTIONS = [
 ];
 
 export default function Overview() {
-  const agents = generateMockAgents();
+  const { user } = useAuth();
+  const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
+
+  useEffect(() => {
+    if (!user?.tenantId) return;
+    let cancelled = false;
+    void bootstrapAgentTemplates(user.tenantId, false)
+      .then(list => { if (!cancelled) setTemplates(list); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [user?.tenantId]);
 
   return (
     <div>
@@ -114,15 +128,23 @@ export default function Overview() {
           </div>
         </div>
         <div className="card">
-          <div className="card-header">代理类型 — AgentInfo[]</div>
-          <div>
-            {agents.map(a => (
-              <div key={a.name} className="tool-card mb-2">
-                <div className="tool-card-name">{a.name}</div>
-                <div className="tool-card-desc">{a.description}</div>
+          <div className="card-header">Agent 模板 ({templates.length})</div>
+          {templates.length === 0 ? (
+            <div style={{ color: 'var(--ink-muted)', fontSize: '.82em', padding: '12px 0' }}>
+              暂无模板 — 在 <Link to="/agents" style={{ color: 'var(--accent)' }}>Agent 市场</Link> 创建
+            </div>
+          ) : (
+            templates.map(t => (
+              <div key={t.id} className="tool-card mb-2">
+                <div className="tool-card-name">{t.name}</div>
+                <div className="tool-card-desc">{t.description}</div>
+                <div className="flex gap-1 mt-1" style={{ flexWrap: 'wrap' }}>
+                  <span className="badge badge-muted">{t.model || 'default'}</span>
+                  <span className="badge badge-muted">{t.tools.length} tools</span>
+                </div>
               </div>
-            ))}
-          </div>
+            ))
+          )}
         </div>
       </div>
     </div>
