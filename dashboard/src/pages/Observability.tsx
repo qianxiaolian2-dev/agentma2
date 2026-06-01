@@ -2,8 +2,6 @@ import { useState, useEffect } from 'react';
 import type { RateLimitInfo } from '../simulator/types';
 import { sdkSimulator } from '../simulator/sdk-simulator';
 import { generateStreamEvents } from '../simulator/mock-data';
-import JsonViewer from '../components/common/JsonViewer';
-import CodeBlock from '../components/common/CodeBlock';
 
 const OTEL_ENV_VARS = [
   { key: 'CLAUDE_CODE_ENABLE_TELEMETRY', value: '1', description: '启用遥测（必须设置）' },

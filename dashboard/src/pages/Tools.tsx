@@ -24,10 +24,6 @@ export default function Tools() {
     endpointHeaders: '', endpointBody: '',
   });
 
-  const [ghUrl, setGhUrl] = useState('');
-  const [ghLoading, setGhLoading] = useState(false);
-  const [ghMsg, setGhMsg] = useState('');
-
   const allTools: (BuiltInTool | RegisteredTool)[] = [...BUILT_IN_TOOLS, ...customTools];
   const tags = Array.from(new Set(allTools.map(t => t.category)));
   const persist = (list: RegisteredTool[]) => { setCustomTools(list); saveCustomTools(list); };
@@ -68,22 +64,6 @@ export default function Tools() {
     const existing = customTools.find(t => t.name === tool.name);
     persist(existing ? customTools.map(t => t.name === tool.name ? tool : t) : [...customTools, tool]);
     setForm({ name: '', description: '', category: '', mcpServer: '', inputSchema: '{}', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true, endpointUrl: '', endpointMethod: 'GET', endpointHeaders: '', endpointBody: '' });
-  };
-
-  const handleGhImport = async () => {
-    if (!ghUrl.trim()) return; setGhLoading(true); setGhMsg('');
-    try {
-      let raw = ghUrl.trim().replace('https://github.com/', 'https://raw.githubusercontent.com/').replace('/blob/', '/');
-      if (!raw.endsWith('.json')) raw = raw.replace(/\/$/, '') + '/tool.json';
-      const res = await fetch(raw);
-      if (!res.ok) { setGhMsg(`HTTP ${res.status}`); setGhLoading(false); return; }
-      const data = await res.json();
-      const name = data.name || raw.split('/').slice(-2)[0];
-      if (customTools.find(t => t.name === name)) { setGhMsg(`"${name}" 已存在`); setGhLoading(false); return; }
-      persist([...customTools, { name, description: data.description || '', category: data.category || 'imported', inputSchema: data.input_schema || {}, annotations: data.annotations, source: 'github', sourceUrl: ghUrl, endpoint: data.endpoint, mcpServer: data.mcp_server }]);
-      setGhUrl(''); setGhMsg(`✓ 已导入 "${name}"`);
-    } catch (e) { setGhMsg(`失败: ${(e as Error).message}`); }
-    setGhLoading(false);
   };
 
   const mcpServers = Array.from(new Set(customTools.filter(t => t.mcpServer).map(t => t.mcpServer!)));
@@ -140,8 +120,6 @@ export default function Tools() {
           <div className="section-title">MCP 服务端管理</div>
           {mcpServers.map(srv => {
             const st = customTools.filter(t => t.mcpServer === srv);
-            const ep = st.filter(t => t.endpoint);
-            const port = ep[0]?.endpoint?.url ? new URL(ep[0].endpoint.url).port || '3005' : '3005';
             return <McpServerCard key={srv} server={srv} tools={st} />;
           })}
         </div>

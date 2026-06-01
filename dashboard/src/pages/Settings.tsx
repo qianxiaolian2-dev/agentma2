@@ -34,7 +34,7 @@ export default function Settings() {
   const [provider, setProvider] = useState<ProviderConfig>(loadProvider);
   const [showEnvPreview, setShowEnvPreview] = useState(false);
   const [saved, setSaved] = useState(false);
-  const saveTimer = useRef<ReturnType<typeof setTimeout>>();
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   // provider 变更时自动保存到 localStorage
   useEffect(() => {

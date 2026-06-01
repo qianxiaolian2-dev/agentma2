@@ -1,11 +1,11 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import type { SDKMessage, ProviderConfig } from '../simulator/types';
-import { getDefaultOptions, getDefaultProviderConfig } from '../simulator/mock-data';
-import { PERMISSION_MODES, EFFORT_LEVELS } from '../simulator/mock-data';
+import { getDefaultProviderConfig } from '../simulator/mock-data';
 import StreamDisplay from '../components/common/StreamDisplay';
 import JsonViewer from '../components/common/JsonViewer';
 import { getAuthHeaders } from '../utils/client-runtime';
 import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
+import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../components/AskUserQuestionPrompt';
 
 function loadProvider(): ProviderConfig {
   try {
@@ -19,11 +19,11 @@ export default function Playground() {
   const [prompt, setPrompt] = useState('');
   const [messages, setMessages] = useState<SDKMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [options] = useState(getDefaultOptions());
   const [provider] = useState<ProviderConfig>(loadProvider);
   const [showOptions, setShowOptions] = useState(false);
   const [resultSummary, setResultSummary] = useState<Record<string, unknown> | null>(null);
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
+  const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const abortRef = useRef<AbortController | null>(null);
 
@@ -47,6 +47,7 @@ export default function Playground() {
     setMessages([]);
     setResultSummary(null);
     setPendingPermissions([]);
+    setPendingQuestions([]);
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -57,7 +58,7 @@ export default function Playground() {
         body: JSON.stringify({
           prompt,
           template: {
-            tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'],
+            tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'AskUserQuestion'],
             model: provider.ANTHROPIC_MODEL,
             maxTurns: 20,
           },
@@ -138,6 +139,14 @@ export default function Playground() {
               }]);
             } else if (dataType === 'permission_resolved') {
               if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
+            } else if (dataType === 'ask_user_question') {
+              setPendingQuestions(prev => [...prev, {
+                reqId: data.reqId,
+                questions: data.questions || [],
+                toolUseID: data.toolUseID,
+              }]);
+            } else if (dataType === 'ask_user_question_resolved') {
+              if (data.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (dataType === 'error') {
               setMessages(prev => [...prev, { type: 'system', subtype: 'error', result: data.message || '未知错误' }]);
             }
@@ -286,6 +295,10 @@ export default function Playground() {
       <PermissionPromptList
         pending={pendingPermissions}
         onResolved={(reqId) => setPendingPermissions(prev => prev.filter(p => p.reqId !== reqId))}
+      />
+      <AskUserQuestionPromptList
+        pending={pendingQuestions}
+        onResolved={(reqId) => setPendingQuestions(prev => prev.filter(p => p.reqId !== reqId))}
       />
 
       {/* 流式消息展示 */}

@@ -2,7 +2,7 @@ import type {
   SDKSessionInfo, SessionMessage, SDKMessage, McpServerStatus,
   SlashCommand, ModelInfo, AgentInfo, AgentDefinition,
   BuiltInTool, TodoItem, FileCheckpoint, RateLimitInfo,
-  HookEvent, HookCallbackMatcher, StreamEvent, SdkOptions,
+  HookEvent, StreamEvent, SdkOptions,
   PermissionMode, ProviderConfig, SkillInfo, RegisteredTool,
 } from './types';
 
@@ -451,8 +451,9 @@ export function generateStreamEvents(): StreamEvent[] {
 }
 
 // --- Hook 模拟输出 ---
-export function generateHookLog(hookEvent: HookEvent, toolName?: string): { input: Record<string, unknown>; output: Record<string, unknown>; timestamp: number } {
+export function generateHookLog(hookEvent: HookEvent, toolName?: string): { event: HookEvent; input: Record<string, unknown>; output: Record<string, unknown>; timestamp: number } {
   return {
+    event: hookEvent,
     timestamp: Date.now(),
     input: {
       hook_event_name: hookEvent,

@@ -3,6 +3,7 @@ import cors from 'cors';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import type { AgentDefinition, EffortLevel, PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 import {
   addTeamMember,
   audit,
@@ -11,21 +12,28 @@ import {
   createTeam,
   deleteUser,
   deleteChatSession,
+  forkChatSession,
   getMe,
   getQuota,
+  getQuotaUsageSummary,
   getChatSession,
   getTenantById,
+  evaluateHookRules,
+  evaluatePermissionRules,
   listAgentTemplates,
   listApiKeys,
   listAuditLogs,
   listChatSessions,
+  listHookRules,
+  listPermissionRules,
   listTeamMembers,
   listTeams,
   listUsers,
   loginUser,
   registerUser,
   removeTeamMember,
-  recordAgentRun,
+  replaceHookRules,
+  replacePermissionRules,
   replaceAgentTemplates,
   revokeApiKey,
   saveChatSession,
@@ -35,7 +43,13 @@ import {
   updateTenant,
   updateUserRole,
 } from './server-store.ts';
-import { runAgent, createPermissionRequester, resolvePermissionRequest } from './server-agent.ts';
+import {
+  runAgent,
+  createPermissionRequester,
+  createAskUserQuestionRequester,
+  resolvePermissionRequest,
+  resolveAskUserQuestion,
+} from './server-agent.ts';
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -49,6 +63,42 @@ const eventSources = new Map<string, { name: string; type: string; url: string; 
 const deployStatus = new Map<string, { status: string; message: string; started: number }>();
 const sessionSubs = new Map<string, Set<string>>();
 const sessionSSE = new Map<string, Set<express.Response>>();
+
+function normalizeStringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : undefined;
+}
+
+function normalizeSubagents(value: unknown): Record<string, AgentDefinition> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>).flatMap(([name, item]) => {
+    const agentName = name.trim();
+    if (!agentName || !item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const raw = item as Record<string, unknown>;
+    const description = typeof raw.description === 'string' ? raw.description.trim() : '';
+    const prompt = typeof raw.prompt === 'string' ? raw.prompt.trim() : '';
+    if (!description || !prompt) return [];
+    const maxTurns = Number(raw.maxTurns);
+    const memory = String(raw.memory || '');
+    const agent: AgentDefinition = {
+      description,
+      prompt,
+      tools: normalizeStringArray(raw.tools),
+      disallowedTools: normalizeStringArray(raw.disallowedTools),
+      model: typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : undefined,
+      skills: normalizeStringArray(raw.skills),
+      initialPrompt: typeof raw.initialPrompt === 'string' && raw.initialPrompt.trim() ? raw.initialPrompt : undefined,
+      maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : undefined,
+      background: typeof raw.background === 'boolean' ? raw.background : undefined,
+      memory: memory === 'user' || memory === 'project' || memory === 'local' ? memory : undefined,
+      effort: typeof raw.effort === 'string' ? raw.effort as EffortLevel : undefined,
+      permissionMode: typeof raw.permissionMode === 'string' ? raw.permissionMode as PermissionMode : undefined,
+    };
+    return [[agentName, agent] as const];
+  });
+  return entries.length ? Object.fromEntries(entries) : undefined;
+}
 
 app.get('/api/events/health', (_req, res) => res.json({ ok: true }));
 
@@ -170,8 +220,13 @@ app.post('/api/deploy', async (req, res) => {
 
 app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const { prompt, messages: inputMessages, systemPrompt, provider, tools: requestTools } = req.body || {};
+  const subagents = normalizeSubagents(req.body?.subagents);
+  const resumeSdkSessionId = typeof req.body?.sdkSessionId === 'string' ? req.body.sdkSessionId.trim() : '';
+  const sdkCwd = typeof req.body?.sdkCwd === 'string' ? req.body.sdkCwd.trim() : '';
 
   // Fold multi-turn history into systemPrompt so the model sees prior context.
+  // When an SDK transcript id is available, resume that transcript and send
+  // only the latest turn to avoid duplicating history.
   let runPrompt = '';
   let effectiveSystemPrompt = typeof systemPrompt === 'string' ? systemPrompt : '';
   if (Array.isArray(inputMessages) && inputMessages.length) {
@@ -184,7 +239,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     }
     if (!filtered.length) { res.status(400).json({ error: 'no usable messages' }); return; }
     runPrompt = filtered[filtered.length - 1].content;
-    if (filtered.length > 1) {
+    if (!resumeSdkSessionId && filtered.length > 1) {
       const history = filtered.slice(0, -1).map(m => `${m.role}: ${m.content}`).join('\n\n');
       effectiveSystemPrompt = [effectiveSystemPrompt, `[Conversation history]\n${history}`].filter(Boolean).join('\n\n');
     }
@@ -206,6 +261,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
 
   const sessionAllow = new Set<string>();
   const requestPermission = createPermissionRequester({ emit, sessionAllow, tenantId: req.auth.tenantId });
+  const requestUserQuestion = createAskUserQuestionRequester({ emit, tenantId: req.auth.tenantId });
   const toolsList = Array.isArray(requestTools) ? requestTools.map((t: any) => t?.name).filter(Boolean) : undefined;
 
   await runAgent({
@@ -216,10 +272,14 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     apiKey,
     tools: toolsList,
     requestTools: Array.isArray(requestTools) ? requestTools : undefined,
+    subagents,
+    cwd: sdkCwd || undefined,
+    resumeSdkSessionId: resumeSdkSessionId || undefined,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
     emit,
     requestPermission,
+    requestUserQuestion,
   });
   res.end();
 });
@@ -375,6 +435,10 @@ app.get('/api/quota', authMiddleware, (req: any, res) => {
   res.json(getQuota(req.auth.tenantId));
 });
 
+app.get('/api/quota/usage', authMiddleware, (req: any, res) => {
+  res.json(getQuotaUsageSummary(req.auth.tenantId));
+});
+
 app.patch('/api/quota', authMiddleware, requireAdmin, (req: any, res) => {
   const q = updateQuota(req.auth.tenantId, req.body || {});
   audit(req.auth.tenantId, 'update_quota', req.auth.sub, 'user', `quota:${req.auth.tenantId}`, req.body);
@@ -417,6 +481,61 @@ app.get('/api/audit-logs', authMiddleware, (req: any, res) => {
   res.json(listAuditLogs(req.auth.tenantId));
 });
 
+// ═══ Hook Rules Routes (tenant-shared) ═══
+app.get('/api/hook-rules', authMiddleware, (req: any, res) => {
+  res.json(listHookRules(req.auth.tenantId));
+});
+
+app.put('/api/hook-rules', authMiddleware, requireAdmin, (req: any, res) => {
+  const list = Array.isArray(req.body) ? req.body : [];
+  const saved = replaceHookRules(req.auth.tenantId, list);
+  audit(req.auth.tenantId, 'replace_hook_rules', req.auth.sub, 'user', `hooks:${req.auth.tenantId}`, { count: saved.length });
+  res.json(saved);
+});
+
+app.post('/api/hook-rules/evaluate', authMiddleware, (req: any, res) => {
+  const eventName = String(req.body?.eventName || '').trim();
+  if (!['PreToolUse', 'PostToolUse', 'Notification'].includes(eventName)) {
+    res.status(400).json({ error: 'eventName must be PreToolUse, PostToolUse, or Notification' }); return;
+  }
+  const input = req.body?.input && typeof req.body.input === 'object' && !Array.isArray(req.body.input)
+    ? req.body.input
+    : {};
+  const decision = evaluateHookRules(req.auth.tenantId, eventName as any, input);
+  res.json({
+    action: decision?.action || 'none',
+    reason: decision?.reason || 'no matching tenant hook rule',
+    output: decision?.output || {},
+    rule: decision?.rule || null,
+  });
+});
+
+// ═══ Permission Rules Routes (tenant-shared) ═══
+app.get('/api/permission-rules', authMiddleware, (req: any, res) => {
+  res.json(listPermissionRules(req.auth.tenantId));
+});
+
+app.put('/api/permission-rules', authMiddleware, requireAdmin, (req: any, res) => {
+  const list = Array.isArray(req.body) ? req.body : [];
+  const saved = replacePermissionRules(req.auth.tenantId, list);
+  audit(req.auth.tenantId, 'replace_permission_rules', req.auth.sub, 'user', `permissions:${req.auth.tenantId}`, { count: saved.length });
+  res.json(saved);
+});
+
+app.post('/api/permission-rules/evaluate', authMiddleware, (req: any, res) => {
+  const toolName = String(req.body?.toolName || '').trim();
+  if (!toolName) { res.status(400).json({ error: 'need toolName' }); return; }
+  const input = req.body?.input && typeof req.body.input === 'object' && !Array.isArray(req.body.input)
+    ? req.body.input
+    : {};
+  const decision = evaluatePermissionRules(req.auth.tenantId, toolName, input);
+  res.json({
+    behavior: decision?.behavior || 'ask',
+    reason: decision?.reason || 'no matching tenant rule',
+    rule: decision?.rule || null,
+  });
+});
+
 // ═══ Agent Templates Routes (tenant-shared) ═══
 app.get('/api/agents', authMiddleware, (req: any, res) => {
   res.json(listAgentTemplates(req.auth.tenantId));
@@ -452,6 +571,13 @@ app.patch('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
   res.json(session);
 });
 
+app.post('/api/chat-sessions/:id/fork', authMiddleware, (req: any, res) => {
+  const session = forkChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id, req.body || {});
+  if (!session) { res.status(404).json({ error: 'not found' }); return; }
+  audit(req.auth.tenantId, 'fork_chat_session', req.auth.sub, 'user', `chat_session:${req.params.id}`, { forkedId: session.id });
+  res.json(session);
+});
+
 app.delete('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
   const ok = deleteChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id);
   if (!ok) { res.status(404).json({ error: 'not found' }); return; }
@@ -463,6 +589,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   const { prompt, template, provider } = req.body || {};
   if (!prompt || typeof prompt !== 'string') { res.status(400).json({ error: 'need prompt' }); return; }
   const tmpl = template || {};
+  const subagents = normalizeSubagents(tmpl?.subagents);
   const apiKey = provider?.ANTHROPIC_AUTH_TOKEN || tmpl?.providerOverrides?.ANTHROPIC_AUTH_TOKEN || '';
   if (!apiKey) { res.status(400).json({ error: 'no api key' }); return; }
 
@@ -475,6 +602,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
 
   const sessionAllow = new Set<string>();
   const requestPermission = createPermissionRequester({ emit, sessionAllow, tenantId: req.auth.tenantId });
+  const requestUserQuestion = createAskUserQuestionRequester({ emit, tenantId: req.auth.tenantId });
 
   await runAgent({
     prompt,
@@ -483,11 +611,13 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
     baseUrl: provider?.ANTHROPIC_BASE_URL || tmpl?.providerOverrides?.ANTHROPIC_BASE_URL,
     apiKey,
     tools: Array.isArray(tmpl?.tools) ? tmpl.tools : undefined,
+    subagents,
     maxTurns: Number(tmpl?.maxTurns) || 20,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
     emit,
     requestPermission,
+    requestUserQuestion,
   });
   res.end();
 });
@@ -506,7 +636,29 @@ app.post('/api/agents/permissions/:reqId', authMiddleware, (req: any, res) => {
   res.json({ ok: true });
 });
 
+// AskUserQuestion answer endpoint — the frontend POSTs structured answers here
+// in response to an `ask_user_question` event from the SSE stream.
+app.post('/api/agents/questions/:reqId', authMiddleware, (req: any, res) => {
+  const answers = req.body?.answers;
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+    res.status(400).json({ error: 'answers must be an object' }); return;
+  }
+  const cleaned: Record<string, string> = {};
+  for (const [question, answer] of Object.entries(answers)) {
+    if (typeof answer !== 'string') continue;
+    const q = question.trim();
+    if (!q) continue;
+    cleaned[q] = answer.trim();
+  }
+  if (!Object.keys(cleaned).length) {
+    res.status(400).json({ error: 'answers must include at least one string answer' }); return;
+  }
+  const result = resolveAskUserQuestion(req.params.reqId, req.auth.tenantId, { answers: cleaned });
+  if (!result.ok) { res.status(404).json({ error: result.reason || 'not found' }); return; }
+  res.json({ ok: true });
+});
+
 app.listen(PORT, () => {
   console.log(`[agentma] http://localhost:${PORT}`);
-  recoverDeployedServers();
+  if (process.env.AGENTMA_SKIP_RECOVER !== '1') recoverDeployedServers();
 });

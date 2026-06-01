@@ -1,12 +1,67 @@
 import { useState, useEffect } from 'react';
-import { useAuth } from '../contexts/AuthContext';
-import JsonViewer from '../components/common/JsonViewer';
 import { getAuthHeaders } from '../utils/client-runtime';
 
 const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
 
+type QuotaUsageRun = {
+  id: string;
+  actor: string;
+  model: string;
+  status: string;
+  durationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  createdAt: number;
+};
+
+type QuotaUsageSummary = {
+  quota: Record<string, number | string>;
+  usage: {
+    monthlyActiveSeconds: { used: number; limit: number; percent: number };
+    weeklyRunCount: { used: number; limit: number; percent: number };
+    totalRuns: number;
+    successfulRuns: number;
+    failedRuns: number;
+    totalDurationMs: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalTokens: number;
+    totalCostUsd: number;
+    lastRunAt: number | null;
+  };
+  recentRuns: QuotaUsageRun[];
+};
+
+function formatNumber(value: unknown) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n.toLocaleString() : '0';
+}
+
+function formatDuration(ms: number) {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const totalSeconds = Math.round(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function formatSeconds(seconds: number) {
+  return formatDuration(seconds * 1000);
+}
+
+function formatCurrency(value: number) {
+  return `$${Number(value || 0).toFixed(6)}`;
+}
+
+function usageColor(percent: number) {
+  if (percent >= 90) return 'var(--danger)';
+  if (percent >= 70) return 'var(--warning)';
+  return 'var(--success)';
+}
+
 export default function Account() {
-  const { user, token } = useAuth();
   const [tab, setTab] = useState<'info' | 'apikeys' | 'teams' | 'users' | 'quota' | 'audit'>('info');
 
   return (
@@ -216,13 +271,20 @@ function TeamManager() {
 
 function QuotaManager() {
   const [quota, setQuota] = useState<any>(null);
+  const [usage, setUsage] = useState<QuotaUsageSummary | null>(null);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState<any>({});
-  useEffect(() => { fetch('/api/quota', { headers: getAuthHeaders() }).then(r => r.json()).then(d => { setQuota(d); setForm(d); }); }, []);
+  useEffect(() => {
+    fetch('/api/quota', { headers: getAuthHeaders() }).then(r => r.json()).then(d => { setQuota(d); setForm(d); });
+    fetch('/api/quota/usage', { headers: getAuthHeaders() }).then(r => r.json()).then(setUsage).catch(() => setUsage(null));
+  }, []);
 
   const save = async () => {
     const r = await fetch('/api/quota', { method: 'PATCH', headers: jsonAuthHeaders(), body: JSON.stringify(form) });
-    setQuota(await r.json()); setEditing(false);
+    const nextQuota = await r.json();
+    setQuota(nextQuota);
+    setUsage(usage ? { ...usage, quota: nextQuota } : usage);
+    setEditing(false);
   };
 
   if (!quota) return null;
@@ -237,24 +299,106 @@ function QuotaManager() {
   ];
 
   return (
-    <div className="card">
-      <div className="flex-between">
-        <div className="card-header" style={{ marginBottom: 0 }}>配额管理</div>
-        <button className="btn btn-sm" onClick={() => setEditing(!editing)}>{editing ? '取消' : '调整配额'}</button>
-      </div>
-      <div className="grid-2 mt-4">
-        {FIELDS.map(([k, label, unit]) => (
-          <div key={k} className="kpi-card">
-            <div className="kpi-label">{label}</div>
-            {editing ? (
-              <input type="number" value={form[k] || 0} onChange={e => setForm({ ...form, [k]: Number(e.target.value) })} style={{ fontSize: '1.2em', fontWeight: 700 }} />
-            ) : (
-              <div className="kpi-value" style={{ fontSize: '1.1em' }}>{quota[k]?.toLocaleString?.() || quota[k]} {unit}</div>
-            )}
+    <div style={{ display: 'grid', gap: 16 }}>
+      {usage && (
+        <div className="card">
+          <div className="flex-between">
+            <div className="card-header" style={{ marginBottom: 0 }}>真实用量</div>
+            <span className="badge badge-info">agent_run 审计聚合</span>
           </div>
-        ))}
+          <div className="grid-4 mt-4">
+            {[
+              ['本周运行', `${formatNumber(usage.usage.weeklyRunCount.used)} / ${formatNumber(usage.usage.weeklyRunCount.limit)}`, usage.usage.weeklyRunCount.percent, '次'],
+              ['月活跃时长', `${formatSeconds(usage.usage.monthlyActiveSeconds.used)} / ${formatSeconds(usage.usage.monthlyActiveSeconds.limit)}`, usage.usage.monthlyActiveSeconds.percent, ''],
+              ['LLM Tokens', formatNumber(usage.usage.totalTokens), 0, `${formatNumber(usage.usage.totalInputTokens)} in / ${formatNumber(usage.usage.totalOutputTokens)} out`],
+              ['估算成本', formatCurrency(usage.usage.totalCostUsd), 0, usage.usage.lastRunAt ? `最近 ${new Date(usage.usage.lastRunAt).toLocaleString()}` : '暂无运行'],
+            ].map(([label, value, percent, sub]) => (
+              <div key={label as string} className="kpi-card">
+                <div className="kpi-label">{label}</div>
+                <div className="kpi-value" style={{ fontSize: '1.18em' }}>{value}</div>
+                {Number(percent) > 0 ? (
+                  <>
+                    <div style={{ height: 6, background: 'var(--bg-hover)', borderRadius: 999, overflow: 'hidden', marginTop: 10 }}>
+                      <div style={{ width: `${percent}%`, height: '100%', background: usageColor(Number(percent)) }} />
+                    </div>
+                    <div className="kpi-sub">{percent}% 已用{sub ? ` · ${sub}` : ''}</div>
+                  </>
+                ) : (
+                  <div className="kpi-sub">{sub}</div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="grid-3 mt-4">
+            <div className="kpi-card">
+              <div className="kpi-label">运行结果</div>
+              <div className="kpi-value" style={{ fontSize: '1.1em' }}>{formatNumber(usage.usage.successfulRuns)} 成功</div>
+              <div className="kpi-sub">{formatNumber(usage.usage.failedRuns)} 失败 · 最近 {formatNumber(usage.usage.totalRuns)} 条</div>
+            </div>
+            <div className="kpi-card">
+              <div className="kpi-label">总运行时长</div>
+              <div className="kpi-value" style={{ fontSize: '1.1em' }}>{formatDuration(usage.usage.totalDurationMs)}</div>
+              <div className="kpi-sub">来自最近 100 条 agent_run 审计</div>
+            </div>
+            <div className="kpi-card">
+              <div className="kpi-label">单次限制</div>
+              <div className="kpi-value" style={{ fontSize: '1.1em' }}>{formatNumber(quota.perRunMaxToolCalls)} 工具</div>
+              <div className="kpi-sub">{formatNumber(quota.perRunMaxLlmTokens)} tokens</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="card">
+        <div className="flex-between">
+          <div className="card-header" style={{ marginBottom: 0 }}>配额管理</div>
+          <button className="btn btn-sm" onClick={() => setEditing(!editing)}>{editing ? '取消' : '调整配额'}</button>
+        </div>
+        <div className="grid-2 mt-4">
+          {FIELDS.map(([k, label, unit]) => (
+            <div key={k} className="kpi-card">
+              <div className="kpi-label">{label}</div>
+              {editing ? (
+                <input type="number" value={form[k] || 0} onChange={e => setForm({ ...form, [k]: Number(e.target.value) })} style={{ fontSize: '1.2em', fontWeight: 700 }} />
+              ) : (
+                <div className="kpi-value" style={{ fontSize: '1.1em' }}>{quota[k]?.toLocaleString?.() || quota[k]} {unit}</div>
+              )}
+            </div>
+          ))}
+        </div>
+        {editing && <button className="btn btn-primary mt-4" onClick={save}>保存配额</button>}
       </div>
-      {editing && <button className="btn btn-primary mt-4" onClick={save}>保存配额</button>}
+
+      {usage && (
+        <div className="card">
+          <div className="card-header">最近运行</div>
+          {usage.recentRuns.length === 0 ? (
+            <div className="kpi-card">
+              <div className="kpi-label">暂无 agent_run</div>
+              <div className="kpi-sub">真实 SDK 执行完成后会自动写入这里。</div>
+            </div>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>时间</th><th>模型</th><th>状态</th><th>时长</th><th>Tokens</th><th>成本</th><th>操作者</th></tr></thead>
+                <tbody>
+                  {usage.recentRuns.map((run) => (
+                    <tr key={run.id}>
+                      <td style={{ fontSize: '.8em' }}>{new Date(run.createdAt).toLocaleString()}</td>
+                      <td style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}>{run.model || 'unknown'}</td>
+                      <td><span className={`badge ${run.status === 'success' ? 'badge-success' : 'badge-danger'}`}>{run.status}</span></td>
+                      <td>{formatDuration(run.durationMs)}</td>
+                      <td>{formatNumber(run.totalTokens)}</td>
+                      <td>{formatCurrency(run.costUsd)}</td>
+                      <td style={{ fontSize: '.78em' }}>{run.actor}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

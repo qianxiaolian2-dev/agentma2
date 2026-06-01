@@ -23,6 +23,8 @@ function normalizeSession(session: unknown): ChatSession | null {
   const templateId = String((session as { templateId?: unknown }).templateId || '');
   const title = String((session as { title?: unknown }).title || '');
   const model = String((session as { model?: unknown }).model || '');
+  const sdkSessionId = String((session as { sdkSessionId?: unknown }).sdkSessionId || '');
+  const sdkCwd = String((session as { sdkCwd?: unknown }).sdkCwd || '');
   const createdAt = Number((session as { createdAt?: unknown }).createdAt);
   const updatedAt = Number((session as { updatedAt?: unknown }).updatedAt);
   if (!id || !templateId) return null;
@@ -39,6 +41,8 @@ function normalizeSession(session: unknown): ChatSession | null {
     title,
     messages,
     model,
+    sdkSessionId: sdkSessionId || undefined,
+    sdkCwd: sdkCwd || undefined,
     pinned: Boolean((session as { pinned?: unknown }).pinned),
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
@@ -108,7 +112,7 @@ export async function saveChatSession(session: ChatSession): Promise<ChatSession
 
 export async function patchChatSession(
   sessionId: string,
-  patch: Partial<Pick<ChatSession, 'title' | 'pinned' | 'templateId' | 'model'>>,
+  patch: Partial<Pick<ChatSession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd'>>,
 ): Promise<ChatSession> {
   const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}`, {
     method: 'PATCH',
@@ -118,6 +122,21 @@ export async function patchChatSession(
   const data = await readJson<unknown>(res);
   const normalized = normalizeSession(data);
   if (!normalized) throw new Error('会话更新失败');
+  return normalized;
+}
+
+export async function forkChatSession(
+  sessionId: string,
+  patch: Partial<Pick<ChatSession, 'title' | 'templateId' | 'model'>> = {},
+): Promise<ChatSession> {
+  const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}/fork`, {
+    method: 'POST',
+    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(patch),
+  });
+  const data = await readJson<unknown>(res);
+  const normalized = normalizeSession(data);
+  if (!normalized) throw new Error('会话分叉失败');
   return normalized;
 }
 

@@ -45,6 +45,37 @@ export type QuotaRow = {
   perRunMaxToolCalls: number;
 };
 
+export type QuotaUsageRun = {
+  id: string;
+  actor: string;
+  model: string;
+  status: string;
+  durationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  createdAt: number;
+};
+
+export type QuotaUsageSummary = {
+  quota: QuotaRow;
+  usage: {
+    monthlyActiveSeconds: { used: number; limit: number; percent: number };
+    weeklyRunCount: { used: number; limit: number; percent: number };
+    totalRuns: number;
+    successfulRuns: number;
+    failedRuns: number;
+    totalDurationMs: number;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalTokens: number;
+    totalCostUsd: number;
+    lastRunAt: number | null;
+  };
+  recentRuns: QuotaUsageRun[];
+};
+
 export type ApiKeyRow = {
   id: string;
   tenantId: string;
@@ -84,6 +115,50 @@ export type AuditRow = {
   createdAt: number;
 };
 
+export type PermissionRuleBehavior = 'allow' | 'deny';
+
+export type PermissionRuleRow = {
+  id: string;
+  tenantId: string;
+  toolName: string;
+  ruleContent: string;
+  behavior: PermissionRuleBehavior;
+  enabled: boolean;
+  position: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type PermissionRuleDecision = {
+  behavior: PermissionRuleBehavior;
+  rule: PermissionRuleRow;
+  reason: string;
+};
+
+export type HookRuleEvent = 'PreToolUse' | 'PostToolUse' | 'Notification';
+export type HookRuleAction = 'allow' | 'block' | 'context' | 'log';
+
+export type HookRuleRow = {
+  id: string;
+  tenantId: string;
+  eventName: HookRuleEvent;
+  matcher: string;
+  ruleContent: string;
+  action: HookRuleAction;
+  message: string;
+  enabled: boolean;
+  position: number;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type HookRuleDecision = {
+  action: HookRuleAction;
+  rule: HookRuleRow;
+  reason: string;
+  output: Record<string, unknown>;
+};
+
 export type ChatHistoryMessage = {
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -96,6 +171,8 @@ export type ChatHistorySession = {
   title: string;
   messages: ChatHistoryMessage[];
   model: string;
+  sdkSessionId?: string;
+  sdkCwd?: string;
   pinned?: boolean;
   createdAt: number;
   updatedAt: number;
@@ -129,6 +206,13 @@ initSchema();
 migrateLegacyJson();
 
 const JWT_SECRET = process.env.JWT_SECRET || readOrCreateSecret();
+
+function ensureColumn(tableName: string, columnName: string, definition: string) {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(columnName)) return;
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+  if (rows.some((row) => row.name === columnName)) return;
+  db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
 
 function initSchema() {
   db.exec(`
@@ -218,6 +302,8 @@ function initSchema() {
       template_id TEXT NOT NULL,
       title TEXT NOT NULL,
       model TEXT NOT NULL,
+      sdk_session_id TEXT,
+      sdk_cwd TEXT,
       pinned INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
@@ -233,7 +319,39 @@ function initSchema() {
       PRIMARY KEY (session_id, seq)
     );
     CREATE INDEX IF NOT EXISTS idx_chat_messages_session_seq ON chat_messages (session_id, seq);
+
+    CREATE TABLE IF NOT EXISTS permission_rules (
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      id TEXT NOT NULL,
+      tool_name TEXT NOT NULL,
+      rule_content TEXT NOT NULL DEFAULT '',
+      behavior TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_permission_rules_tenant_position ON permission_rules (tenant_id, position ASC, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS hook_rules (
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      id TEXT NOT NULL,
+      event_name TEXT NOT NULL,
+      matcher TEXT NOT NULL DEFAULT '',
+      rule_content TEXT NOT NULL DEFAULT '',
+      action TEXT NOT NULL,
+      message TEXT NOT NULL DEFAULT '',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_hook_rules_tenant_position ON hook_rules (tenant_id, position ASC, updated_at DESC);
   `);
+  ensureColumn('chat_sessions', 'sdk_session_id', 'TEXT');
+  ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
 }
 
 function readOrCreateSecret() {
@@ -454,6 +572,38 @@ function mapQuota(row: any): QuotaRow {
   };
 }
 
+function clampPercent(used: number, limit: number) {
+  if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((used / limit) * 1000) / 10));
+}
+
+function asAgentRunDiff(diff: unknown): Record<string, unknown> {
+  return diff && typeof diff === 'object' && !Array.isArray(diff) ? diff as Record<string, unknown> : {};
+}
+
+function toFiniteNumber(value: unknown) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function mapQuotaUsageRun(row: any): QuotaUsageRun {
+  const diff = asAgentRunDiff(row.diff_json ? JSON.parse(row.diff_json) : {});
+  const inputTokens = toFiniteNumber(diff.inputTokens);
+  const outputTokens = toFiniteNumber(diff.outputTokens);
+  return {
+    id: row.id,
+    actor: row.actor,
+    model: String(diff.model || row.resource || '').replace(/^run:/, ''),
+    status: String(diff.status || 'unknown'),
+    durationMs: toFiniteNumber(diff.durationMs),
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    costUsd: toFiniteNumber(diff.costUsd),
+    createdAt: row.created_at,
+  };
+}
+
 function mapApiKey(row: any): ApiKeyRow {
   return {
     id: row.id,
@@ -482,6 +632,36 @@ function mapAudit(row: any): AuditRow {
   };
 }
 
+function mapPermissionRule(row: any): PermissionRuleRow {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    toolName: row.tool_name,
+    ruleContent: row.rule_content || '',
+    behavior: row.behavior,
+    enabled: Boolean(row.enabled),
+    position: Number(row.position || 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapHookRule(row: any): HookRuleRow {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    eventName: row.event_name,
+    matcher: row.matcher || '',
+    ruleContent: row.rule_content || '',
+    action: row.action,
+    message: row.message || '',
+    enabled: Boolean(row.enabled),
+    position: Number(row.position || 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function normalizeChatMessages(messages: unknown): ChatHistoryMessage[] {
   if (!Array.isArray(messages)) return [];
   return messages.flatMap((message, index) => {
@@ -506,6 +686,8 @@ function mapChatSession(row: any, messages: ChatHistoryMessage[]): ChatHistorySe
     title: row.title,
     messages,
     model: row.model,
+    sdkSessionId: row.sdk_session_id || undefined,
+    sdkCwd: row.sdk_cwd || undefined,
     pinned: Boolean(row.pinned),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -799,6 +981,48 @@ export function getQuota(tenantId: string) {
   return row ? mapQuota(row) : { tenantId, ...DEFAULT_QUOTA };
 }
 
+export function getQuotaUsageSummary(tenantId: string): QuotaUsageSummary {
+  const quota = getQuota(tenantId);
+  const rows = db.prepare(`
+    SELECT id, actor, resource, diff_json, created_at
+    FROM audit_logs
+    WHERE tenant_id = ? AND action = 'agent_run'
+    ORDER BY created_at DESC
+    LIMIT 100
+  `).all(tenantId);
+  const runs = rows.map(mapQuotaUsageRun);
+  const totalInputTokens = runs.reduce((sum, run) => sum + run.inputTokens, 0);
+  const totalOutputTokens = runs.reduce((sum, run) => sum + run.outputTokens, 0);
+  const totalDurationMs = runs.reduce((sum, run) => sum + run.durationMs, 0);
+  const totalCostUsd = runs.reduce((sum, run) => sum + run.costUsd, 0);
+
+  return {
+    quota,
+    usage: {
+      monthlyActiveSeconds: {
+        used: quota.monthlyActiveSecondsUsed,
+        limit: quota.monthlyActiveSecondsLimit,
+        percent: clampPercent(quota.monthlyActiveSecondsUsed, quota.monthlyActiveSecondsLimit),
+      },
+      weeklyRunCount: {
+        used: quota.weeklyRunCountUsed,
+        limit: quota.weeklyRunCountLimit,
+        percent: clampPercent(quota.weeklyRunCountUsed, quota.weeklyRunCountLimit),
+      },
+      totalRuns: runs.length,
+      successfulRuns: runs.filter((run) => run.status === 'success').length,
+      failedRuns: runs.filter((run) => run.status !== 'success').length,
+      totalDurationMs,
+      totalInputTokens,
+      totalOutputTokens,
+      totalTokens: totalInputTokens + totalOutputTokens,
+      totalCostUsd,
+      lastRunAt: runs[0]?.createdAt ?? null,
+    },
+    recentRuns: runs.slice(0, 10),
+  };
+}
+
 export function updateQuota(tenantId: string, body: Record<string, unknown>) {
   ensureQuotaForTenant(tenantId);
   const current = getQuota(tenantId);
@@ -933,6 +1157,226 @@ export function listAuditLogs(tenantId: string) {
   return rows.map(mapAudit);
 }
 
+export function listPermissionRules(tenantId: string) {
+  const rows = db.prepare(`
+    SELECT tenant_id, id, tool_name, rule_content, behavior, enabled, position, created_at, updated_at
+    FROM permission_rules
+    WHERE tenant_id = ?
+    ORDER BY position ASC, updated_at DESC
+  `).all(tenantId);
+  return rows.map(mapPermissionRule);
+}
+
+export function replacePermissionRules(tenantId: string, rules: Array<Record<string, unknown>>) {
+  const timestamp = now();
+  const normalized = rules.flatMap((rule, index): PermissionRuleRow[] => {
+    const toolName = String(rule?.toolName || '').trim();
+    const behavior = String(rule?.behavior || '').trim();
+    if (!toolName || (behavior !== 'allow' && behavior !== 'deny')) return [];
+    return [{
+      id: String(rule?.id || crypto.randomUUID()),
+      tenantId,
+      toolName,
+      ruleContent: String(rule?.ruleContent || '').slice(0, 1000),
+      behavior,
+      enabled: rule?.enabled !== false,
+      position: Number.isFinite(Number(rule?.position)) ? Number(rule.position) : index,
+      createdAt: Number(rule?.createdAt) || timestamp,
+      updatedAt: timestamp,
+    }];
+  });
+
+  db.exec('BEGIN');
+  try {
+    db.prepare('DELETE FROM permission_rules WHERE tenant_id = ?').run(tenantId);
+    const insert = db.prepare(`
+      INSERT INTO permission_rules (
+        tenant_id, id, tool_name, rule_content, behavior, enabled, position, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    normalized.forEach((rule, index) => {
+      insert.run(
+        tenantId,
+        rule.id,
+        rule.toolName,
+        rule.ruleContent,
+        rule.behavior,
+        rule.enabled ? 1 : 0,
+        index,
+        rule.createdAt,
+        rule.updatedAt,
+      );
+    });
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+
+  return listPermissionRules(tenantId);
+}
+
+function getBareToolName(toolName: string) {
+  return toolName.startsWith('mcp__') ? (toolName.split('__').pop() || toolName) : toolName;
+}
+
+function permissionRuleMatches(rule: PermissionRuleRow, toolName: string, input: Record<string, unknown>) {
+  const ruleTool = rule.toolName.trim();
+  const bareName = getBareToolName(toolName);
+  if (ruleTool !== '*' && ruleTool !== toolName && ruleTool !== bareName) return false;
+
+  const ruleContent = rule.ruleContent.trim().toLowerCase();
+  if (!ruleContent) return true;
+  const inputText = JSON.stringify(input || {}).toLowerCase();
+  return inputText.includes(ruleContent);
+}
+
+export function evaluatePermissionRules(tenantId: string, toolName: string, input: Record<string, unknown>): PermissionRuleDecision | null {
+  const rule = listPermissionRules(tenantId).find((candidate) => (
+    candidate.enabled && permissionRuleMatches(candidate, toolName, input)
+  ));
+  if (!rule) return null;
+  const reason = rule.ruleContent
+    ? `${rule.behavior} rule matched ${rule.toolName}:${rule.ruleContent}`
+    : `${rule.behavior} rule matched ${rule.toolName}`;
+  return { behavior: rule.behavior, rule, reason };
+}
+
+const HOOK_RULE_EVENTS = new Set<HookRuleEvent>(['PreToolUse', 'PostToolUse', 'Notification']);
+const HOOK_RULE_ACTIONS = new Set<HookRuleAction>(['allow', 'block', 'context', 'log']);
+
+export function listHookRules(tenantId: string) {
+  const rows = db.prepare(`
+    SELECT tenant_id, id, event_name, matcher, rule_content, action, message, enabled, position, created_at, updated_at
+    FROM hook_rules
+    WHERE tenant_id = ?
+    ORDER BY position ASC, updated_at DESC
+  `).all(tenantId);
+  return rows.map(mapHookRule);
+}
+
+export function replaceHookRules(tenantId: string, rules: Array<Record<string, unknown>>) {
+  const timestamp = now();
+  const normalized = rules.flatMap((rule, index): HookRuleRow[] => {
+    const eventName = String(rule?.eventName || '').trim() as HookRuleEvent;
+    const action = String(rule?.action || '').trim() as HookRuleAction;
+    if (!HOOK_RULE_EVENTS.has(eventName) || !HOOK_RULE_ACTIONS.has(action)) return [];
+    return [{
+      id: String(rule?.id || crypto.randomUUID()),
+      tenantId,
+      eventName,
+      matcher: String(rule?.matcher || '').slice(0, 300),
+      ruleContent: String(rule?.ruleContent || '').slice(0, 1000),
+      action,
+      message: String(rule?.message || '').slice(0, 1000),
+      enabled: rule?.enabled !== false,
+      position: Number.isFinite(Number(rule?.position)) ? Number(rule.position) : index,
+      createdAt: Number(rule?.createdAt) || timestamp,
+      updatedAt: timestamp,
+    }];
+  });
+
+  db.exec('BEGIN');
+  try {
+    db.prepare('DELETE FROM hook_rules WHERE tenant_id = ?').run(tenantId);
+    const insert = db.prepare(`
+      INSERT INTO hook_rules (
+        tenant_id, id, event_name, matcher, rule_content, action, message, enabled, position, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    normalized.forEach((rule, index) => {
+      insert.run(
+        tenantId,
+        rule.id,
+        rule.eventName,
+        rule.matcher,
+        rule.ruleContent,
+        rule.action,
+        rule.message,
+        rule.enabled ? 1 : 0,
+        index,
+        rule.createdAt,
+        rule.updatedAt,
+      );
+    });
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+
+  return listHookRules(tenantId);
+}
+
+function getHookMatcherValue(input: Record<string, unknown>) {
+  const toolName = typeof input.tool_name === 'string' ? input.tool_name : '';
+  const notificationType = typeof input.notification_type === 'string' ? input.notification_type : '';
+  return toolName || notificationType;
+}
+
+function hookRuleMatches(rule: HookRuleRow, eventName: HookRuleEvent, input: Record<string, unknown>) {
+  if (rule.eventName !== eventName) return false;
+
+  const matcher = rule.matcher.trim().toLowerCase();
+  if (matcher) {
+    const matcherValue = getHookMatcherValue(input).toLowerCase();
+    if (!matcherValue.includes(matcher)) return false;
+  }
+
+  const ruleContent = rule.ruleContent.trim().toLowerCase();
+  if (!ruleContent) return true;
+  return JSON.stringify(input || {}).toLowerCase().includes(ruleContent);
+}
+
+function buildHookRuleOutput(rule: HookRuleRow, reason: string): Record<string, unknown> {
+  const additionalContext = rule.message || reason;
+  if (rule.eventName === 'PreToolUse') {
+    const hookSpecificOutput: Record<string, unknown> = { hookEventName: 'PreToolUse' };
+    if (rule.action === 'allow') {
+      hookSpecificOutput.permissionDecision = 'allow';
+      hookSpecificOutput.permissionDecisionReason = reason;
+    } else if (rule.action === 'block') {
+      hookSpecificOutput.permissionDecision = 'deny';
+      hookSpecificOutput.permissionDecisionReason = reason;
+    } else if (rule.action === 'context') {
+      hookSpecificOutput.additionalContext = additionalContext;
+    }
+    return {
+      ...(rule.action === 'block' ? { decision: 'block', reason } : {}),
+      hookSpecificOutput,
+    };
+  }
+
+  if (rule.eventName === 'PostToolUse') {
+    return {
+      ...(rule.action === 'block' ? { decision: 'block', reason } : {}),
+      hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext },
+    };
+  }
+
+  return {
+    ...(rule.action === 'block' ? { decision: 'block', reason } : {}),
+    hookSpecificOutput: { hookEventName: 'Notification', additionalContext },
+  };
+}
+
+export function evaluateHookRules(tenantId: string, eventName: HookRuleEvent, input: Record<string, unknown>): HookRuleDecision | null {
+  const rule = listHookRules(tenantId).find((candidate) => (
+    candidate.enabled && hookRuleMatches(candidate, eventName, input)
+  ));
+  if (!rule) return null;
+  const detail = [rule.eventName, rule.matcher, rule.ruleContent].filter(Boolean).join(':');
+  const reason = `${rule.action} hook rule matched ${detail}`;
+  return {
+    action: rule.action,
+    rule,
+    reason,
+    output: buildHookRuleOutput(rule, reason),
+  };
+}
+
 export function audit(tenantId: string, action: string, actor: string, actorType: string, resource: string, diff?: unknown) {
   db.prepare(`
     INSERT INTO audit_logs (id, tenant_id, action, actor, actor_type, resource, diff_json, created_at)
@@ -959,7 +1403,7 @@ export function audit(tenantId: string, action: string, actor: string, actorType
 
 function getChatSessionRow(tenantId: string, ownerSub: string, sessionId: string) {
   return db.prepare(`
-    SELECT id, tenant_id, owner_sub, template_id, title, model, pinned, created_at, updated_at
+    SELECT id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, pinned, created_at, updated_at
     FROM chat_sessions
     WHERE tenant_id = ? AND owner_sub = ? AND id = ?
   `).get(tenantId, ownerSub, sessionId) as {
@@ -969,6 +1413,8 @@ function getChatSessionRow(tenantId: string, ownerSub: string, sessionId: string
     template_id: string;
     title: string;
     model: string;
+    sdk_session_id?: string | null;
+    sdk_cwd?: string | null;
     pinned: number;
     created_at: number;
     updated_at: number;
@@ -1007,7 +1453,7 @@ function listMessagesForSession(sessionId: string) {
 
 export function listChatSessions(tenantId: string, ownerSub: string) {
   const rows = db.prepare(`
-    SELECT id, tenant_id, owner_sub, template_id, title, model, pinned, created_at, updated_at
+    SELECT id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, pinned, created_at, updated_at
     FROM chat_sessions
     WHERE tenant_id = ? AND owner_sub = ?
     ORDER BY pinned DESC, updated_at DESC
@@ -1019,6 +1465,18 @@ export function getChatSession(tenantId: string, ownerSub: string, sessionId: st
   const row = getChatSessionRow(tenantId, ownerSub, sessionId);
   if (!row) return null;
   return mapChatSession(row, listMessagesForSession(sessionId));
+}
+
+export function listProtectedSdkCwds() {
+  const rows = db.prepare(`
+    SELECT DISTINCT sdk_cwd
+    FROM chat_sessions
+    WHERE sdk_session_id IS NOT NULL
+      AND sdk_session_id != ''
+      AND sdk_cwd IS NOT NULL
+      AND sdk_cwd != ''
+  `).all() as Array<{ sdk_cwd: string }>;
+  return rows.map((row) => row.sdk_cwd);
 }
 
 export function saveChatSession(
@@ -1043,6 +1501,8 @@ export function saveChatSession(
   const updatedAt = Number(session.updatedAt) || now();
   const title = String(session.title || existing?.title || firstContent?.slice(0, 40) || '新对话');
   const model = String(session.model || existing?.model || '');
+  const sdkSessionId = String(session.sdkSessionId || existing?.sdkSessionId || '').trim();
+  const sdkCwd = String(session.sdkCwd || existing?.sdkCwd || '').trim();
   const pinned = typeof session.pinned === 'boolean' ? session.pinned : Boolean(existing?.pinned);
   const templateId = String(session.templateId || existing?.templateId);
 
@@ -1050,16 +1510,18 @@ export function saveChatSession(
   try {
     db.prepare(`
       INSERT INTO chat_sessions (
-        id, tenant_id, owner_sub, template_id, title, model, pinned, created_at, updated_at
+        id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, pinned, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         template_id = excluded.template_id,
         title = excluded.title,
         model = excluded.model,
+        sdk_session_id = excluded.sdk_session_id,
+        sdk_cwd = excluded.sdk_cwd,
         pinned = excluded.pinned,
         updated_at = excluded.updated_at
-    `).run(id, tenantId, ownerSub, templateId, title, model, pinned ? 1 : 0, createdAt, updatedAt);
+    `).run(id, tenantId, ownerSub, templateId, title, model, sdkSessionId || null, sdkCwd || null, pinned ? 1 : 0, createdAt, updatedAt);
 
     db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(id);
     if (messages.length > 0) {
@@ -1085,7 +1547,7 @@ export function updateChatSession(
   tenantId: string,
   ownerSub: string,
   sessionId: string,
-  patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model'>>,
+  patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd'>>,
 ) {
   const current = getChatSession(tenantId, ownerSub, sessionId);
   if (!current) return null;
@@ -1096,7 +1558,33 @@ export function updateChatSession(
     pinned: typeof patch.pinned === 'boolean' ? patch.pinned : current.pinned,
     templateId: patch.templateId ?? current.templateId,
     model: patch.model ?? current.model,
+    sdkSessionId: patch.sdkSessionId ?? current.sdkSessionId,
+    sdkCwd: patch.sdkCwd ?? current.sdkCwd,
     updatedAt: now(),
+  });
+  return next.ok ? next.session : null;
+}
+
+export function forkChatSession(
+  tenantId: string,
+  ownerSub: string,
+  sessionId: string,
+  patch: Partial<Pick<ChatHistorySession, 'title' | 'templateId' | 'model'>>,
+) {
+  const current = getChatSession(tenantId, ownerSub, sessionId);
+  if (!current) return null;
+  const timestamp = now();
+  const next = saveChatSession(tenantId, ownerSub, {
+    id: crypto.randomUUID(),
+    title: String(patch.title || `${current.title || '新对话'} · fork`),
+    templateId: patch.templateId || current.templateId,
+    model: patch.model || current.model,
+    sdkSessionId: undefined,
+    sdkCwd: undefined,
+    pinned: false,
+    messages: current.messages,
+    createdAt: timestamp,
+    updatedAt: timestamp,
   });
   return next.ok ? next.session : null;
 }

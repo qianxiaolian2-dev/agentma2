@@ -5,11 +5,16 @@ import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-dat
 import type { EventSourceConfig } from '../simulator/types';
 import { getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
 import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
+import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../components/AskUserQuestionPrompt';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
+import { buildRequestToolsForAgent } from '../utils/build-request-tools';
+import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
+import { hasTrailingAssistantMessage, withAssistantDraft } from '../utils/chat-stream-draft';
 import {
   bootstrapChatSessions,
   deleteChatSession as deleteChatSessionApi,
+  forkChatSession as forkChatSessionApi,
   patchChatSession,
   saveChatSession as saveChatSessionApi,
 } from '../utils/chat-sessions';
@@ -89,6 +94,7 @@ export default function Conversations() {
   const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
   const [selectedAgentId, setSelectedAgentId] = useState('');
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [mobileListOpen, setMobileListOpen] = useState(false);
 
   // 聊天状态
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -96,19 +102,19 @@ export default function Conversations() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamThinking, setStreamThinking] = useState('');
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
-  const [streamText, setStreamText] = useState('');
+  const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
+  const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(loadGlobalProvider());
   const currentAgent = templates.find(t => t.id === selectedAgentId);
 
-  const [botEvents, setBotEvents] = useState<Array<{ type: string; source?: string; username?: string; message?: string; timestamp: number }>>([]);
+  const [botEvents, setBotEvents] = useState<Array<{ type: string; source?: string; username?: string; message?: string; health?: number; timestamp: number }>>([]);
   const [eventSources, setEventSources] = useState<EventSourceConfig[]>([]);
   const [subbedSources, setSubbedSources] = useState<string[]>([]);
   const [showEventToggles, setShowEventToggles] = useState(false);
-  const autoReplyRef = useRef<((eventText: string) => Promise<void>) | null>(null);
-  const persistRef = useRef<((msgs: ChatMessage[], sid: string | null) => Promise<string>) | null>(null);
+  const persistRef = useRef<((msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => Promise<string>) | null>(null);
 
   // 自动回复
   const doAutoReply = useCallback(async (eventText: string) => {
@@ -122,9 +128,11 @@ export default function Conversations() {
     setIsStreaming(true);
     const eventMsg: ChatMessage = { role: 'user', content: eventText, timestamp: Date.now() };
     const newMsgs = [...currentMsgs, eventMsg];
+    const assistantTimestamp = Date.now();
     setMessages(newMsgs);
     setStreamThinking('');
-    setStreamText('');
+    setPendingQuestions([]);
+    setAgentTasks([]);
 
     try {
       const res = await fetch('/api/chat', {
@@ -134,23 +142,10 @@ export default function Conversations() {
           messages: newMsgs.map(m => ({ role: m.role, content: m.content })),
           systemPrompt: agent.systemPrompt || undefined,
           provider: prov,
-          tools: (() => {
-            if (!agent?.tools?.length) return undefined;
-            const customs = initCustomTools();
-            const BUILTIN_SCHEMAS: Record<string, Record<string, unknown>> = {
-              Read: { file_path: 'string' }, Write: { file_path: 'string', content: 'string' },
-              Edit: { file_path: 'string', old_string: 'string', new_string: 'string' },
-              Bash: { command: 'string' }, Grep: { pattern: 'string' }, Glob: { pattern: 'string' },
-              WebSearch: { query: 'string' }, WebFetch: { url: 'string', prompt: 'string' },
-            };
-            return agent.tools.map(t => {
-              const custom = customs.find(c => c.name === t);
-              if (custom) return { name: t, description: custom.description, input_schema: custom.inputSchema };
-              const schema = BUILTIN_SCHEMAS[t];
-              if (schema) return { name: t, description: t, input_schema: schema };
-              return { name: t, description: t, input_schema: {} };
-            });
-          })(),
+          tools: buildRequestToolsForAgent(agent),
+          subagents: agent.subagents,
+          sdkSessionId: sessions.find((session) => session.id === activeSessionId)?.sdkSessionId,
+          sdkCwd: sessions.find((session) => session.id === activeSessionId)?.sdkCwd,
         }),
       });
 
@@ -167,14 +162,16 @@ export default function Conversations() {
               const d = JSON.parse(line.slice(6));
               if (d.type === 'delta') {
                 if (d.thinking) { thinking += d.text || ''; setStreamThinking(thinking); }
-                else { text += d.text || ''; setStreamText(text); }
+                else {
+                  text += d.text || '';
+                  setMessages(withAssistantDraft(newMsgs, text, assistantTimestamp));
+                }
               } else if (d.type === 'result') {
                 const content = d.text || text || thinking || '';
-                const respMsg: ChatMessage = { role: 'assistant', content, timestamp: Date.now() };
-                const finalMsgs = [...newMsgs, respMsg];
+                const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
+                setStreamThinking('');
                 setMessages(finalMsgs);
-                setStreamThinking(''); setStreamText('');
-                const sid = await (persistRef.current?.(finalMsgs, activeSessionId) || Promise.resolve(''));
+                const sid = await (persistRef.current?.(finalMsgs, activeSessionId, d.sdkSessionId, d.sdkCwd) || Promise.resolve(''));
                 if (sid) setActiveSessionId(sid);
               } else if (d.type === 'permission_request') {
                 setPendingPermissions(prev => [...prev, {
@@ -184,6 +181,16 @@ export default function Conversations() {
                 }]);
               } else if (d.type === 'permission_resolved') {
                 if (d.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
+              } else if (d.type === 'ask_user_question') {
+                setPendingQuestions(prev => [...prev, {
+                  reqId: d.reqId,
+                  questions: d.questions || [],
+                  toolUseID: d.toolUseID,
+                }]);
+              } else if (d.type === 'ask_user_question_resolved') {
+                if (d.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== d.reqId));
+              } else if (String(d.type || '').startsWith('task_')) {
+                setAgentTasks(prev => mergeAgentTaskEvent(prev, d));
               }
             } catch {}
           }
@@ -191,7 +198,7 @@ export default function Conversations() {
       }
     } catch {}
     setIsStreaming(false);
-  }, [currentAgent, isStreaming, activeSessionId, messages]);
+  }, [currentAgent, isStreaming, activeSessionId, messages, sessions]);
 
   // 订阅 EventSource — 当 MCP 服务器部署后，自动桥接 bot 事件到当前会话
   useEffect(() => {
@@ -282,10 +289,10 @@ export default function Conversations() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, streamThinking, streamText]);
+  }, [messages, streamThinking, agentTasks]);
 
   // 保存会话（服务端持久化 + 本地状态同步）
-  const persistSession = useCallback(async (msgs: ChatMessage[], sid: string | null) => {
+  const persistSession = useCallback(async (msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => {
     if (!selectedAgentId || msgs.length === 0) return '';
     const now = Date.now();
     const id = sid || `chat-${Date.now()}`;
@@ -296,6 +303,8 @@ export default function Conversations() {
       title: existing?.title || msgs[0]?.content?.slice(0, 40) || '新对话',
       messages: msgs,
       model: currentAgent?.model || provider.current.ANTHROPIC_MODEL || existing?.model || '',
+      sdkSessionId: sdkSessionId || existing?.sdkSessionId,
+      sdkCwd: sdkCwd || existing?.sdkCwd,
       pinned: existing?.pinned,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
@@ -331,8 +340,10 @@ export default function Conversations() {
     setActiveSessionId(null);
     setMessages([]);
     setStreamThinking('');
-    setStreamText('');
+    setPendingQuestions([]);
+    setAgentTasks([]);
     setInput('');
+    setMobileListOpen(false);
   };
 
   // 选中会话时滚动到可见位置
@@ -347,11 +358,13 @@ export default function Conversations() {
     setActiveSessionId(s.id);
     setMessages(s.messages);
     setStreamThinking('');
-    setStreamText('');
+    setPendingQuestions([]);
+    setAgentTasks([]);
     setInput('');
     if (s.templateId && templates.find(t => t.id === s.templateId)) {
       setSelectedAgentId(s.templateId);
     }
+    setMobileListOpen(false);
   }, [templates]);
 
   // 编辑标题
@@ -390,6 +403,18 @@ export default function Conversations() {
     }
   };
 
+  const handleFork = async (source: ChatSession, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const title = `${source.title || source.messages[0]?.content?.slice(0, 40) || '新对话'} · fork`;
+    try {
+      const forked = await forkChatSessionApi(source.id, { title });
+      setSessions(prev => [forked, ...prev.filter(s => s.id !== forked.id)]);
+      handleSelect(forked);
+    } catch (error) {
+      console.error('failed to fork chat session', error);
+    }
+  };
+
   // 删除会话
   const handleDelete = async (id: string) => {
     const updated = sessions.filter(s => s.id !== id);
@@ -418,11 +443,13 @@ export default function Conversations() {
 
     const userMsg: ChatMessage = { role: 'user', content: input.trim(), timestamp: Date.now() };
     const newMsgs = [...messages, userMsg];
+    const assistantTimestamp = Date.now();
     setMessages(newMsgs);
     setInput('');
     setIsStreaming(true);
     setStreamThinking('');
-    setStreamText('');
+    setPendingQuestions([]);
+    setAgentTasks([]);
 
     try {
       const res = await fetch('/api/chat', {
@@ -432,31 +459,10 @@ export default function Conversations() {
           messages: newMsgs.map(m => ({ role: m.role, content: m.content })),
           systemPrompt: currentAgent.systemPrompt || undefined,
           provider: provider.current,
-          tools: (() => {
-            if (!currentAgent?.tools?.length) return undefined;
-            const customs = initCustomTools();
-            // 内置工具 schema（简化的）
-            const BUILTIN_SCHEMAS: Record<string, Record<string, unknown>> = {
-              Read: { file_path: 'string', offset: 'number?', limit: 'number?' },
-              Write: { file_path: 'string', content: 'string' },
-              Edit: { file_path: 'string', old_string: 'string', new_string: 'string', replace_all: 'boolean?' },
-              Bash: { command: 'string', timeout: 'number?', description: 'string?' },
-              Grep: { pattern: 'string', path: 'string?' },
-              Glob: { pattern: 'string' },
-              WebSearch: { query: 'string' },
-              WebFetch: { url: 'string', prompt: 'string' },
-              TaskCreate: { subject: 'string', description: 'string' },
-              TaskUpdate: { taskId: 'string', status: 'string' },
-              TaskList: {},
-            };
-            return currentAgent.tools.map(t => {
-              const custom = customs.find(c => c.name === t);
-              if (custom) return { name: t, description: custom.description, input_schema: custom.inputSchema };
-              const schema = BUILTIN_SCHEMAS[t];
-              if (schema) return { name: t, description: t, input_schema: schema };
-              return { name: t, description: t, input_schema: {} };
-            });
-          })(),
+          tools: buildRequestToolsForAgent(currentAgent),
+          subagents: currentAgent.subagents,
+          sdkSessionId: activeSessionId ? sessions.find((session) => session.id === activeSessionId)?.sdkSessionId : undefined,
+          sdkCwd: activeSessionId ? sessions.find((session) => session.id === activeSessionId)?.sdkCwd : undefined,
         }),
       });
 
@@ -490,16 +496,17 @@ export default function Conversations() {
             const data = JSON.parse(line.slice(6));
             if (data.type === 'delta') {
               if (data.thinking) { thinking += data.text || ''; setStreamThinking(thinking); }
-              else { text += data.text || ''; setStreamText(text); }
+              else {
+                text += data.text || '';
+                setMessages(withAssistantDraft(newMsgs, text, assistantTimestamp));
+              }
             } else if (data.type === 'result') {
               const content = data.text || text || thinking || '';
-              const respMsg: ChatMessage = { role: 'assistant', content, timestamp: Date.now() };
-              const finalMsgs = [...newMsgs, respMsg];
-              setMessages(finalMsgs);
-              const sid = await persistSession(finalMsgs, activeSessionId);
-              if (sid) setActiveSessionId(sid);
               setStreamThinking('');
-              setStreamText('');
+              const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
+              setMessages(finalMsgs);
+              const sid = await persistSession(finalMsgs, activeSessionId, data.sdkSessionId, data.sdkCwd);
+              if (sid) setActiveSessionId(sid);
             } else if (data.type === 'permission_request') {
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
@@ -508,14 +515,22 @@ export default function Conversations() {
               }]);
             } else if (data.type === 'permission_resolved') {
               if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
+            } else if (data.type === 'ask_user_question') {
+              setPendingQuestions(prev => [...prev, {
+                reqId: data.reqId,
+                questions: data.questions || [],
+                toolUseID: data.toolUseID,
+              }]);
+            } else if (data.type === 'ask_user_question_resolved') {
+              if (data.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
+            } else if (String(data.type || '').startsWith('task_')) {
+              setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
             } else if (data.type === 'error') {
-              const err: ChatMessage = { role: 'assistant', content: `错误: ${data.message}`, timestamp: Date.now() };
-              const finalMsgs = [...newMsgs, err];
+              setStreamThinking('');
+              const finalMsgs = withAssistantDraft(newMsgs, `错误: ${data.message}`, assistantTimestamp);
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId);
               if (sid) setActiveSessionId(sid);
-              setStreamThinking('');
-              setStreamText('');
             }
           } catch {}
         }
@@ -531,13 +546,13 @@ export default function Conversations() {
   }, [input, isStreaming, currentAgent, messages, activeSessionId, persistSession]);
 
   return (
-    <div style={{ display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+    <div className="conversation-shell">
+      <div
+        className={`conversation-list-overlay ${mobileListOpen ? 'open' : ''}`}
+        onClick={() => setMobileListOpen(false)}
+      />
       {/* 左侧：历史对话列表 */}
-      <div style={{
-        width: 280, minWidth: 280, borderRight: '1px solid var(--border)',
-        background: 'var(--bg-card)', display: 'flex', flexDirection: 'column',
-        overflow: 'hidden',
-      }}>
+      <div className={`conversation-sidebar ${mobileListOpen ? 'open' : ''}`}>
         {/* Agent 选择 + 新对话 */}
         <div style={{ padding: '14px 14px 8px', borderBottom: '1px solid var(--border)' }}>
           <div className="form-group" style={{ marginBottom: 8 }}>
@@ -618,11 +633,19 @@ export default function Conversations() {
                 </div>
                 <div className="flex-between" style={{ fontSize: '.68em', color: 'var(--ink-muted)', marginTop: 2 }}>
                   <span>{new Date(s.updatedAt).toLocaleDateString()}</span>
-                  <button
-                    className="btn btn-sm"
-                    style={{ padding: '0 6px', fontSize: '.85em', color: 'var(--danger)' }}
-                    onClick={e => { e.stopPropagation(); void handleDelete(s.id); }}
-                  >删除</button>
+                  <span className="flex gap-2">
+                    <button
+                      className="btn btn-sm"
+                      style={{ padding: '0 6px', fontSize: '.85em' }}
+                      title="从当前消息历史分叉一个新会话"
+                      onClick={e => { void handleFork(s, e); }}
+                    >分叉</button>
+                    <button
+                      className="btn btn-sm"
+                      style={{ padding: '0 6px', fontSize: '.85em', color: 'var(--danger)' }}
+                      onClick={e => { e.stopPropagation(); void handleDelete(s.id); }}
+                    >删除</button>
+                  </span>
                 </div>
               </div>
             ))}
@@ -635,7 +658,7 @@ export default function Conversations() {
       </div>
 
       {/* 右侧：对话区域 */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+      <div className="conversation-main">
         {!selectedAgentId ? (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--ink-muted)' }}>
             <div style={{ textAlign: 'center' }}>
@@ -648,10 +671,14 @@ export default function Conversations() {
         ) : (
           <>
             {/* 对话头部 */}
-            <div style={{
-              padding: '10px 20px', borderBottom: '1px solid var(--border)',
-              background: 'var(--bg-card)', display: 'flex', alignItems: 'center', gap: 10,
-            }}>
+            <div className="conversation-header">
+              <button
+                className="btn btn-sm conversation-list-toggle"
+                onClick={() => setMobileListOpen(true)}
+                aria-label="打开会话列表"
+              >
+                历史
+              </button>
               <div style={{ fontWeight: 700, fontSize: '.95em' }}>{currentAgent?.name}</div>
               <div className="flex gap-2" style={{ flexWrap: 'wrap', flex: 1 }}>
                 {currentAgent?.model && <span className="badge badge-muted">{currentAgent.model}</span>}
@@ -717,7 +744,7 @@ export default function Conversations() {
             </div>
 
             {/* 消息列表 */}
-            <div style={{ flex: 1, overflowY: 'auto', padding: '16px 24px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div className="conversation-messages">
               {/* Bot 实时事件 */}
               {activeSessionId && (
                 <details style={{ fontSize: '.78em' }}>
@@ -752,15 +779,40 @@ export default function Conversations() {
               {messages.map((msg, i) => (
                 <div key={i} className={`chat-msg ${msg.role}`}>{msg.content}</div>
               ))}
+              {agentTasks.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {agentTasks.map(task => (
+                    <div key={task.id} className="chat-msg thinking" style={{ padding: '8px 12px' }}>
+                      <div className="flex-between" style={{ gap: 10 }}>
+                        <span style={{ fontWeight: 600 }}>{task.subagentType || task.taskType || '子任务'}</span>
+                        <span className="badge" style={{ color: taskStatusColor(task.status), background: 'var(--bg-hover)' }}>
+                          {taskStatusLabel(task.status)}
+                        </span>
+                      </div>
+                      <div style={{ marginTop: 4 }}>{task.summary || task.description || task.id}</div>
+                      {(task.lastToolName || task.usage?.total_tokens) && (
+                        <div style={{ marginTop: 4, fontSize: '.78em', color: 'var(--ink-muted)' }}>
+                          {task.lastToolName && <span>tool: {task.lastToolName}</span>}
+                          {task.usage?.total_tokens && <span>{task.lastToolName ? ' · ' : ''}{task.usage.total_tokens} tokens</span>}
+                        </div>
+                      )}
+                      {task.error && <div style={{ marginTop: 4, color: 'var(--danger)' }}>{task.error}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
               {streamThinking && <div className="chat-msg thinking">{streamThinking}</div>}
-              {streamText && <div className="chat-msg assistant">{streamText}</div>}
-              {isStreaming && !streamThinking && !streamText && (
+              {isStreaming && !streamThinking && !hasTrailingAssistantMessage(messages) && (
                 <div className="chat-msg assistant pulse">...</div>
               )}
               <div ref={bottomRef} />
             </div>
 
-            <div style={{ padding: '0 20px' }}>
+            <div className="conversation-prompts">
+              <AskUserQuestionPromptList
+                pending={pendingQuestions}
+                onResolved={(reqId) => setPendingQuestions(prev => prev.filter(p => p.reqId !== reqId))}
+              />
               <PermissionPromptList
                 pending={pendingPermissions}
                 onResolved={(reqId) => setPendingPermissions(prev => prev.filter(p => p.reqId !== reqId))}
@@ -768,10 +820,7 @@ export default function Conversations() {
             </div>
 
             {/* 输入区域 */}
-            <div style={{
-              padding: '12px 20px', borderTop: '1px solid var(--border)',
-              background: 'var(--bg-card)',
-            }}>
+            <div className="conversation-composer">
               <div className="chat-input-area" style={{ padding: 0, borderTop: 'none' }}>
                 <textarea
                   value={input}

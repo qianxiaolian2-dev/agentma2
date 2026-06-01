@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { AgentTemplate, EffortLevel, PermissionMode, SkillInfo, RegisteredTool } from '../simulator/types';
-import { BUILT_IN_TOOLS, EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, MOCK_MCP_SERVERS, initCustomTools } from '../simulator/mock-data';
+import type { AgentDefinition, AgentTemplate, EffortLevel, PermissionMode, SkillInfo, RegisteredTool } from '../simulator/types';
+import { EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, MOCK_MCP_SERVERS, initCustomTools } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
 
@@ -23,6 +23,16 @@ function newTemplate(): AgentTemplate {
     effort: 'high', maxTurns: 50, permissionMode: 'default',
     providerOverrides: {},
     createdAt: Date.now(), updatedAt: Date.now(),
+  };
+}
+
+function defaultSubagent(): AgentDefinition {
+  return {
+    description: '只读代码探索代理',
+    prompt: '你是一个只读代码探索子代理。分析文件和结构，最后给出简短结论，不修改文件。',
+    tools: ['Read', 'Grep', 'Glob'],
+    effort: 'medium',
+    permissionMode: 'default',
   };
 }
 
@@ -55,6 +65,7 @@ export default function Agents() {
       .then(r => r.json()).then(data => { if (Array.isArray(data)) setLiveEventSources(data); }).catch(() => {});
   }, []);
   const [liveCustomTools, setLiveCustomTools] = useState<RegisteredTool[]>(() => initCustomTools());
+  const subagentEntries = Object.entries(form.subagents || {});
 
   // 每次页面可见时刷新自定义工具
   useEffect(() => {
@@ -167,6 +178,50 @@ export default function Agents() {
     }));
   };
 
+  const addSubagent = () => {
+    setForm(prev => {
+      const count = Object.keys(prev.subagents || {}).length + 1;
+      return {
+        ...prev,
+        tools: prev.tools.includes('Agent') ? prev.tools : [...prev.tools, 'Agent'],
+        subagents: {
+          ...(prev.subagents || {}),
+          [`worker-${count}`]: defaultSubagent(),
+        },
+      };
+    });
+  };
+
+  const renameSubagent = (oldName: string, nextName: string) => {
+    const cleanName = nextName.trim();
+    if (!cleanName || cleanName === oldName) return;
+    setForm(prev => {
+      const subagents = { ...(prev.subagents || {}) };
+      if (!subagents[oldName] || subagents[cleanName]) return prev;
+      subagents[cleanName] = subagents[oldName];
+      delete subagents[oldName];
+      return { ...prev, subagents };
+    });
+  };
+
+  const updateSubagent = (name: string, patch: Partial<AgentDefinition>) => {
+    setForm(prev => ({
+      ...prev,
+      subagents: {
+        ...(prev.subagents || {}),
+        [name]: { ...(prev.subagents || {})[name], ...patch },
+      },
+    }));
+  };
+
+  const deleteSubagent = (name: string) => {
+    setForm(prev => {
+      const subagents = { ...(prev.subagents || {}) };
+      delete subagents[name];
+      return { ...prev, subagents };
+    });
+  };
+
   const toggleMcp = (srv: string) => {
     setForm(prev => ({
       ...prev,
@@ -194,7 +249,7 @@ export default function Agents() {
     }));
   };
 
-  const startChat = (t: AgentTemplate) => {
+  const startChat = () => {
     navigate('/conversations');
   };
 
@@ -262,7 +317,7 @@ export default function Agents() {
               <div className="flex gap-2">
                 {isEditing && (
                   <>
-                    <button className="btn btn-sm btn-primary" onClick={() => startChat(form)} disabled={isSaving}>💬 开始对话</button>
+                    <button className="btn btn-sm btn-primary" onClick={startChat} disabled={isSaving}>💬 开始对话</button>
                     <button className="btn btn-sm btn-danger" onClick={() => { void handleDelete(form.id); }} disabled={isSaving}>删除</button>
                   </>
                 )}
@@ -466,6 +521,113 @@ export default function Agents() {
                   </div>
                 )}
               </div>
+            </div>
+
+            {/* 子代理定义 */}
+            <div className="form-group">
+              <div className="flex-between" style={{ marginBottom: 8 }}>
+                <label style={{ marginBottom: 0 }}>子代理 (SDK agents) — 已定义 {subagentEntries.length} 个</label>
+                <button type="button" className="btn btn-sm btn-primary" onClick={addSubagent}>
+                  + 子代理
+                </button>
+              </div>
+              {subagentEntries.length === 0 ? (
+                <div style={{ color: 'var(--ink-muted)', fontSize: '.78em', padding: '8px 0' }}>
+                  添加后会自动启用 Agent 工具，运行时通过 SDK Agent tool 调用。
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {subagentEntries.map(([name, agent]) => (
+                    <div key={name} className="tool-card" style={{ padding: 12 }}>
+                      <div className="grid-2">
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>名称</label>
+                          <input
+                            defaultValue={name}
+                            onBlur={e => renameSubagent(name, e.target.value)}
+                            style={{ fontFamily: 'var(--font-mono)' }}
+                          />
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>模型覆盖</label>
+                          <input
+                            value={agent.model || ''}
+                            onChange={e => updateSubagent(name, { model: e.target.value || undefined })}
+                            placeholder="留空继承主模型"
+                            style={{ fontFamily: 'var(--font-mono)' }}
+                          />
+                        </div>
+                      </div>
+                      <div className="form-group" style={{ marginBottom: 8 }}>
+                        <label>description</label>
+                        <input
+                          value={agent.description}
+                          onChange={e => updateSubagent(name, { description: e.target.value })}
+                          placeholder="何时使用这个子代理"
+                        />
+                      </div>
+                      <div className="form-group" style={{ marginBottom: 8 }}>
+                        <label>prompt</label>
+                        <textarea
+                          value={agent.prompt}
+                          onChange={e => updateSubagent(name, { prompt: e.target.value })}
+                          rows={2}
+                          placeholder="子代理系统提示词"
+                          style={{ resize: 'vertical' }}
+                        />
+                      </div>
+                      <div className="grid-2">
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>tools</label>
+                          <input
+                            value={(agent.tools || []).join(', ')}
+                            onChange={e => updateSubagent(name, { tools: e.target.value.split(',').map(t => t.trim()).filter(Boolean) })}
+                            placeholder="Read, Grep, Glob"
+                            style={{ fontFamily: 'var(--font-mono)' }}
+                          />
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>maxTurns</label>
+                          <input
+                            type="number"
+                            value={agent.maxTurns || ''}
+                            onChange={e => updateSubagent(name, { maxTurns: Number(e.target.value) || undefined })}
+                            placeholder="继承默认"
+                          />
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>effort</label>
+                          <select value={agent.effort || ''} onChange={e => updateSubagent(name, { effort: e.target.value as EffortLevel || undefined })}>
+                            <option value="">继承</option>
+                            {EFFORT_LEVELS.map(e => <option key={e.value} value={e.value}>{e.label} ({e.value})</option>)}
+                          </select>
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>权限模式</label>
+                          <select value={agent.permissionMode || ''} onChange={e => updateSubagent(name, { permissionMode: e.target.value as PermissionMode || undefined })}>
+                            <option value="">继承</option>
+                            {PERMISSION_MODES.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                      <div className="flex-between">
+                        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, margin: 0, fontSize: '.78em' }}>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(agent.background)}
+                            onChange={e => updateSubagent(name, { background: e.target.checked || undefined })}
+                            style={{ width: 'auto', margin: 0 }}
+                          />
+                          background
+                        </label>
+                        <button type="button" className="btn btn-sm btn-danger" onClick={() => deleteSubagent(name)}>
+                          删除子代理
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* 技能选择 */}

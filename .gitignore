@@ -1,0 +1,27 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+dist-ssr/
+coverage/
+*.tsbuildinfo
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+.npmrc
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+record/
+spike-sdk/
+
+# Logs and OS/editor files
+*.log
+.DS_Store
+.idea/
+.vscode/

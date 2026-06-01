@@ -186,6 +186,7 @@ export interface SDKMessage {
   content?: unknown[];
   result?: string;
   duration_ms?: number;
+  duration_api_ms?: number;
   total_cost_usd?: number;
   usage?: { input_tokens: number; output_tokens: number; cache_creation_tokens?: number; cache_read_tokens?: number };
   model?: string;
@@ -207,6 +208,7 @@ export interface SDKMessage {
   modelUsage?: Record<string, { input_tokens: number; output_tokens: number }>;
   permission_denials?: unknown[];
   structured_output?: unknown;
+  parent_tool_use_id?: string;
 }
 
 // --- MCP 服务器状态 ---
@@ -309,6 +311,7 @@ export interface BuiltInTool {
   description: string;
   category: 'file' | 'execution' | 'task' | 'search' | 'interaction' | 'mcp' | 'notebook' | 'agent';
   inputSchema: Record<string, unknown>;
+  annotations?: ToolAnnotations;
 }
 
 // --- 供应商/Provider 配置 (通过 options.env 传递) ---
@@ -385,6 +388,7 @@ export interface AgentTemplate {
   systemPrompt: string;
   model: string;
   tools: string[];
+  subagents?: Record<string, AgentDefinition>;
   mcpServers: string[];
   eventSources: string[];
   skills: string[];
@@ -449,6 +453,8 @@ export interface ChatSession {
   title: string;
   messages: ChatMessage[];
   model: string;
+  sdkSessionId?: string;
+  sdkCwd?: string;
   createdAt: number;
   updatedAt: number;
 }

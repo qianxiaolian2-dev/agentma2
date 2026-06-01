@@ -1,9 +1,20 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { query, tool, createSdkMcpServer, type CanUseTool, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query,
+  tool,
+  createSdkMcpServer,
+  type AgentDefinition,
+  type CanUseTool,
+  type HookCallbackMatcher,
+  type HookEvent,
+  type PermissionResult,
+} from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { recordAgentRun } from './server-store.ts';
+import { evaluateHookRules, evaluatePermissionRules, listHookRules, listProtectedSdkCwds, recordAgentRun } from './server-store.ts';
+import type { HookRuleEvent } from './server-store.ts';
 
 // ─── Pricing ─────────────────────────────────────────────────────────────────
 // Edit to match your provider's actual rates. The SDK's own total_cost_usd
@@ -83,6 +94,24 @@ export type PermissionDecision = {
   rememberForSession?: boolean;  // remember within THIS run
 };
 
+export type AskUserQuestionOption = {
+  label: string;
+  description: string;
+  preview?: string;
+};
+
+export type AskUserQuestionItem = {
+  question: string;
+  header: string;
+  options: AskUserQuestionOption[];
+  multiSelect: boolean;
+};
+
+export type AskUserQuestionAnswer = {
+  answers: Record<string, string>;
+  reason?: string;
+};
+
 export type PermissionRequest = {
   toolName: string;
   input: Record<string, unknown>;
@@ -94,6 +123,11 @@ export type PermissionRequest = {
 };
 
 export type RequestPermissionFn = (req: PermissionRequest) => Promise<PermissionDecision>;
+export type RequestUserQuestionFn = (req: {
+  questions: AskUserQuestionItem[];
+  toolUseID: string;
+  signal?: AbortSignal;
+}) => Promise<AskUserQuestionAnswer>;
 
 type Pending = {
   resolve: (decision: PermissionDecision) => void;
@@ -103,7 +137,15 @@ type Pending = {
   timer: NodeJS.Timeout;
 };
 
+type PendingUserQuestion = {
+  resolve: (answer: AskUserQuestionAnswer) => void;
+  tenantId: string;
+  createdAt: number;
+  timer: NodeJS.Timeout;
+};
+
 const pending = new Map<string, Pending>();
+const pendingUserQuestions = new Map<string, PendingUserQuestion>();
 const PROMPT_TIMEOUT_MS = 120 * 1000;  // 2 min for user decision; auto-deny on timeout
 
 export function resolvePermissionRequest(reqId: string, tenantId: string, decision: PermissionDecision) {
@@ -113,6 +155,16 @@ export function resolvePermissionRequest(reqId: string, tenantId: string, decisi
   clearTimeout(p.timer);
   pending.delete(reqId);
   p.resolve(decision);
+  return { ok: true };
+}
+
+export function resolveAskUserQuestion(reqId: string, tenantId: string, answer: AskUserQuestionAnswer) {
+  const p = pendingUserQuestions.get(reqId);
+  if (!p) return { ok: false, reason: 'unknown reqId' };
+  if (p.tenantId !== tenantId) return { ok: false, reason: 'tenant mismatch' };
+  clearTimeout(p.timer);
+  pendingUserQuestions.delete(reqId);
+  p.resolve(answer);
   return { ok: true };
 }
 
@@ -156,14 +208,49 @@ export function createPermissionRequester(opts: {
   };
 }
 
+export function createAskUserQuestionRequester(opts: {
+  emit: (event: any) => void;
+  tenantId: string;
+}): RequestUserQuestionFn {
+  return async (req) => {
+    const reqId = crypto.randomUUID();
+    return new Promise<AskUserQuestionAnswer>((resolve) => {
+      const timer = setTimeout(() => {
+        if (pendingUserQuestions.has(reqId)) {
+          pendingUserQuestions.delete(reqId);
+          const answers = buildFallbackAnswers(req.questions);
+          resolve({ answers, reason: 'timeout' });
+        }
+      }, PROMPT_TIMEOUT_MS);
+      pendingUserQuestions.set(reqId, { resolve, tenantId: opts.tenantId, createdAt: Date.now(), timer });
+      opts.emit({
+        type: 'ask_user_question',
+        reqId,
+        questions: req.questions,
+        toolUseID: req.toolUseID,
+      });
+    }).then((answer) => {
+      opts.emit({ type: 'ask_user_question_resolved', reqId, answers: answer.answers, reason: answer.reason });
+      return answer;
+    });
+  };
+}
+
 // ─── Runner ─────────────────────────────────────────────────────────────────
 
 export type AgentEvent =
-  | { type: 'system'; subtype: 'init'; model: string; tools: number; cwd: string }
+  | { type: 'system'; subtype: 'init'; model: string; tools: number; cwd: string; sdkSessionId?: string }
   | { type: 'delta'; text: string; thinking?: boolean }
   | { type: 'permission_request'; reqId: string; toolName: string; input: unknown; title?: string; displayName?: string; description?: string; toolUseID: string }
   | { type: 'permission_resolved'; reqId?: string; toolName: string; decision: 'allow' | 'deny'; reason?: string }
-  | { type: 'result'; subtype: string; text: string; usage: { input_tokens: number; output_tokens: number }; duration_ms: number; cost_usd: number; model: string }
+  | { type: 'ask_user_question'; reqId: string; questions: AskUserQuestionItem[]; toolUseID: string }
+  | { type: 'ask_user_question_resolved'; reqId: string; answers?: Record<string, string>; reason?: string }
+  | { type: 'hook_response'; eventName: HookRuleEvent; action: string; reason: string; input: unknown; output: unknown; toolUseID?: string }
+  | { type: 'task_started'; taskId: string; toolUseId?: string; description: string; subagentType?: string; taskType?: string; prompt?: string; sdkSessionId?: string }
+  | { type: 'task_progress'; taskId: string; toolUseId?: string; description: string; subagentType?: string; lastToolName?: string; summary?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }; sdkSessionId?: string }
+  | { type: 'task_updated'; taskId: string; status?: string; description?: string; error?: string; backgrounded?: boolean; sdkSessionId?: string }
+  | { type: 'task_notification'; taskId: string; toolUseId?: string; status: string; summary?: string; outputFile?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }; sdkSessionId?: string }
+  | { type: 'result'; subtype: string; text: string; usage: { input_tokens: number; output_tokens: number }; duration_ms: number; cost_usd: number; model: string; sdkSessionId?: string; sdkCwd?: string }
   | { type: 'error'; message: string };
 
 export interface RunAgentOptions {
@@ -176,17 +263,162 @@ export interface RunAgentOptions {
   tools?: string[];
   /** Raw tool definitions from the request body (for custom-tools schema). */
   requestTools?: any[];
+  /** Programmatic SDK subagents exposed through the Agent tool. */
+  subagents?: Record<string, AgentDefinition>;
   maxTurns?: number;
   cwd?: string;
+  resumeSdkSessionId?: string;
   tenantId: string;
   sub: string;
   emit: (e: AgentEvent) => void;
   requestPermission: RequestPermissionFn;
+  requestUserQuestion: RequestUserQuestionFn;
+}
+
+const RUN_CWD_PREFIX = 'agentma-run-';
+const RUN_CWD_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const RUN_CWD_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+let lastRunCwdCleanupMs = 0;
+
+function realpathIfPossible(filePath: string) {
+  try {
+    return fs.realpathSync.native(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+function getRunCwdParents() {
+  const parents = new Set<string>();
+  for (const root of [os.tmpdir(), '/tmp', '/private/tmp']) {
+    try {
+      parents.add(fs.realpathSync.native(root));
+    } catch {}
+  }
+  return parents;
+}
+
+function cleanupExpiredRunCwds(excludeCwd: string) {
+  const ttlMs = Number(process.env.AGENTMA_RUN_CWD_TTL_MS || RUN_CWD_DEFAULT_TTL_MS);
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) return;
+
+  const now = Date.now();
+  if (now - lastRunCwdCleanupMs < RUN_CWD_CLEANUP_INTERVAL_MS) return;
+  lastRunCwdCleanupMs = now;
+
+  const parents = getRunCwdParents();
+  const excluded = realpathIfPossible(excludeCwd);
+  const protectedCwds = new Set(listProtectedSdkCwds().map(realpathIfPossible));
+  for (const parent of parents) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(parent, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith(RUN_CWD_PREFIX)) continue;
+      const candidate = path.join(parent, entry.name);
+      try {
+        const resolved = fs.realpathSync.native(candidate);
+        if (resolved === excluded || !parents.has(path.dirname(resolved))) continue;
+        if (protectedCwds.has(resolved)) continue;
+        const stat = fs.statSync(resolved);
+        if (!stat.isDirectory() || now - stat.mtimeMs < ttlMs) continue;
+        fs.rmSync(resolved, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+}
+
+const SUPPORTED_HOOK_EVENTS: HookRuleEvent[] = ['PreToolUse', 'PostToolUse', 'Notification'];
+
+function asHookInputRecord(input: unknown): Record<string, unknown> {
+  return input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+}
+
+function buildTenantHooks(
+  tenantId: string,
+  emit: (e: AgentEvent) => void,
+): Partial<Record<HookEvent, HookCallbackMatcher[]>> | undefined {
+  const activeRules = listHookRules(tenantId).filter((rule) => rule.enabled);
+  if (!activeRules.length) return undefined;
+
+  const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {};
+  for (const eventName of SUPPORTED_HOOK_EVENTS) {
+    if (!activeRules.some((rule) => rule.eventName === eventName)) continue;
+    hooks[eventName] = [{
+      hooks: [async (input, toolUseID) => {
+        const inputRecord = asHookInputRecord(input);
+        const decision = evaluateHookRules(tenantId, eventName, inputRecord);
+        if (!decision) return {};
+        emit({
+          type: 'hook_response',
+          eventName,
+          action: decision.action,
+          reason: decision.reason,
+          input: inputRecord,
+          output: decision.output,
+          toolUseID,
+        });
+        return decision.output as any;
+      }],
+      timeout: 30,
+    }];
+  }
+
+  return Object.keys(hooks).length ? hooks : undefined;
+}
+
+function asRecord(input: unknown): Record<string, unknown> {
+  return input && typeof input === 'object' && !Array.isArray(input)
+    ? input as Record<string, unknown>
+    : {};
+}
+
+function normalizeAskUserQuestions(input: Record<string, unknown>): AskUserQuestionItem[] {
+  const rawQuestions = Array.isArray(input.questions) ? input.questions : [];
+  return rawQuestions.slice(0, 4).flatMap((item): AskUserQuestionItem[] => {
+    const raw = asRecord(item);
+    const question = typeof raw.question === 'string' ? raw.question.trim() : '';
+    if (!question) return [];
+    const header = typeof raw.header === 'string' && raw.header.trim()
+      ? raw.header.trim().slice(0, 24)
+      : 'Question';
+    const options = Array.isArray(raw.options)
+      ? raw.options.slice(0, 4).flatMap((option): AskUserQuestionOption[] => {
+          const opt = asRecord(option);
+          const label = typeof opt.label === 'string' ? opt.label.trim() : '';
+          if (!label) return [];
+          return [{
+            label,
+            description: typeof opt.description === 'string' ? opt.description : '',
+            preview: typeof opt.preview === 'string' ? opt.preview : undefined,
+          }];
+        })
+      : [];
+    if (options.length < 2) return [];
+    return [{
+      question,
+      header,
+      options,
+      multiSelect: raw.multiSelect === true,
+    }];
+  });
+}
+
+function buildFallbackAnswers(questions: AskUserQuestionItem[]) {
+  const answers: Record<string, string> = {};
+  for (const question of questions) {
+    answers[question.question] = 'No response before timeout';
+  }
+  return answers;
 }
 
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
   const cwd = opts.cwd || path.join('/tmp', `agentma-run-${opts.tenantId}-${Date.now()}`);
   fs.mkdirSync(cwd, { recursive: true });
+  cleanupExpiredRunCwds(cwd);
 
   // Per-call env (concurrency-safe — never mutate process.env)
   const env: Record<string, string> = {};
@@ -196,17 +428,31 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   delete env.ANTHROPIC_AUTH_TOKEN;
 
   const customMcp = buildCustomToolsMcp(opts.requestTools || []);
+  const hooks = buildTenantHooks(opts.tenantId, opts.emit);
+  const agentNames = Object.keys(opts.subagents || {});
+  const subagentToolNames = new Set<string>();
+  for (const agent of Object.values(opts.subagents || {})) {
+    for (const toolName of agent.tools || []) subagentToolNames.add(toolName);
+  }
+  let customNames = new Set<string>();
+  if (customMcp) {
+    let endpoints: any[] = [];
+    try { endpoints = JSON.parse(fs.readFileSync('/tmp/agentma_custom_tools.json', 'utf-8')); } catch {}
+    customNames = new Set(endpoints.filter((e) => e?.endpoint && e.name).map((e) => String(e.name)));
+  }
   // Resolve template tool names → SDK-visible names (prefix custom with mcp__custom__).
   const templateToolNames = new Set<string>();
+  const sdkBuiltinTools = new Set<string>();
   if (opts.tools && opts.tools.length) {
-    const customNames = new Set<string>();
-    if (customMcp) {
-      let endpoints: any[] = [];
-      try { endpoints = JSON.parse(fs.readFileSync('/tmp/agentma_custom_tools.json', 'utf-8')); } catch {}
-      for (const e of endpoints) if (e?.endpoint && e.name) customNames.add(e.name);
-    }
     for (const t of opts.tools) {
-      templateToolNames.add(customNames.has(t) ? `mcp__custom__${t}` : t);
+      const isCustom = customNames.has(t);
+      templateToolNames.add(isCustom ? `mcp__custom__${t}` : t);
+      if (t === 'Agent') templateToolNames.add('Task');
+      if (t === 'Task') templateToolNames.add('Agent');
+      if (!isCustom) sdkBuiltinTools.add(t);
+    }
+    for (const t of subagentToolNames) {
+      if (!customNames.has(t) && !t.startsWith('mcp__')) sdkBuiltinTools.add(t);
     }
   }
 
@@ -215,15 +461,45 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // when behavior is 'allow', even though the TS type marks it optional.
   const canUseTool: CanUseTool = async (toolName, input, callOpts) => {
     // 1. Template restriction — if template specifies tools and this isn't one of them, deny.
-    if (templateToolNames.size > 0 && !templateToolNames.has(toolName)) {
+    const allowedBySubagentDefinition = Boolean(callOpts.agentID && subagentToolNames.has(toolName));
+    if (templateToolNames.size > 0 && !templateToolNames.has(toolName) && !allowedBySubagentDefinition) {
       return { behavior: 'deny', message: `Tool '${toolName}' is not enabled by the agent template.` } as PermissionResult;
     }
-    // 2. Safe auto-allow (read-only). Strip MCP prefix to check the bare name.
+    if (toolName === 'AskUserQuestion') {
+      const questions = normalizeAskUserQuestions(input);
+      if (!questions.length) {
+        return { behavior: 'deny', message: 'AskUserQuestion did not provide valid questions.' } as PermissionResult;
+      }
+      const answer = await opts.requestUserQuestion({
+        questions,
+        toolUseID: callOpts.toolUseID,
+        signal: callOpts.signal,
+      });
+      return {
+        behavior: 'allow',
+        updatedInput: { ...input, questions, answers: answer.answers },
+      } as PermissionResult;
+    }
+    // 2. Tenant policy rules from the Permissions page.
+    const policyDecision = evaluatePermissionRules(opts.tenantId, toolName, input);
+    if (policyDecision) {
+      opts.emit({
+        type: 'permission_resolved',
+        toolName,
+        decision: policyDecision.behavior,
+        reason: policyDecision.reason,
+      });
+      if (policyDecision.behavior === 'allow') {
+        return { behavior: 'allow', updatedInput: input } as PermissionResult;
+      }
+      return { behavior: 'deny', message: policyDecision.reason } as PermissionResult;
+    }
+    // 3. Safe auto-allow (read-only). Strip MCP prefix to check the bare name.
     const bareName = toolName.startsWith('mcp__') ? (toolName.split('__').pop() || toolName) : toolName;
     if (SAFE_AUTO_ALLOW_TOOLS.has(bareName)) {
       return { behavior: 'allow', updatedInput: input } as PermissionResult;
     }
-    // 3. Interactive: ask the user via SSE.
+    // 4. Interactive: ask the user via SSE.
     const r = await opts.requestPermission({
       toolName,
       input,
@@ -240,7 +516,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   };
 
   const startTime = Date.now();
-  let inTok = 0, outTok = 0, finalText = '', status = 'success';
+  let inTok = 0, outTok = 0, finalText = '', status = 'success', sdkSessionId = opts.resumeSdkSessionId || '';
 
   try {
     for await (const msg of query({
@@ -248,18 +524,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       options: {
         model: opts.model,
         permissionMode: 'default',  // canUseTool decides everything
+        ...(sdkBuiltinTools.size ? { tools: Array.from(sdkBuiltinTools) } : {}),
         canUseTool,
         maxTurns: Number(opts.maxTurns) || 20,
         cwd,
+        ...(agentNames.length ? { agents: opts.subagents, forwardSubagentText: true, agentProgressSummaries: true } : {}),
+        ...(opts.resumeSdkSessionId ? { resume: opts.resumeSdkSessionId } : {}),
         settingSources: [],
         env,
+        ...(hooks ? { hooks, includeHookEvents: true } : {}),
         ...(customMcp ? { mcpServers: { custom: customMcp } } : {}),
         ...(opts.systemPrompt && opts.systemPrompt.trim() ? { systemPrompt: opts.systemPrompt } : {}),
       },
     })) {
       const m = msg as any;
+      if (m.session_id && !sdkSessionId) sdkSessionId = m.session_id;
       if (m.type === 'system' && m.subtype === 'init') {
-        opts.emit({ type: 'system', subtype: 'init', model: m.model, tools: (m.tools || []).length, cwd });
+        opts.emit({ type: 'system', subtype: 'init', model: m.model, tools: (m.tools || []).length, cwd, sdkSessionId: m.session_id || sdkSessionId || undefined });
       } else if (m.type === 'assistant') {
         for (const b of m.message?.content || []) {
           if (b.type === 'text' && b.text) { finalText += b.text; opts.emit({ type: 'delta', text: b.text }); }
@@ -274,10 +555,55 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         }
       } else if (m.type === 'result') {
         status = m.subtype || 'success';
+        if (m.session_id) sdkSessionId = m.session_id;
         if (m.result) finalText = m.result;
         const u = m.usage || {};
         inTok = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
         outTok = u.output_tokens || 0;
+      } else if (m.type === 'system' && m.subtype === 'task_started') {
+        opts.emit({
+          type: 'task_started',
+          taskId: m.task_id,
+          toolUseId: m.tool_use_id,
+          description: m.description || '',
+          subagentType: m.subagent_type,
+          taskType: m.task_type,
+          prompt: m.prompt,
+          sdkSessionId: m.session_id || sdkSessionId || undefined,
+        });
+      } else if (m.type === 'system' && m.subtype === 'task_progress') {
+        opts.emit({
+          type: 'task_progress',
+          taskId: m.task_id,
+          toolUseId: m.tool_use_id,
+          description: m.description || '',
+          subagentType: m.subagent_type,
+          lastToolName: m.last_tool_name,
+          summary: m.summary,
+          usage: m.usage,
+          sdkSessionId: m.session_id || sdkSessionId || undefined,
+        });
+      } else if (m.type === 'system' && m.subtype === 'task_updated') {
+        opts.emit({
+          type: 'task_updated',
+          taskId: m.task_id,
+          status: m.patch?.status,
+          description: m.patch?.description,
+          error: m.patch?.error,
+          backgrounded: m.patch?.is_backgrounded,
+          sdkSessionId: m.session_id || sdkSessionId || undefined,
+        });
+      } else if (m.type === 'system' && m.subtype === 'task_notification') {
+        opts.emit({
+          type: 'task_notification',
+          taskId: m.task_id,
+          toolUseId: m.tool_use_id,
+          status: m.status,
+          summary: m.summary,
+          outputFile: m.output_file,
+          usage: m.usage,
+          sdkSessionId: m.session_id || sdkSessionId || undefined,
+        });
       }
     }
   } catch (e) {
@@ -296,5 +622,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     duration_ms: durationMs,
     cost_usd: costUsd,
     model: opts.model,
+    sdkSessionId: sdkSessionId || undefined,
+    sdkCwd: cwd,
   });
 }

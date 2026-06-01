@@ -6,6 +6,14 @@
   "scripts": {
     "dev": "vite",
     "server": "tsx server.ts",
+    "smoke:chat-resume": "node scripts/smoke-chat-resume.mjs",
+    "smoke:chat-session-fork": "node scripts/smoke-chat-session-fork.mjs",
+    "smoke:chat-ask-user-question": "node scripts/smoke-chat-ask-user-question.mjs",
+    "smoke:chat-subagents": "node scripts/smoke-chat-subagents.mjs",
+    "smoke:chat-write": "node scripts/smoke-chat-write.mjs",
+    "smoke:hook-rules": "node scripts/smoke-hook-rules.mjs",
+    "smoke:hook-runtime": "AGENTMA_SMOKE_EXPECT_HOOK=1 node scripts/smoke-chat-write.mjs",
+    "smoke:permission-rules": "node scripts/smoke-permission-rules.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"

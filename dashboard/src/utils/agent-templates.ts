@@ -1,4 +1,4 @@
-import type { AgentTemplate, EffortLevel, PermissionMode, ProviderConfig } from '../simulator/types';
+import type { AgentDefinition, AgentTemplate, EffortLevel, PermissionMode, ProviderConfig } from '../simulator/types';
 import { getAuthHeaders } from './client-runtime';
 
 const LEGACY_CACHE_KEY = 'agentma_templates';
@@ -23,6 +23,33 @@ function normalizeProviderOverrides(value: unknown): Partial<ProviderConfig> | u
   ) as Partial<ProviderConfig>;
 }
 
+function normalizeSubagents(value: unknown): Record<string, AgentDefinition> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).flatMap(([name, item]) => {
+      if (!name.trim() || !item || typeof item !== 'object' || Array.isArray(item)) return [];
+      const raw = item as Record<string, unknown>;
+      if (typeof raw.description !== 'string' || typeof raw.prompt !== 'string') return [];
+      const maxTurns = Number(raw.maxTurns);
+      const agent: AgentDefinition = {
+        description: raw.description,
+        prompt: raw.prompt,
+        tools: Array.isArray(raw.tools) ? normalizeStringArray(raw.tools) : undefined,
+        disallowedTools: Array.isArray(raw.disallowedTools) ? normalizeStringArray(raw.disallowedTools) : undefined,
+        model: typeof raw.model === 'string' && raw.model.trim() ? raw.model : undefined,
+        skills: Array.isArray(raw.skills) ? normalizeStringArray(raw.skills) : undefined,
+        initialPrompt: typeof raw.initialPrompt === 'string' ? raw.initialPrompt : undefined,
+        maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : undefined,
+        background: typeof raw.background === 'boolean' ? raw.background : undefined,
+        memory: ['user', 'project', 'local'].includes(String(raw.memory)) ? raw.memory as AgentDefinition['memory'] : undefined,
+        effort: typeof raw.effort === 'string' ? raw.effort as EffortLevel : undefined,
+        permissionMode: typeof raw.permissionMode === 'string' ? raw.permissionMode as PermissionMode : undefined,
+      };
+      return [[name.trim(), agent]];
+    }),
+  );
+}
+
 function normalizeAgentTemplate(value: unknown): AgentTemplate | null {
   if (!value || typeof value !== 'object') return null;
   const raw = value as Record<string, unknown>;
@@ -44,6 +71,7 @@ function normalizeAgentTemplate(value: unknown): AgentTemplate | null {
     systemPrompt: typeof raw.systemPrompt === 'string' ? raw.systemPrompt : '',
     model: typeof raw.model === 'string' && raw.model.trim() ? raw.model : DEFAULT_MODEL,
     tools: Array.isArray(raw.tools) ? tools : DEFAULT_TOOLS,
+    subagents: normalizeSubagents(raw.subagents),
     mcpServers: normalizeStringArray(raw.mcpServers),
     eventSources: normalizeStringArray(raw.eventSources),
     skills: normalizeStringArray(raw.skills),
