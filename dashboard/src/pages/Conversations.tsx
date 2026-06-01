@@ -12,6 +12,7 @@ import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { appendAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
 import JsonViewer from '../components/common/JsonViewer';
+import ChatMessageBubble from '../components/ChatMessageBubble';
 import {
   bootstrapChatSessions,
   deleteChatSession as deleteChatSessionApi,
@@ -101,8 +102,6 @@ export default function Conversations() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [hasResponseStarted, setHasResponseStarted] = useState(false);
-  const [streamThinking, setStreamThinking] = useState('');
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
@@ -130,13 +129,11 @@ export default function Conversations() {
     if (agent.providerOverrides) Object.assign(prov, agent.providerOverrides);
 
     setIsStreaming(true);
-    setHasResponseStarted(false);
     const eventMsg: ChatMessage = { role: 'user', content: eventText, timestamp: Date.now() };
     const newMsgs = [...currentMsgs, eventMsg];
     const assistantTimestamp = Date.now();
     const draftId0 = crypto.randomUUID();
-    setMessages(newMsgs);
-    setStreamThinking('');
+    setMessages(appendAssistantDraft(newMsgs, draftId0, assistantTimestamp));
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
@@ -170,28 +167,23 @@ export default function Conversations() {
             try {
               const d = JSON.parse(line.slice(6));
               if (d.type === 'delta') {
-                if (!hasResponseStarted) {
-                  setHasResponseStarted(true);
-                  setMessages(appendAssistantDraft(newMsgs, draftId0, assistantTimestamp));
-                }
-                if (d.thinking) { thinking += d.text || ''; setStreamThinking(thinking); }
-                else {
+                if (d.thinking) {
+                  thinking += d.text || '';
+                  setMessages(prev => updateAssistantDraft(prev, draftId0, { thinking, status: 'streaming' }));
+                } else {
                   text += d.text || '';
                   setMessages(prev => updateAssistantDraft(prev, draftId0, { content: text, status: 'streaming' }));
                 }
               } else if (d.type === 'result') {
-                setHasResponseStarted(true);
-                const content = d.text || text || thinking || '';
+                const content = d.text || text || '';
                 if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
                 if (d.cost_usd !== undefined || d.duration_ms !== undefined)
                   setRunStats({ costUsd: d.cost_usd, durationMs: d.duration_ms, inTok: d.usage?.input_tokens, outTok: d.usage?.output_tokens });
-                const finalMsgs = [...newMsgs, { id: draftId0, role: 'assistant' as const, content, status: 'complete' as const, timestamp: assistantTimestamp }];
-                setStreamThinking('');
+                const finalMsgs = [...newMsgs, { id: draftId0, role: 'assistant' as const, content, thinking: thinking || undefined, status: 'complete' as const, timestamp: assistantTimestamp }];
                 setMessages(finalMsgs);
                 const sid = await (persistRef.current?.(finalMsgs, activeSessionId, d.sdkSessionId, d.sdkCwd) || Promise.resolve(''));
                 if (sid) setActiveSessionId(sid);
               } else if (d.type === 'permission_request') {
-                setHasResponseStarted(true);
                 setPendingPermissions(prev => [...prev, {
                   reqId: d.reqId, toolName: d.toolName, input: d.input,
                   title: d.title, displayName: d.displayName, description: d.description,
@@ -200,7 +192,6 @@ export default function Conversations() {
               } else if (d.type === 'permission_resolved') {
                 if (d.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
               } else if (d.type === 'ask_user_question') {
-                setHasResponseStarted(true);
                 setPendingQuestions(prev => [...prev, {
                   reqId: d.reqId,
                   questions: d.questions || [],
@@ -209,7 +200,6 @@ export default function Conversations() {
               } else if (d.type === 'ask_user_question_resolved') {
                 if (d.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== d.reqId));
               } else if (String(d.type || '').startsWith('task_')) {
-                setHasResponseStarted(true);
                 setAgentTasks(prev => mergeAgentTaskEvent(prev, d));
               }
             } catch {}
@@ -309,7 +299,7 @@ export default function Conversations() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, streamThinking, agentTasks]);
+  }, [messages, agentTasks]);
 
   // 保存会话（服务端持久化 + 本地状态同步）
   const persistSession = useCallback(async (msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => {
@@ -359,8 +349,6 @@ export default function Conversations() {
     if (!selectedAgentId) return;
     setActiveSessionId(null);
     setMessages([]);
-    setStreamThinking('');
-    setHasResponseStarted(false);
     setPendingQuestions([]);
     setAgentTasks([]);
     setInput('');
@@ -378,8 +366,6 @@ export default function Conversations() {
   const handleSelect = useCallback((s: ChatSession) => {
     setActiveSessionId(s.id);
     setMessages(s.messages);
-    setStreamThinking('');
-    setHasResponseStarted(false);
     setPendingQuestions([]);
     setAgentTasks([]);
     setInput('');
@@ -467,11 +453,9 @@ export default function Conversations() {
     const newMsgs = [...messages, userMsg];
     const assistantTimestamp = Date.now();
     const draftId = crypto.randomUUID();
-    setMessages(newMsgs);
+    setMessages(appendAssistantDraft(newMsgs, draftId, assistantTimestamp));
     setInput('');
     setIsStreaming(true);
-    setHasResponseStarted(false);
-    setStreamThinking('');
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
@@ -494,7 +478,6 @@ export default function Conversations() {
       });
 
       if (!res.ok) {
-        setHasResponseStarted(true);
         const errMsg: ChatMessage = { role: 'assistant', content: `API 错误: ${res.status}`, timestamp: Date.now() };
         const finalMsgs = [...newMsgs, errMsg];
         setMessages(finalMsgs);
@@ -523,28 +506,23 @@ export default function Conversations() {
           try {
             const data = JSON.parse(line.slice(6));
             if (data.type === 'delta') {
-              if (!hasResponseStarted) {
-                setHasResponseStarted(true);
-                setMessages(appendAssistantDraft(newMsgs, draftId, assistantTimestamp));
-              }
-              if (data.thinking) { thinking += data.text || ''; setStreamThinking(thinking); }
-              else {
+              if (data.thinking) {
+                thinking += data.text || '';
+                setMessages(prev => updateAssistantDraft(prev, draftId, { thinking, status: 'streaming' }));
+              } else {
                 text += data.text || '';
                 setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
               }
             } else if (data.type === 'result') {
-              setHasResponseStarted(true);
-              const content = data.text || text || thinking || '';
-              setStreamThinking('');
+              const content = data.text || text || '';
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              const finalMsgs = [...newMsgs, { id: draftId, role: 'assistant' as const, content, status: 'complete' as const, timestamp: assistantTimestamp }];
+              const finalMsgs = [...newMsgs, { id: draftId, role: 'assistant' as const, content, thinking: thinking || undefined, status: 'complete' as const, timestamp: assistantTimestamp }];
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId, data.sdkSessionId, data.sdkCwd);
               if (sid) setActiveSessionId(sid);
             } else if (data.type === 'permission_request') {
-              setHasResponseStarted(true);
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
                 title: data.title, displayName: data.displayName, description: data.description,
@@ -553,7 +531,6 @@ export default function Conversations() {
             } else if (data.type === 'permission_resolved') {
               if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (data.type === 'ask_user_question') {
-              setHasResponseStarted(true);
               setPendingQuestions(prev => [...prev, {
                 reqId: data.reqId,
                 questions: data.questions || [],
@@ -562,11 +539,8 @@ export default function Conversations() {
             } else if (data.type === 'ask_user_question_resolved') {
               if (data.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (String(data.type || '').startsWith('task_')) {
-              setHasResponseStarted(true);
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
             } else if (data.type === 'error') {
-              setHasResponseStarted(true);
-              setStreamThinking('');
               const finalMsgs = [...newMsgs, { id: draftId, role: 'assistant' as const, content: `错误: ${data.message}`, status: 'error' as const, timestamp: assistantTimestamp }];
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId);
@@ -576,7 +550,6 @@ export default function Conversations() {
         }
       }
     } catch (e) {
-      setHasResponseStarted(true);
       const err: ChatMessage = { role: 'assistant', content: `连接失败: ${(e as Error).message}`, timestamp: Date.now() };
       const finalMsgs = [...newMsgs, err];
       setMessages(finalMsgs);
@@ -818,7 +791,7 @@ export default function Conversations() {
                 </div>
               )}
               {messages.map((msg, i) => (
-                <div key={i} className={`chat-msg ${msg.role}`}>{msg.content}</div>
+                <ChatMessageBubble key={msg.id || i} message={msg} />
               ))}
               {agentTasks.length > 0 && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -841,10 +814,6 @@ export default function Conversations() {
                     </div>
                   ))}
                 </div>
-              )}
-              {streamThinking && <div className="chat-msg thinking">{streamThinking}</div>}
-              {isStreaming && !hasResponseStarted && (
-                <div className="chat-msg assistant pulse">...</div>
               )}
               {structuredOutput !== null && !isStreaming && (
                 <div className="chat-msg assistant" style={{ padding: '8px 12px' }}>

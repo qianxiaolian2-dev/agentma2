@@ -12,6 +12,7 @@ import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { appendAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
 import JsonViewer from '../components/common/JsonViewer';
+import ChatMessageBubble from '../components/ChatMessageBubble';
 
 function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
   try {
@@ -35,10 +36,8 @@ export default function AgentChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
-  const [hasResponseStarted, setHasResponseStarted] = useState(false);
   const [sessionId, setSessionId] = useState<string>('');
   const [sessionMeta, setSessionMeta] = useState<ChatSession | null>(null);
-  const [streamThinking, setStreamThinking] = useState('');
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
@@ -138,7 +137,7 @@ export default function AgentChat() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, streamThinking, agentTasks]);
+  }, [messages, agentTasks]);
 
   const handleSend = useCallback(async () => {
     if (!input.trim() || isStreaming || !template) return;
@@ -149,11 +148,9 @@ export default function AgentChat() {
     const newMessages = [...messages, userMsg];
     const assistantTimestamp = Date.now();
     const draftId = crypto.randomUUID();
-    setMessages(newMessages);
+    setMessages(appendAssistantDraft(newMessages, draftId, assistantTimestamp));
     setInput('');
     setIsStreaming(true);
-    setHasResponseStarted(false);
-    setStreamThinking('');
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
@@ -176,7 +173,7 @@ export default function AgentChat() {
       });
 
       if (!res.ok) {
-        setHasResponseStarted(true);
+  
         const assistantMsg: ChatMessage = {
           role: 'assistant',
           content: `API 错误: ${res.status}`,
@@ -211,29 +208,23 @@ export default function AgentChat() {
           try {
             const data = JSON.parse(json);
             if (data.type === 'delta') {
-              if (!hasResponseStarted) {
-                setHasResponseStarted(true);
-                setMessages(appendAssistantDraft(newMessages, draftId, assistantTimestamp));
-              }
               if (data.thinking) {
                 thinking += data.text || '';
-                setStreamThinking(thinking);
+                setMessages(prev => updateAssistantDraft(prev, draftId, { thinking, status: 'streaming' }));
               } else {
                 text += data.text || '';
                 setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
               }
             } else if (data.type === 'result') {
-              setHasResponseStarted(true);
-              const finalContent = text || thinking || data.text || '';
-              setStreamThinking('');
+              const finalContent = text || data.text || '';
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              const finalMessages = [...newMessages, { id: draftId, role: 'assistant' as const, content: finalContent, status: 'complete' as const, timestamp: assistantTimestamp }];
+              const finalMessages = [...newMessages, { id: draftId, role: 'assistant' as const, content: finalContent, thinking: thinking || undefined, status: 'complete' as const, timestamp: assistantTimestamp }];
               setMessages(finalMessages);
               await persistSession(finalMessages, data.sdkSessionId, data.sdkCwd);
             } else if (data.type === 'permission_request') {
-              setHasResponseStarted(true);
+
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
                 title: data.title, displayName: data.displayName, description: data.description,
@@ -242,7 +233,7 @@ export default function AgentChat() {
             } else if (data.type === 'permission_resolved') {
               if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (data.type === 'ask_user_question') {
-              setHasResponseStarted(true);
+
               setPendingQuestions(prev => [...prev, {
                 reqId: data.reqId,
                 questions: data.questions || [],
@@ -251,11 +242,9 @@ export default function AgentChat() {
             } else if (data.type === 'ask_user_question_resolved') {
               if (data.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (String(data.type || '').startsWith('task_')) {
-              setHasResponseStarted(true);
+
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
             } else if (data.type === 'error') {
-              setHasResponseStarted(true);
-              setStreamThinking('');
               const finalMessages = [...newMessages, { id: draftId, role: 'assistant' as const, content: `错误: ${data.message}`, status: 'error' as const, timestamp: assistantTimestamp }];
               setMessages(finalMessages);
               await persistSession(finalMessages);
@@ -264,7 +253,7 @@ export default function AgentChat() {
         }
       }
     } catch (e) {
-      setHasResponseStarted(true);
+
       const assistantMsg: ChatMessage = {
         role: 'assistant',
         content: `连接失败: ${(e as Error).message}`,
@@ -313,9 +302,7 @@ export default function AgentChat() {
           )}
 
           {messages.map((msg, i) => (
-            <div key={i} className={`chat-msg ${msg.role}`}>
-              {msg.content}
-            </div>
+            <ChatMessageBubble key={msg.id || i} message={msg} />
           ))}
 
           {agentTasks.length > 0 && (
@@ -339,14 +326,6 @@ export default function AgentChat() {
                 </div>
               ))}
             </div>
-          )}
-
-          {streamThinking && (
-            <div className="chat-msg thinking">{streamThinking}</div>
-          )}
-
-          {isStreaming && !hasResponseStarted && (
-            <div className="chat-msg assistant pulse">...</div>
           )}
 
           {structuredOutput !== null && !isStreaming && (
