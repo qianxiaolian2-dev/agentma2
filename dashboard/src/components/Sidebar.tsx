@@ -31,11 +31,31 @@ const SECTIONS = [
   },
 ];
 
-export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
+type SidebarProps = {
+  collapsed?: boolean;
+  onNavigate?: () => void;
+  onToggleCollapsed?: () => void;
+};
+
+export default function Sidebar({ collapsed = false, onNavigate, onToggleCollapsed }: SidebarProps) {
   const { user, logout } = useAuth();
   return (
     <nav className="sidebar-body" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div className="sidebar-logo">🐾 AgentMa</div>
+      <div className="sidebar-logo-row">
+        <div className="sidebar-logo" title="AgentMa">
+          <span className="sidebar-logo-mark">🐾</span>
+          <span className="sidebar-logo-text">AgentMa</span>
+        </div>
+        <button
+          type="button"
+          className="sidebar-collapse-btn"
+          onClick={onToggleCollapsed}
+          aria-label={collapsed ? '展开侧边栏' : '折叠侧边栏'}
+          title={collapsed ? '展开侧边栏' : '折叠侧边栏'}
+        >
+          {collapsed ? '›' : '‹'}
+        </button>
+      </div>
       <div style={{ flex: 1, overflow: 'auto' }}>
         {SECTIONS.map(section => (
           <div className="sidebar-section" key={section.title}>
@@ -46,18 +66,22 @@ export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
                 to={item.path}
                 end={item.path === '/'}
                 onClick={onNavigate}
+                title={collapsed ? item.label : undefined}
                 className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
               >
-                <span>{item.icon}</span>
-                <span>{item.label}</span>
+                <span className="sidebar-link-icon">{item.icon}</span>
+                <span className="sidebar-link-label">{item.label}</span>
               </NavLink>
             ))}
           </div>
         ))}
       </div>
-      <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border)', fontSize: '.8em' }}>
-        {user && <div style={{ marginBottom: 6, color: 'var(--ink-secondary)' }}>{user.email}</div>}
-        <button className="btn btn-sm" onClick={logout} style={{ width: '100%' }}>登出</button>
+      <div className="sidebar-footer">
+        {user && <div className="sidebar-user" title={user.email}>{user.email}</div>}
+        <button className="btn btn-sm sidebar-logout-btn" onClick={logout} title="登出">
+          <span className="sidebar-logout-icon">⎋</span>
+          <span className="sidebar-link-label">登出</span>
+        </button>
       </div>
     </nav>
   );
