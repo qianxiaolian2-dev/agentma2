@@ -13,13 +13,13 @@
 |---|---|---|---|
 | §2 接 SDK 岔路 | 前置 | ✅ 100% | 选了"接 SDK",spike 通过 |
 | P1 让执行变真 | 25% | ✅ **100%** | runAgent / SDK query() / 配额审计入库 |
-| P2 把配置面接到真能力 | 30% | 🟡 **90%** | Permissions ✅ / Hooks ✅ / Sessions ✅ / Subagents 定义管理 ✅ / Subagents 独立表 ❌ |
+| P2 把配置面接到真能力 | 30% | ✅ **100%** | Permissions ✅ / Hooks ✅ / Sessions ✅ / Subagents ✅ / McpServers ✅ |
 | P3 生产化 / 多租户 | 30% | ❌ **0%** | 沙箱 / OTel / 多租户强隔离 0 启动（需拍板） |
-| P4 差异化 / 丰富度 | 15% | 🟡 **20%** | 结构化输出 ✅ / AskUserQuestion ✅ / 其余 ❌ |
-| §5 小赢 | 散件 | ✅ **100%** | 真用量 ✅ / fork+resume ✅ / AskUserQuestion ✅ / 结构化输出 ✅ |
+| P4 差异化 / 丰富度 | 15% | 🟡 **25%** | 结构化输出 ✅ / AskUserQuestion ✅ / Observability 真数据 ✅ / 其余 ❌ |
+| §5 小赢 | 散件 | ✅ **100%** | 全部完成 |
 
-**整体加权进度 ≈ 52%**，**核心功能层(P1+P2)≈ 95%**。
-产品可演示完整 agent 能力（工具 + 权限 + Hooks + resume + 结构化输出）。
+**整体加权进度 ≈ 56%**，**核心功能层(P1+P2)= 100%**。
+sdkSimulator 活跃调用归零，所有页面使用真实 API 或合理静态配置。
 
 ### 已合并 commit(`8c91b32` 之后)
 
