@@ -18,3 +18,23 @@ export function updateAssistantDraft(
     return { ...message, ...patch };
   });
 }
+
+export function finalizeAssistantDraft(
+  baseMessages: ChatMessage[],
+  id: string,
+  timestamp: number,
+  content: string,
+  status: NonNullable<ChatMessage['status']>,
+  thinking?: string,
+): ChatMessage[] {
+  const assistantMessage: ChatMessage = {
+    id,
+    role: 'assistant',
+    content,
+    status,
+    timestamp,
+    ...(thinking ? { thinking } : {}),
+  };
+
+  return [...baseMessages, assistantMessage];
+}

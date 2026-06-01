@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import type { AgentTemplate, ChatMessage, ChatSession, ProviderConfig } from '../simulator/types';
+import type { AgentTemplate, ChatMessage, ChatSession, ProviderConfig, ChatImageAttachment } from '../simulator/types';
 import { getDefaultProviderConfig } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, getCachedAgentTemplateById } from '../utils/agent-templates';
@@ -43,6 +43,7 @@ export default function AgentChat() {
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
   const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
   const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
+  const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(loadProvider());
 
@@ -144,12 +145,14 @@ export default function AgentChat() {
 
     const userMsg: ChatMessage = {
       role: 'user', content: input.trim(), timestamp: Date.now(),
+      attachments: attachments.length > 0 ? attachments : undefined,
     };
     const newMessages = [...messages, userMsg];
     const assistantTimestamp = Date.now();
     const draftId = crypto.randomUUID();
     setMessages(appendAssistantDraft(newMessages, draftId, assistantTimestamp));
     setInput('');
+    setAttachments([]);
     setIsStreaming(true);
     setPendingQuestions([]);
     setAgentTasks([]);
@@ -161,7 +164,7 @@ export default function AgentChat() {
         method: 'POST',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
-          messages: newMessages.map(m => ({ role: m.role, content: m.content })),
+          messages: newMessages.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
           systemPrompt: template.systemPrompt || undefined,
           provider: provider.current,
           tools: buildRequestToolsForAgent(template),
@@ -360,6 +363,20 @@ export default function AgentChat() {
         </div>
 
         <div className="chat-input-area">
+          {attachments.length > 0 && (
+            <div style={{ display: 'flex', gap: 6, padding: '4px 0', flexWrap: 'wrap' }}>
+              {attachments.map(img => (
+                <div key={img.id} style={{ position: 'relative' }}>
+                  <img src={`data:${img.mediaType};base64,${img.data}`} alt={img.name}
+                    style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)' }} />
+                  <button onClick={() => setAttachments(prev => prev.filter(a => a.id !== img.id))}
+                    style={{ position: 'absolute', top: -4, right: -4, width: 16, height: 16, borderRadius: '50%', background: 'var(--danger)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 10, lineHeight: '16px', padding: 0 }}>
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <textarea
             value={input}
             onChange={e => setInput(e.target.value)}
@@ -369,11 +386,33 @@ export default function AgentChat() {
                 handleSend();
               }
             }}
-            placeholder="输入消息，Enter 换行，Shift+Enter 发送"
+            onPaste={e => {
+              const items = Array.from(e.clipboardData?.items || []);
+              const imgItems = items.filter(it => it.type.startsWith('image/'));
+              if (imgItems.length === 0) return;
+              e.preventDefault();
+              imgItems.slice(0, 4).forEach(item => {
+                const file = item.getAsFile();
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                  const result = String(reader.result || '');
+                  const data = result.includes(',') ? result.split(',')[1] : result;
+                  if (!data) return;
+                  setAttachments(prev => [...prev, {
+                    id: crypto.randomUUID(), type: 'image',
+                    mediaType: file.type as ChatImageAttachment['mediaType'],
+                    data, name: file.name || 'pasted-image', size: file.size,
+                  }]);
+                };
+                reader.readAsDataURL(file);
+              });
+            }}
+            placeholder="输入消息，Shift+Enter 发送，可粘贴图片"
             rows={1}
             disabled={isStreaming}
           />
-          <button className="btn btn-primary" onClick={handleSend} disabled={isStreaming || !input.trim()}>
+          <button className="btn btn-primary" onClick={handleSend} disabled={isStreaming || (!input.trim() && attachments.length === 0)}>
             {isStreaming ? '...' : '发送'}
           </button>
         </div>
