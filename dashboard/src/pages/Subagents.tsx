@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { AgentDefinition, AgentTemplate, EffortLevel, PermissionMode, TodoItem } from '../simulator/types';
-import { sdkSimulator } from '../simulator/sdk-simulator';
-import { generateMockTodos, EFFORT_LEVELS, PERMISSION_MODES } from '../simulator/mock-data';
+import type { AgentDefinition, AgentTemplate, EffortLevel, PermissionMode } from '../simulator/types';
+import { EFFORT_LEVELS, PERMISSION_MODES } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
 import StatusBadge from '../components/common/StatusBadge';
@@ -55,7 +54,6 @@ export default function Subagents() {
   const [form, setForm] = useState<SubagentForm>(newSubagentForm());
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
-  const [todos, setTodos] = useState<TodoItem[]>(generateMockTodos());
 
   useEffect(() => {
     if (!user?.tenantId) return;
@@ -143,19 +141,6 @@ export default function Subagents() {
       setIsSaving(false);
     }
   };
-
-  const handleCreateTodo = async () => {
-    const todo = await sdkSimulator.createTodo('新任务', '手动创建的任务');
-    setTodos(prev => [...prev, todo]);
-  };
-
-  const handleUpdateTodo = async (id: string, status: TodoItem['status']) => {
-    await sdkSimulator.updateTodoStatus(id, status);
-    setTodos(prev => prev.map(t => t.id === id ? { ...t, status } : t));
-  };
-
-  const statusLabel = (s: string) => s === 'pending' ? '待处理' : s === 'in_progress' ? '进行中' : '已完成';
-  const statusColor = (s: string) => s === 'completed' ? 'success' as const : s === 'in_progress' ? 'warning' as const : 'info' as const;
 
   return (
     <div>
@@ -280,36 +265,6 @@ export default function Subagents() {
             </button>
           </div>
 
-          <div className="card mt-4">
-            <div className="flex-between">
-              <div className="card-header" style={{ marginBottom: 0 }}>Task CRUD 演示</div>
-              <button className="btn btn-sm btn-primary" onClick={handleCreateTodo}>
-                TaskCreate()
-              </button>
-            </div>
-            <div className="mt-4">
-              {todos.map(todo => (
-                <div key={todo.id} className="tool-card mb-2">
-                  <div className="flex-between">
-                    <div>
-                      <div className="tool-card-name">{todo.subject}</div>
-                      <div className="tool-card-desc">{todo.description}</div>
-                    </div>
-                    <StatusBadge status={statusColor(todo.status)} label={statusLabel(todo.status)} />
-                  </div>
-                  {todo.blockedBy && todo.blockedBy.length > 0 && (
-                    <div className="mt-2" style={{ fontSize: '.75em', color: 'var(--ink-muted)' }}>
-                      被阻塞: {todo.blockedBy.join(', ')}
-                    </div>
-                  )}
-                  <div className="flex gap-2 mt-2">
-                    <button className="btn btn-sm" onClick={() => handleUpdateTodo(todo.id, 'completed')}>TaskUpdate {'->'} completed</button>
-                    <button className="btn btn-sm" onClick={() => handleUpdateTodo(todo.id, 'in_progress')}>{'->'} in_progress</button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
         </div>
       </div>
     </div>
