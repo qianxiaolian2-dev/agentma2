@@ -250,7 +250,7 @@ export type AgentEvent =
   | { type: 'task_progress'; taskId: string; toolUseId?: string; description: string; subagentType?: string; lastToolName?: string; summary?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }; sdkSessionId?: string }
   | { type: 'task_updated'; taskId: string; status?: string; description?: string; error?: string; backgrounded?: boolean; sdkSessionId?: string }
   | { type: 'task_notification'; taskId: string; toolUseId?: string; status: string; summary?: string; outputFile?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }; sdkSessionId?: string }
-  | { type: 'result'; subtype: string; text: string; usage: { input_tokens: number; output_tokens: number }; duration_ms: number; cost_usd: number; model: string; sdkSessionId?: string; sdkCwd?: string }
+  | { type: 'result'; subtype: string; text: string; usage: { input_tokens: number; output_tokens: number }; duration_ms: number; cost_usd: number; model: string; sdkSessionId?: string; sdkCwd?: string; structuredOutput?: unknown }
   | { type: 'error'; message: string };
 
 export interface RunAgentOptions {
@@ -265,6 +265,8 @@ export interface RunAgentOptions {
   requestTools?: any[];
   /** Programmatic SDK subagents exposed through the Agent tool. */
   subagents?: Record<string, AgentDefinition>;
+  /** Structured output JSON Schema — when set, SDK returns structured_output alongside text. */
+  outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   maxTurns?: number;
   cwd?: string;
   resumeSdkSessionId?: string;
@@ -516,7 +518,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   };
 
   const startTime = Date.now();
-  let inTok = 0, outTok = 0, finalText = '', status = 'success', sdkSessionId = opts.resumeSdkSessionId || '';
+  let inTok = 0, outTok = 0, finalText = '', status = 'success', sdkSessionId = opts.resumeSdkSessionId || '', structuredOutput: unknown = undefined;
 
   try {
     for await (const msg of query({
@@ -530,6 +532,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         cwd,
         ...(agentNames.length ? { agents: opts.subagents, forwardSubagentText: true, agentProgressSummaries: true } : {}),
         ...(opts.resumeSdkSessionId ? { resume: opts.resumeSdkSessionId } : {}),
+        ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
         settingSources: [],
         env,
         ...(hooks ? { hooks, includeHookEvents: true } : {}),
@@ -557,6 +560,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         status = m.subtype || 'success';
         if (m.session_id) sdkSessionId = m.session_id;
         if (m.result) finalText = m.result;
+        if (m.structured_output !== undefined) structuredOutput = m.structured_output;
         const u = m.usage || {};
         inTok = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
         outTok = u.output_tokens || 0;
@@ -624,5 +628,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     model: opts.model,
     sdkSessionId: sdkSessionId || undefined,
     sdkCwd: cwd,
+    ...(structuredOutput !== undefined ? { structuredOutput } : {}),
   });
 }

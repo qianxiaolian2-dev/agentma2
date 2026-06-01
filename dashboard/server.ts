@@ -612,6 +612,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
     apiKey,
     tools: Array.isArray(tmpl?.tools) ? tmpl.tools : undefined,
     subagents,
+    outputFormat: tmpl?.outputSchema ? { type: 'json_schema', schema: tmpl.outputSchema } : undefined,
     maxTurns: Number(tmpl?.maxTurns) || 20,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,

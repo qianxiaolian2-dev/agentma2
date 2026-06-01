@@ -456,6 +456,30 @@ export default function Agents() {
               </div>
             </details>
 
+            {/* 结构化输出 */}
+            <details>
+              <summary style={{ cursor: 'pointer', fontSize: '.82em', color: 'var(--ink-secondary)', marginBottom: 8 }}>
+                结构化输出 (outputSchema) {form.outputSchema ? '✓' : '— 可选'}
+              </summary>
+              <div className="form-group">
+                <label>JSON Schema（留空 = 纯文本输出）</label>
+                <textarea
+                  rows={6}
+                  style={{ fontFamily: 'var(--font-mono)', fontSize: '.76em', resize: 'vertical' }}
+                  placeholder={'{\n  "type": "object",\n  "properties": {\n    "title": { "type": "string" },\n    "summary": { "type": "string" }\n  },\n  "required": ["title", "summary"]\n}'}
+                  value={form.outputSchema ? JSON.stringify(form.outputSchema, null, 2) : ''}
+                  onChange={e => {
+                    const raw = e.target.value.trim();
+                    if (!raw) { setForm({ ...form, outputSchema: undefined }); return; }
+                    try { setForm({ ...form, outputSchema: JSON.parse(raw) }); } catch { /* keep existing until valid */ }
+                  }}
+                />
+                {form.outputSchema && (
+                  <div style={{ fontSize: '.72em', color: 'var(--success)', marginTop: 4 }}>schema 有效，运行时启用结构化输出</div>
+                )}
+              </div>
+            </details>
+
             {/* 工具选择 */}
             <div className="form-group">
               <label>启用的工具 (tools: string[]) — 已选 {form.tools.length} 个</label>

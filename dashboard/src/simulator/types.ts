@@ -397,6 +397,8 @@ export interface AgentTemplate {
   permissionMode: PermissionMode;
   // 供应商配置覆盖 (可选，留空则使用全局配置)
   providerOverrides?: Partial<ProviderConfig>;
+  // 结构化输出 JSON Schema (可选)
+  outputSchema?: Record<string, unknown>;
   createdAt: number;
   updatedAt: number;
 }

@@ -79,6 +79,9 @@ function normalizeAgentTemplate(value: unknown): AgentTemplate | null {
     maxTurns: Number.isFinite(maxTurns) && maxTurns > 0 ? maxTurns : 50,
     permissionMode,
     providerOverrides: normalizeProviderOverrides(raw.providerOverrides),
+    outputSchema: raw.outputSchema && typeof raw.outputSchema === 'object' && !Array.isArray(raw.outputSchema)
+      ? raw.outputSchema as Record<string, unknown>
+      : undefined,
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
   };
