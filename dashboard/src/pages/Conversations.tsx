@@ -11,6 +11,7 @@ import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agen
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { withAssistantDraft } from '../utils/chat-stream-draft';
+import JsonViewer from '../components/common/JsonViewer';
 import {
   bootstrapChatSessions,
   deleteChatSession as deleteChatSessionApi,
@@ -105,6 +106,7 @@ export default function Conversations() {
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
+  const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
@@ -135,6 +137,7 @@ export default function Conversations() {
     setStreamThinking('');
     setPendingQuestions([]);
     setAgentTasks([]);
+    setStructuredOutput(null);
 
     try {
       const res = await fetch('/api/chat', {
@@ -172,6 +175,7 @@ export default function Conversations() {
               } else if (d.type === 'result') {
                 setHasResponseStarted(true);
                 const content = d.text || text || thinking || '';
+                if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
                 const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
                 setStreamThinking('');
                 setMessages(finalMsgs);
@@ -460,6 +464,7 @@ export default function Conversations() {
     setStreamThinking('');
     setPendingQuestions([]);
     setAgentTasks([]);
+    setStructuredOutput(null);
 
     try {
       const res = await fetch('/api/chat', {
@@ -516,6 +521,7 @@ export default function Conversations() {
               setHasResponseStarted(true);
               const content = data.text || text || thinking || '';
               setStreamThinking('');
+              if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId, data.sdkSessionId, data.sdkCwd);
@@ -822,6 +828,14 @@ export default function Conversations() {
               {streamThinking && <div className="chat-msg thinking">{streamThinking}</div>}
               {isStreaming && !hasResponseStarted && (
                 <div className="chat-msg assistant pulse">...</div>
+              )}
+              {structuredOutput !== null && !isStreaming && (
+                <div className="chat-msg assistant" style={{ padding: '8px 12px' }}>
+                  <div style={{ fontSize: '.72em', fontWeight: 600, color: 'var(--ink-muted)', marginBottom: 6 }}>
+                    结构化输出 (outputSchema)
+                  </div>
+                  <JsonViewer data={structuredOutput} maxHeight={300} />
+                </div>
               )}
               <div ref={bottomRef} />
             </div>

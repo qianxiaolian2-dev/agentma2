@@ -11,6 +11,7 @@ import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '..
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { withAssistantDraft } from '../utils/chat-stream-draft';
+import JsonViewer from '../components/common/JsonViewer';
 
 function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
   try {
@@ -41,6 +42,7 @@ export default function AgentChat() {
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
+  const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(loadProvider());
 
@@ -152,6 +154,7 @@ export default function AgentChat() {
     setStreamThinking('');
     setPendingQuestions([]);
     setAgentTasks([]);
+    setStructuredOutput(null);
 
     try {
       const res = await fetch('/api/chat', {
@@ -216,6 +219,7 @@ export default function AgentChat() {
               setHasResponseStarted(true);
               const finalContent = text || thinking || data.text || '';
               setStreamThinking('');
+              if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               const finalMessages = withAssistantDraft(newMessages, finalContent, assistantTimestamp);
               setMessages(finalMessages);
               await persistSession(finalMessages, data.sdkSessionId, data.sdkCwd);
@@ -334,6 +338,15 @@ export default function AgentChat() {
 
           {isStreaming && !hasResponseStarted && (
             <div className="chat-msg assistant pulse">...</div>
+          )}
+
+          {structuredOutput !== null && !isStreaming && (
+            <div className="chat-msg assistant" style={{ padding: '8px 12px' }}>
+              <div style={{ fontSize: '.72em', fontWeight: 600, color: 'var(--ink-muted)', marginBottom: 6 }}>
+                结构化输出 (outputSchema)
+              </div>
+              <JsonViewer data={structuredOutput} maxHeight={300} />
+            </div>
           )}
 
           <div ref={bottomRef} />
