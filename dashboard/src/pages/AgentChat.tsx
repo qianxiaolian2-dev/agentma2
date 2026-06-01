@@ -10,7 +10,7 @@ import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../compo
 import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
-import { appendAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
+import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
 
@@ -176,13 +176,7 @@ export default function AgentChat() {
       });
 
       if (!res.ok) {
-  
-        const assistantMsg: ChatMessage = {
-          role: 'assistant',
-          content: `API 错误: ${res.status}`,
-          timestamp: Date.now(),
-        };
-        const finalMessages = [...newMessages, assistantMsg];
+        const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, `API 错误: ${res.status}`, 'error');
         setMessages(finalMessages);
         await persistSession(finalMessages);
         setIsStreaming(false);
@@ -190,7 +184,13 @@ export default function AgentChat() {
       }
 
       const reader = res.body?.getReader();
-      if (!reader) { setIsStreaming(false); return; }
+      if (!reader) {
+        const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, '连接失败: 响应体为空', 'error');
+        setMessages(finalMessages);
+        await persistSession(finalMessages);
+        setIsStreaming(false);
+        return;
+      }
 
       const decoder = new TextDecoder();
       let buf = '';
@@ -223,11 +223,10 @@ export default function AgentChat() {
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              const finalMessages = [...newMessages, { id: draftId, role: 'assistant' as const, content: finalContent, thinking: thinking || undefined, status: 'complete' as const, timestamp: assistantTimestamp }];
+              const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, finalContent, 'complete', thinking || undefined);
               setMessages(finalMessages);
               await persistSession(finalMessages, data.sdkSessionId, data.sdkCwd);
             } else if (data.type === 'permission_request') {
-
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
                 title: data.title, displayName: data.displayName, description: data.description,
@@ -236,7 +235,6 @@ export default function AgentChat() {
             } else if (data.type === 'permission_resolved') {
               if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (data.type === 'ask_user_question') {
-
               setPendingQuestions(prev => [...prev, {
                 reqId: data.reqId,
                 questions: data.questions || [],
@@ -245,10 +243,9 @@ export default function AgentChat() {
             } else if (data.type === 'ask_user_question_resolved') {
               if (data.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (String(data.type || '').startsWith('task_')) {
-
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
             } else if (data.type === 'error') {
-              const finalMessages = [...newMessages, { id: draftId, role: 'assistant' as const, content: `错误: ${data.message}`, status: 'error' as const, timestamp: assistantTimestamp }];
+              const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, `错误: ${data.message}`, 'error', thinking || undefined);
               setMessages(finalMessages);
               await persistSession(finalMessages);
             }
@@ -256,18 +253,12 @@ export default function AgentChat() {
         }
       }
     } catch (e) {
-
-      const assistantMsg: ChatMessage = {
-        role: 'assistant',
-        content: `连接失败: ${(e as Error).message}`,
-        timestamp: Date.now(),
-      };
-      const finalMessages = [...newMessages, assistantMsg];
+      const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, `连接失败: ${(e as Error).message}`, 'error');
       setMessages(finalMessages);
       await persistSession(finalMessages);
     }
     setIsStreaming(false);
-  }, [input, isStreaming, template, messages, persistSession]);
+  }, [input, attachments, isStreaming, template, messages, persistSession]);
 
   if (!template) {
     return <div className="page-header"><h1>加载中...</h1></div>;

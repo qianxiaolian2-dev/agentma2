@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import type { ClipboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig } from '../simulator/types';
+import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig, ChatImageAttachment, ChatImageMimeType } from '../simulator/types';
 import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
 import { getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
@@ -10,7 +11,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
-import { appendAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
+import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
 import {
@@ -20,6 +21,38 @@ import {
   patchChatSession,
   saveChatSession as saveChatSessionApi,
 } from '../utils/chat-sessions';
+
+const CHAT_IMAGE_MIME_TYPES = new Set<ChatImageMimeType>(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const CHAT_IMAGE_MAX_COUNT = 4;
+const CHAT_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+
+function getImageSrc(image: ChatImageAttachment): string {
+  return `data:${image.mediaType};base64,${image.data}`;
+}
+
+function fileToImageAttachment(file: File): Promise<ChatImageAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('图片读取失败'));
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      const data = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      if (!data) {
+        reject(new Error('图片数据为空'));
+        return;
+      }
+      resolve({
+        id: crypto.randomUUID(),
+        type: 'image',
+        mediaType: file.type as ChatImageMimeType,
+        data,
+        name: file.name || 'pasted-image',
+        size: file.size,
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 // MCP 服务状态指示灯（自动 ping 端点）
 function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }) {
@@ -107,6 +140,8 @@ export default function Conversations() {
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
   const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
   const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
+  const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
@@ -144,7 +179,7 @@ export default function Conversations() {
         method: 'POST',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
-          messages: newMsgs.map(m => ({ role: m.role, content: m.content })),
+          messages: newMsgs.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
           systemPrompt: agent.systemPrompt || undefined,
           provider: prov,
           tools: buildRequestToolsForAgent(agent),
@@ -179,7 +214,7 @@ export default function Conversations() {
                 if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
                 if (d.cost_usd !== undefined || d.duration_ms !== undefined)
                   setRunStats({ costUsd: d.cost_usd, durationMs: d.duration_ms, inTok: d.usage?.input_tokens, outTok: d.usage?.output_tokens });
-                const finalMsgs = [...newMsgs, { id: draftId0, role: 'assistant' as const, content, thinking: thinking || undefined, status: 'complete' as const, timestamp: assistantTimestamp }];
+                const finalMsgs = finalizeAssistantDraft(newMsgs, draftId0, assistantTimestamp, content, 'complete', thinking || undefined);
                 setMessages(finalMsgs);
                 const sid = await (persistRef.current?.(finalMsgs, activeSessionId, d.sdkSessionId, d.sdkCwd) || Promise.resolve(''));
                 if (sid) setActiveSessionId(sid);
@@ -352,6 +387,8 @@ export default function Conversations() {
     setPendingQuestions([]);
     setAgentTasks([]);
     setInput('');
+    setAttachments([]);
+    setAttachmentError('');
     setMobileListOpen(false);
   };
 
@@ -369,6 +406,8 @@ export default function Conversations() {
     setPendingQuestions([]);
     setAgentTasks([]);
     setInput('');
+    setAttachments([]);
+    setAttachmentError('');
     if (s.templateId && templates.find(t => t.id === s.templateId)) {
       setSelectedAgentId(s.templateId);
     }
@@ -430,6 +469,8 @@ export default function Conversations() {
     if (activeSessionId === id) {
       setActiveSessionId(null);
       setMessages([]);
+      setAttachments([]);
+      setAttachmentError('');
     }
     try {
       await deleteChatSessionApi(id);
@@ -439,9 +480,57 @@ export default function Conversations() {
     }
   };
 
+  const handlePaste = useCallback(async (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const clipboardItems = Array.from(event.clipboardData.items || []);
+    const clipboardFiles = Array.from(event.clipboardData.files || []);
+    const itemFiles = clipboardItems
+      .filter(item => item.kind === 'file')
+      .map(item => item.getAsFile())
+      .filter((file): file is File => Boolean(file));
+    const files = [...clipboardFiles, ...itemFiles]
+      .filter((file, index, all) => file.type.startsWith('image/') && all.findIndex(candidate => candidate === file) === index);
+
+    if (!files.length) return;
+    event.preventDefault();
+    setAttachmentError('');
+
+    const remainingSlots = CHAT_IMAGE_MAX_COUNT - attachments.length;
+    if (remainingSlots <= 0) {
+      setAttachmentError(`最多一次发送 ${CHAT_IMAGE_MAX_COUNT} 张图片`);
+      return;
+    }
+
+    const accepted: File[] = [];
+    for (const file of files) {
+      if (!CHAT_IMAGE_MIME_TYPES.has(file.type as ChatImageMimeType)) {
+        setAttachmentError('仅支持 PNG、JPEG、GIF、WebP 图片');
+        continue;
+      }
+      if (file.size > CHAT_IMAGE_MAX_BYTES) {
+        setAttachmentError('单张图片不能超过 5MB');
+        continue;
+      }
+      if (accepted.length < remainingSlots) accepted.push(file);
+    }
+
+    if (files.length > remainingSlots) {
+      setAttachmentError(`最多一次发送 ${CHAT_IMAGE_MAX_COUNT} 张图片`);
+    }
+    if (!accepted.length) return;
+
+    try {
+      const nextAttachments = await Promise.all(accepted.map(fileToImageAttachment));
+      setAttachments(prev => [...prev, ...nextAttachments]);
+    } catch (error) {
+      setAttachmentError((error as Error).message || '图片读取失败');
+    }
+  }, [attachments.length]);
+
   // 发送消息
   const handleSend = useCallback(async () => {
-    if (!input.trim() || isStreaming || !currentAgent) return;
+    const content = input.trim();
+    const messageAttachments = attachments;
+    if ((!content && messageAttachments.length === 0) || isStreaming || !currentAgent) return;
 
     // 合并 provider 配置
     provider.current = loadGlobalProvider();
@@ -449,12 +538,19 @@ export default function Conversations() {
       provider.current = { ...provider.current, ...currentAgent.providerOverrides };
     }
 
-    const userMsg: ChatMessage = { role: 'user', content: input.trim(), timestamp: Date.now() };
+    const userMsg: ChatMessage = {
+      role: 'user',
+      content,
+      timestamp: Date.now(),
+      ...(messageAttachments.length ? { attachments: messageAttachments } : {}),
+    };
     const newMsgs = [...messages, userMsg];
     const assistantTimestamp = Date.now();
     const draftId = crypto.randomUUID();
     setMessages(appendAssistantDraft(newMsgs, draftId, assistantTimestamp));
     setInput('');
+    setAttachments([]);
+    setAttachmentError('');
     setIsStreaming(true);
     setPendingQuestions([]);
     setAgentTasks([]);
@@ -466,7 +562,7 @@ export default function Conversations() {
         method: 'POST',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
-          messages: newMsgs.map(m => ({ role: m.role, content: m.content })),
+          messages: newMsgs.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
           systemPrompt: currentAgent.systemPrompt || undefined,
           provider: provider.current,
           tools: buildRequestToolsForAgent(currentAgent),
@@ -518,7 +614,7 @@ export default function Conversations() {
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              const finalMsgs = [...newMsgs, { id: draftId, role: 'assistant' as const, content, thinking: thinking || undefined, status: 'complete' as const, timestamp: assistantTimestamp }];
+              const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, content, 'complete', thinking || undefined);
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId, data.sdkSessionId, data.sdkCwd);
               if (sid) setActiveSessionId(sid);
@@ -541,7 +637,7 @@ export default function Conversations() {
             } else if (String(data.type || '').startsWith('task_')) {
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
             } else if (data.type === 'error') {
-              const finalMsgs = [...newMsgs, { id: draftId, role: 'assistant' as const, content: `错误: ${data.message}`, status: 'error' as const, timestamp: assistantTimestamp }];
+              const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, `错误: ${data.message}`, 'error');
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId);
               if (sid) setActiveSessionId(sid);
@@ -557,7 +653,7 @@ export default function Conversations() {
       if (sid) setActiveSessionId(sid);
     }
     setIsStreaming(false);
-  }, [input, isStreaming, currentAgent, messages, activeSessionId, persistSession]);
+  }, [input, attachments, isStreaming, currentAgent, messages, activeSessionId, persistSession, sessions]);
 
   return (
     <div className="conversation-shell">
@@ -847,17 +943,37 @@ export default function Conversations() {
             {/* 输入区域 */}
             <div className="conversation-composer">
               <div className="chat-input-area" style={{ padding: 0, borderTop: 'none' }}>
+                {(attachments.length > 0 || attachmentError) && (
+                  <div style={{ padding: '4px 8px' }}>
+                    {attachmentError && <div style={{ color: 'var(--danger)', fontSize: '.75em', marginBottom: 4 }}>{attachmentError}</div>}
+                    {attachments.length > 0 && (
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        {attachments.map(img => (
+                          <div key={img.id} style={{ position: 'relative' }}>
+                            <img src={getImageSrc(img)} alt={img.name}
+                              style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)' }} />
+                            <button onClick={() => setAttachments(prev => prev.filter(a => a.id !== img.id))}
+                              style={{ position: 'absolute', top: -4, right: -4, width: 16, height: 16, borderRadius: '50%', background: 'var(--danger)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 10, lineHeight: '16px', padding: 0 }}>
+                              ×
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <textarea
                   value={input}
                   onChange={e => setInput(e.target.value)}
                   onKeyDown={e => {
                     if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); handleSend(); }
                   }}
-                  placeholder="输入消息，Enter 换行，Shift+Enter 发送"
+                  onPaste={handlePaste}
+                  placeholder="输入消息，Shift+Enter 发送，可粘贴图片"
                   rows={1}
                   disabled={isStreaming}
                 />
-                <button className="btn btn-primary" onClick={handleSend} disabled={isStreaming || !input.trim()}>
+                <button className="btn btn-primary" onClick={handleSend} disabled={isStreaming || (!input.trim() && attachments.length === 0)}>
                   {isStreaming ? '...' : '发送'}
                 </button>
               </div>
