@@ -10,7 +10,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
-import { hasTrailingAssistantMessage, withAssistantDraft } from '../utils/chat-stream-draft';
+import { withAssistantDraft } from '../utils/chat-stream-draft';
 import {
   bootstrapChatSessions,
   deleteChatSession as deleteChatSessionApi,
@@ -100,6 +100,7 @@ export default function Conversations() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [hasResponseStarted, setHasResponseStarted] = useState(false);
   const [streamThinking, setStreamThinking] = useState('');
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
@@ -126,6 +127,7 @@ export default function Conversations() {
     if (agent.providerOverrides) Object.assign(prov, agent.providerOverrides);
 
     setIsStreaming(true);
+    setHasResponseStarted(false);
     const eventMsg: ChatMessage = { role: 'user', content: eventText, timestamp: Date.now() };
     const newMsgs = [...currentMsgs, eventMsg];
     const assistantTimestamp = Date.now();
@@ -161,12 +163,14 @@ export default function Conversations() {
             try {
               const d = JSON.parse(line.slice(6));
               if (d.type === 'delta') {
+                setHasResponseStarted(true);
                 if (d.thinking) { thinking += d.text || ''; setStreamThinking(thinking); }
                 else {
                   text += d.text || '';
                   setMessages(withAssistantDraft(newMsgs, text, assistantTimestamp));
                 }
               } else if (d.type === 'result') {
+                setHasResponseStarted(true);
                 const content = d.text || text || thinking || '';
                 const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
                 setStreamThinking('');
@@ -174,6 +178,7 @@ export default function Conversations() {
                 const sid = await (persistRef.current?.(finalMsgs, activeSessionId, d.sdkSessionId, d.sdkCwd) || Promise.resolve(''));
                 if (sid) setActiveSessionId(sid);
               } else if (d.type === 'permission_request') {
+                setHasResponseStarted(true);
                 setPendingPermissions(prev => [...prev, {
                   reqId: d.reqId, toolName: d.toolName, input: d.input,
                   title: d.title, displayName: d.displayName, description: d.description,
@@ -182,6 +187,7 @@ export default function Conversations() {
               } else if (d.type === 'permission_resolved') {
                 if (d.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
               } else if (d.type === 'ask_user_question') {
+                setHasResponseStarted(true);
                 setPendingQuestions(prev => [...prev, {
                   reqId: d.reqId,
                   questions: d.questions || [],
@@ -190,6 +196,7 @@ export default function Conversations() {
               } else if (d.type === 'ask_user_question_resolved') {
                 if (d.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== d.reqId));
               } else if (String(d.type || '').startsWith('task_')) {
+                setHasResponseStarted(true);
                 setAgentTasks(prev => mergeAgentTaskEvent(prev, d));
               }
             } catch {}
@@ -340,6 +347,7 @@ export default function Conversations() {
     setActiveSessionId(null);
     setMessages([]);
     setStreamThinking('');
+    setHasResponseStarted(false);
     setPendingQuestions([]);
     setAgentTasks([]);
     setInput('');
@@ -358,6 +366,7 @@ export default function Conversations() {
     setActiveSessionId(s.id);
     setMessages(s.messages);
     setStreamThinking('');
+    setHasResponseStarted(false);
     setPendingQuestions([]);
     setAgentTasks([]);
     setInput('');
@@ -447,6 +456,7 @@ export default function Conversations() {
     setMessages(newMsgs);
     setInput('');
     setIsStreaming(true);
+    setHasResponseStarted(false);
     setStreamThinking('');
     setPendingQuestions([]);
     setAgentTasks([]);
@@ -467,6 +477,7 @@ export default function Conversations() {
       });
 
       if (!res.ok) {
+        setHasResponseStarted(true);
         const errMsg: ChatMessage = { role: 'assistant', content: `API 错误: ${res.status}`, timestamp: Date.now() };
         const finalMsgs = [...newMsgs, errMsg];
         setMessages(finalMsgs);
@@ -495,12 +506,14 @@ export default function Conversations() {
           try {
             const data = JSON.parse(line.slice(6));
             if (data.type === 'delta') {
+              setHasResponseStarted(true);
               if (data.thinking) { thinking += data.text || ''; setStreamThinking(thinking); }
               else {
                 text += data.text || '';
                 setMessages(withAssistantDraft(newMsgs, text, assistantTimestamp));
               }
             } else if (data.type === 'result') {
+              setHasResponseStarted(true);
               const content = data.text || text || thinking || '';
               setStreamThinking('');
               const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
@@ -508,6 +521,7 @@ export default function Conversations() {
               const sid = await persistSession(finalMsgs, activeSessionId, data.sdkSessionId, data.sdkCwd);
               if (sid) setActiveSessionId(sid);
             } else if (data.type === 'permission_request') {
+              setHasResponseStarted(true);
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
                 title: data.title, displayName: data.displayName, description: data.description,
@@ -516,6 +530,7 @@ export default function Conversations() {
             } else if (data.type === 'permission_resolved') {
               if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (data.type === 'ask_user_question') {
+              setHasResponseStarted(true);
               setPendingQuestions(prev => [...prev, {
                 reqId: data.reqId,
                 questions: data.questions || [],
@@ -524,8 +539,10 @@ export default function Conversations() {
             } else if (data.type === 'ask_user_question_resolved') {
               if (data.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
             } else if (String(data.type || '').startsWith('task_')) {
+              setHasResponseStarted(true);
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
             } else if (data.type === 'error') {
+              setHasResponseStarted(true);
               setStreamThinking('');
               const finalMsgs = withAssistantDraft(newMsgs, `错误: ${data.message}`, assistantTimestamp);
               setMessages(finalMsgs);
@@ -536,6 +553,7 @@ export default function Conversations() {
         }
       }
     } catch (e) {
+      setHasResponseStarted(true);
       const err: ChatMessage = { role: 'assistant', content: `连接失败: ${(e as Error).message}`, timestamp: Date.now() };
       const finalMsgs = [...newMsgs, err];
       setMessages(finalMsgs);
@@ -802,7 +820,7 @@ export default function Conversations() {
                 </div>
               )}
               {streamThinking && <div className="chat-msg thinking">{streamThinking}</div>}
-              {isStreaming && !streamThinking && !hasTrailingAssistantMessage(messages) && (
+              {isStreaming && !hasResponseStarted && (
                 <div className="chat-msg assistant pulse">...</div>
               )}
               <div ref={bottomRef} />
