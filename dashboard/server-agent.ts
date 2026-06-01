@@ -11,6 +11,7 @@ import {
   type HookCallbackMatcher,
   type HookEvent,
   type PermissionResult,
+  type SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { evaluateHookRules, evaluatePermissionRules, listHookRules, listProtectedSdkCwds, recordAgentRun } from './server-store.ts';
@@ -255,6 +256,10 @@ export type AgentEvent =
 
 export interface RunAgentOptions {
   prompt: string;
+  promptImages?: Array<{
+    mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+    data: string;
+  }>;
   systemPrompt?: string;
   model: string;
   baseUrl?: string;
@@ -267,6 +272,8 @@ export interface RunAgentOptions {
   subagents?: Record<string, AgentDefinition>;
   /** Structured output JSON Schema — when set, SDK returns structured_output alongside text. */
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
+  /** Snapshot files before edits so /rewind can restore them. */
+  enableFileCheckpointing?: boolean;
   maxTurns?: number;
   cwd?: string;
   resumeSdkSessionId?: string;
@@ -417,6 +424,30 @@ function buildFallbackAnswers(questions: AskUserQuestionItem[]) {
   return answers;
 }
 
+async function* buildUserPromptStream(text: string, images: NonNullable<RunAgentOptions['promptImages']>): AsyncIterable<SDKUserMessage> {
+  const content: any[] = [];
+  const cleanText = text.trim();
+  if (cleanText) content.push({ type: 'text', text: cleanText });
+  for (const image of images) {
+    content.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: image.mediaType,
+        data: image.data,
+      },
+    });
+  }
+  yield {
+    type: 'user',
+    message: {
+      role: 'user',
+      content,
+    },
+    parent_tool_use_id: null,
+  };
+}
+
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
   const cwd = opts.cwd || path.join('/tmp', `agentma-run-${opts.tenantId}-${Date.now()}`);
   fs.mkdirSync(cwd, { recursive: true });
@@ -521,8 +552,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   let inTok = 0, outTok = 0, finalText = '', status = 'success', sdkSessionId = opts.resumeSdkSessionId || '', structuredOutput: unknown = undefined;
 
   try {
+    const queryPrompt = opts.promptImages?.length
+      ? buildUserPromptStream(opts.prompt, opts.promptImages)
+      : opts.prompt;
     for await (const msg of query({
-      prompt: opts.prompt,
+      prompt: queryPrompt,
       options: {
         model: opts.model,
         permissionMode: 'default',  // canUseTool decides everything
@@ -533,6 +567,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         ...(agentNames.length ? { agents: opts.subagents, forwardSubagentText: true, agentProgressSummaries: true } : {}),
         ...(opts.resumeSdkSessionId ? { resume: opts.resumeSdkSessionId } : {}),
         ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
+        ...(opts.enableFileCheckpointing ? { enableFileCheckpointing: true } : {}),
         settingSources: [],
         env,
         ...(hooks ? { hooks, includeHookEvents: true } : {}),

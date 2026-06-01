@@ -53,7 +53,7 @@ import {
 
 const app = express();
 app.use(cors({ origin: true }));
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 // 生产模式：serve 前端静态文件
 app.use(express.static(path.join(import.meta.dirname, 'dist')));
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
@@ -98,6 +98,44 @@ function normalizeSubagents(value: unknown): Record<string, AgentDefinition> | u
     return [[agentName, agent] as const];
   });
   return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+type ChatImageMimeType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+type ChatImageInput = {
+  mediaType: ChatImageMimeType;
+  data: string;
+  size: number;
+};
+
+const CHAT_IMAGE_MIME_TYPES = new Set<ChatImageMimeType>(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const MAX_CHAT_IMAGES = 4;
+const MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024;
+
+function base64SizeBytes(data: string) {
+  const clean = data.replace(/\s/g, '');
+  const padding = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((clean.length * 3) / 4) - padding);
+}
+
+function normalizeChatImages(value: unknown): { images: ChatImageInput[]; error?: string } {
+  if (!Array.isArray(value)) return { images: [] };
+  if (value.length > MAX_CHAT_IMAGES) return { images: [], error: `最多一次发送 ${MAX_CHAT_IMAGES} 张图片` };
+
+  const images: ChatImageInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') return { images: [], error: '图片附件格式无效' };
+    const raw = item as Record<string, unknown>;
+    const mediaType = String(raw.mediaType || '') as ChatImageMimeType;
+    const data = String(raw.data || '').replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '');
+    if (raw.type !== 'image' || !CHAT_IMAGE_MIME_TYPES.has(mediaType)) {
+      return { images: [], error: '仅支持 PNG、JPEG、GIF、WebP 图片' };
+    }
+    if (!/^[A-Za-z0-9+/=\s]+$/.test(data)) return { images: [], error: '图片 base64 数据无效' };
+    const size = Number(raw.size) || base64SizeBytes(data);
+    if (size > MAX_CHAT_IMAGE_BYTES) return { images: [], error: '单张图片不能超过 5MB' };
+    images.push({ mediaType, data, size });
+  }
+  return { images };
 }
 
 app.get('/api/events/health', (_req, res) => res.json({ ok: true }));
@@ -223,24 +261,33 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const subagents = normalizeSubagents(req.body?.subagents);
   const resumeSdkSessionId = typeof req.body?.sdkSessionId === 'string' ? req.body.sdkSessionId.trim() : '';
   const sdkCwd = typeof req.body?.sdkCwd === 'string' ? req.body.sdkCwd.trim() : '';
+  const enableFileCheckpointing = req.body?.enableFileCheckpointing === true;
 
   // Fold multi-turn history into systemPrompt so the model sees prior context.
   // When an SDK transcript id is available, resume that transcript and send
   // only the latest turn to avoid duplicating history.
   let runPrompt = '';
+  let promptImages: ChatImageInput[] = [];
   let effectiveSystemPrompt = typeof systemPrompt === 'string' ? systemPrompt : '';
   if (Array.isArray(inputMessages) && inputMessages.length) {
-    const filtered: Array<{ role: string; content: string }> = [];
+    const filtered: Array<{ role: string; content: string; images: ChatImageInput[] }> = [];
     for (const m of inputMessages) {
       const c = typeof m?.content === 'string' ? m.content : '';
-      if (!c) continue;
       if (c.includes('"type":"tool_use"') || c.includes('"type":"tool_result"') || c.startsWith('[{')) continue;
-      filtered.push({ role: String(m.role || 'user'), content: c });
+      const normalizedImages = normalizeChatImages(m?.attachments);
+      if (normalizedImages.error) { res.status(400).json({ error: normalizedImages.error }); return; }
+      if (!c.trim() && normalizedImages.images.length === 0) continue;
+      filtered.push({ role: String(m.role || 'user'), content: c, images: normalizedImages.images });
     }
     if (!filtered.length) { res.status(400).json({ error: 'no usable messages' }); return; }
-    runPrompt = filtered[filtered.length - 1].content;
+    const latest = filtered[filtered.length - 1];
+    runPrompt = latest.content.trim() || '请分析这些图片。';
+    promptImages = latest.role === 'user' ? latest.images : [];
     if (!resumeSdkSessionId && filtered.length > 1) {
-      const history = filtered.slice(0, -1).map(m => `${m.role}: ${m.content}`).join('\n\n');
+      const history = filtered.slice(0, -1).map(m => {
+        const imageNote = m.images.length ? `\n[${m.role} sent ${m.images.length} image(s)]` : '';
+        return `${m.role}: ${m.content}${imageNote}`;
+      }).join('\n\n');
       effectiveSystemPrompt = [effectiveSystemPrompt, `[Conversation history]\n${history}`].filter(Boolean).join('\n\n');
     }
   } else if (typeof prompt === 'string' && prompt.trim()) {
@@ -266,6 +313,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
 
   await runAgent({
     prompt: runPrompt,
+    promptImages,
     systemPrompt: effectiveSystemPrompt || undefined,
     model: provider?.ANTHROPIC_MODEL || 'deepseek-chat',
     baseUrl: provider?.ANTHROPIC_BASE_URL,
@@ -275,6 +323,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     subagents,
     cwd: sdkCwd || undefined,
     resumeSdkSessionId: resumeSdkSessionId || undefined,
+    enableFileCheckpointing: enableFileCheckpointing || undefined,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
     emit,
@@ -613,6 +662,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
     tools: Array.isArray(tmpl?.tools) ? tmpl.tools : undefined,
     subagents,
     outputFormat: tmpl?.outputSchema ? { type: 'json_schema', schema: tmpl.outputSchema } : undefined,
+    enableFileCheckpointing: tmpl?.enableFileCheckpointing === true || undefined,
     maxTurns: Number(tmpl?.maxTurns) || 20,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,

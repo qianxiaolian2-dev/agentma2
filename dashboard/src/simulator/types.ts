@@ -399,6 +399,8 @@ export interface AgentTemplate {
   providerOverrides?: Partial<ProviderConfig>;
   // 结构化输出 JSON Schema (可选)
   outputSchema?: Record<string, unknown>;
+  // 文件检查点：编辑前快照文件，支持 /rewind 回滚
+  enableFileCheckpointing?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -445,8 +447,11 @@ export interface ChatImageAttachment {
 }
 
 export interface ChatMessage {
+  id?: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  thinking?: string;
+  status?: 'pending' | 'streaming' | 'complete' | 'error';
   attachments?: ChatImageAttachment[];
   timestamp: number;
 }

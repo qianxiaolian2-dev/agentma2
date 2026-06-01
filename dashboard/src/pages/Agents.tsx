@@ -480,6 +480,19 @@ export default function Agents() {
               </div>
             </details>
 
+            {/* 文件检查点 */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <input
+                type="checkbox"
+                checked={Boolean(form.enableFileCheckpointing)}
+                onChange={e => setForm({ ...form, enableFileCheckpointing: e.target.checked || undefined })}
+                style={{ width: 'auto' }}
+              />
+              <span style={{ fontSize: '.85em' }}>
+                enableFileCheckpointing — 编辑前快照文件，支持 /rewind 回滚
+              </span>
+            </label>
+
             {/* 工具选择 */}
             <div className="form-group">
               <label>启用的工具 (tools: string[]) — 已选 {form.tools.length} 个</label>

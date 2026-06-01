@@ -10,7 +10,7 @@ import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../compo
 import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
-import { withAssistantDraft } from '../utils/chat-stream-draft';
+import { appendAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
 import JsonViewer from '../components/common/JsonViewer';
 
 function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
@@ -148,6 +148,7 @@ export default function AgentChat() {
     };
     const newMessages = [...messages, userMsg];
     const assistantTimestamp = Date.now();
+    const draftId = crypto.randomUUID();
     setMessages(newMessages);
     setInput('');
     setIsStreaming(true);
@@ -168,6 +169,7 @@ export default function AgentChat() {
           provider: provider.current,
           tools: buildRequestToolsForAgent(template),
           subagents: template.subagents,
+          enableFileCheckpointing: template.enableFileCheckpointing || undefined,
           sdkSessionId: sessionMeta?.sdkSessionId,
           sdkCwd: sessionMeta?.sdkCwd,
         }),
@@ -209,13 +211,16 @@ export default function AgentChat() {
           try {
             const data = JSON.parse(json);
             if (data.type === 'delta') {
-              setHasResponseStarted(true);
+              if (!hasResponseStarted) {
+                setHasResponseStarted(true);
+                setMessages(appendAssistantDraft(newMessages, draftId, assistantTimestamp));
+              }
               if (data.thinking) {
                 thinking += data.text || '';
                 setStreamThinking(thinking);
               } else {
                 text += data.text || '';
-                setMessages(withAssistantDraft(newMessages, text, assistantTimestamp));
+                setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
               }
             } else if (data.type === 'result') {
               setHasResponseStarted(true);
@@ -224,7 +229,7 @@ export default function AgentChat() {
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              const finalMessages = withAssistantDraft(newMessages, finalContent, assistantTimestamp);
+              const finalMessages = [...newMessages, { id: draftId, role: 'assistant' as const, content: finalContent, status: 'complete' as const, timestamp: assistantTimestamp }];
               setMessages(finalMessages);
               await persistSession(finalMessages, data.sdkSessionId, data.sdkCwd);
             } else if (data.type === 'permission_request') {
@@ -251,7 +256,7 @@ export default function AgentChat() {
             } else if (data.type === 'error') {
               setHasResponseStarted(true);
               setStreamThinking('');
-              const finalMessages = withAssistantDraft(newMessages, `错误: ${data.message}`, assistantTimestamp);
+              const finalMessages = [...newMessages, { id: draftId, role: 'assistant' as const, content: `错误: ${data.message}`, status: 'error' as const, timestamp: assistantTimestamp }];
               setMessages(finalMessages);
               await persistSession(finalMessages);
             }

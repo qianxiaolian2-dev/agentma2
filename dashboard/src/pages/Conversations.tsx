@@ -10,7 +10,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
-import { withAssistantDraft } from '../utils/chat-stream-draft';
+import { appendAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
 import JsonViewer from '../components/common/JsonViewer';
 import {
   bootstrapChatSessions,
@@ -134,6 +134,7 @@ export default function Conversations() {
     const eventMsg: ChatMessage = { role: 'user', content: eventText, timestamp: Date.now() };
     const newMsgs = [...currentMsgs, eventMsg];
     const assistantTimestamp = Date.now();
+    const draftId0 = crypto.randomUUID();
     setMessages(newMsgs);
     setStreamThinking('');
     setPendingQuestions([]);
@@ -151,6 +152,7 @@ export default function Conversations() {
           provider: prov,
           tools: buildRequestToolsForAgent(agent),
           subagents: agent.subagents,
+          enableFileCheckpointing: agent.enableFileCheckpointing || undefined,
           sdkSessionId: sessions.find((session) => session.id === activeSessionId)?.sdkSessionId,
           sdkCwd: sessions.find((session) => session.id === activeSessionId)?.sdkCwd,
         }),
@@ -168,11 +170,14 @@ export default function Conversations() {
             try {
               const d = JSON.parse(line.slice(6));
               if (d.type === 'delta') {
-                setHasResponseStarted(true);
+                if (!hasResponseStarted) {
+                  setHasResponseStarted(true);
+                  setMessages(appendAssistantDraft(newMsgs, draftId0, assistantTimestamp));
+                }
                 if (d.thinking) { thinking += d.text || ''; setStreamThinking(thinking); }
                 else {
                   text += d.text || '';
-                  setMessages(withAssistantDraft(newMsgs, text, assistantTimestamp));
+                  setMessages(prev => updateAssistantDraft(prev, draftId0, { content: text, status: 'streaming' }));
                 }
               } else if (d.type === 'result') {
                 setHasResponseStarted(true);
@@ -180,7 +185,7 @@ export default function Conversations() {
                 if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
                 if (d.cost_usd !== undefined || d.duration_ms !== undefined)
                   setRunStats({ costUsd: d.cost_usd, durationMs: d.duration_ms, inTok: d.usage?.input_tokens, outTok: d.usage?.output_tokens });
-                const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
+                const finalMsgs = [...newMsgs, { id: draftId0, role: 'assistant' as const, content, status: 'complete' as const, timestamp: assistantTimestamp }];
                 setStreamThinking('');
                 setMessages(finalMsgs);
                 const sid = await (persistRef.current?.(finalMsgs, activeSessionId, d.sdkSessionId, d.sdkCwd) || Promise.resolve(''));
@@ -461,6 +466,7 @@ export default function Conversations() {
     const userMsg: ChatMessage = { role: 'user', content: input.trim(), timestamp: Date.now() };
     const newMsgs = [...messages, userMsg];
     const assistantTimestamp = Date.now();
+    const draftId = crypto.randomUUID();
     setMessages(newMsgs);
     setInput('');
     setIsStreaming(true);
@@ -481,6 +487,7 @@ export default function Conversations() {
           provider: provider.current,
           tools: buildRequestToolsForAgent(currentAgent),
           subagents: currentAgent.subagents,
+          enableFileCheckpointing: currentAgent.enableFileCheckpointing || undefined,
           sdkSessionId: activeSessionId ? sessions.find((session) => session.id === activeSessionId)?.sdkSessionId : undefined,
           sdkCwd: activeSessionId ? sessions.find((session) => session.id === activeSessionId)?.sdkCwd : undefined,
         }),
@@ -516,11 +523,14 @@ export default function Conversations() {
           try {
             const data = JSON.parse(line.slice(6));
             if (data.type === 'delta') {
-              setHasResponseStarted(true);
+              if (!hasResponseStarted) {
+                setHasResponseStarted(true);
+                setMessages(appendAssistantDraft(newMsgs, draftId, assistantTimestamp));
+              }
               if (data.thinking) { thinking += data.text || ''; setStreamThinking(thinking); }
               else {
                 text += data.text || '';
-                setMessages(withAssistantDraft(newMsgs, text, assistantTimestamp));
+                setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
               }
             } else if (data.type === 'result') {
               setHasResponseStarted(true);
@@ -529,7 +539,7 @@ export default function Conversations() {
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
+              const finalMsgs = [...newMsgs, { id: draftId, role: 'assistant' as const, content, status: 'complete' as const, timestamp: assistantTimestamp }];
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId, data.sdkSessionId, data.sdkCwd);
               if (sid) setActiveSessionId(sid);
@@ -557,7 +567,7 @@ export default function Conversations() {
             } else if (data.type === 'error') {
               setHasResponseStarted(true);
               setStreamThinking('');
-              const finalMsgs = withAssistantDraft(newMsgs, `错误: ${data.message}`, assistantTimestamp);
+              const finalMsgs = [...newMsgs, { id: draftId, role: 'assistant' as const, content: `错误: ${data.message}`, status: 'error' as const, timestamp: assistantTimestamp }];
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId);
               if (sid) setActiveSessionId(sid);
