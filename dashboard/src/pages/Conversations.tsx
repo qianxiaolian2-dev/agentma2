@@ -174,6 +174,23 @@ export default function Conversations() {
     setStructuredOutput(null);
     setRunStats(null);
 
+    let thinking = '';
+    let text = '';
+    let didFinalize = false;
+    const persistFinalMessage = async (
+      content: string,
+      status: NonNullable<ChatMessage['status']>,
+      sdkSessionId?: string,
+      sdkCwd?: string,
+    ) => {
+      if (didFinalize) return;
+      didFinalize = true;
+      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId0, assistantTimestamp, content, status, thinking || undefined);
+      setMessages(finalMsgs);
+      const sid = await (persistRef.current?.(finalMsgs, activeSessionId, sdkSessionId, sdkCwd) || Promise.resolve(''));
+      if (sid) setActiveSessionId(sid);
+    };
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -190,58 +207,75 @@ export default function Conversations() {
         }),
       });
 
-      if (res.ok) {
-        const reader = res.body?.getReader(); if (!reader) { setIsStreaming(false); return; }
-        const dec = new TextDecoder(); let buf = ''; let thinking = ''; let text = '';
-        while (true) {
-          const { done, value } = await reader.read(); if (done) break;
-          buf += dec.decode(value, { stream: true });
-          const lines = buf.split('\n'); buf = lines.pop() || '';
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue;
-            try {
-              const d = JSON.parse(line.slice(6));
-              if (d.type === 'delta') {
-                if (d.thinking) {
-                  thinking += d.text || '';
-                  setMessages(prev => updateAssistantDraft(prev, draftId0, { thinking, status: 'streaming' }));
-                } else {
-                  text += d.text || '';
-                  setMessages(prev => updateAssistantDraft(prev, draftId0, { content: text, status: 'streaming' }));
-                }
-              } else if (d.type === 'result') {
-                const content = d.text || text || '';
-                if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
-                if (d.cost_usd !== undefined || d.duration_ms !== undefined)
-                  setRunStats({ costUsd: d.cost_usd, durationMs: d.duration_ms, inTok: d.usage?.input_tokens, outTok: d.usage?.output_tokens });
-                const finalMsgs = finalizeAssistantDraft(newMsgs, draftId0, assistantTimestamp, content, 'complete', thinking || undefined);
-                setMessages(finalMsgs);
-                const sid = await (persistRef.current?.(finalMsgs, activeSessionId, d.sdkSessionId, d.sdkCwd) || Promise.resolve(''));
-                if (sid) setActiveSessionId(sid);
-              } else if (d.type === 'permission_request') {
-                setPendingPermissions(prev => [...prev, {
-                  reqId: d.reqId, toolName: d.toolName, input: d.input,
-                  title: d.title, displayName: d.displayName, description: d.description,
-                  toolUseID: d.toolUseID,
-                }]);
-              } else if (d.type === 'permission_resolved') {
-                if (d.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
-              } else if (d.type === 'ask_user_question') {
-                setPendingQuestions(prev => [...prev, {
-                  reqId: d.reqId,
-                  questions: d.questions || [],
-                  toolUseID: d.toolUseID,
-                }]);
-              } else if (d.type === 'ask_user_question_resolved') {
-                if (d.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== d.reqId));
-              } else if (String(d.type || '').startsWith('task_')) {
-                setAgentTasks(prev => mergeAgentTaskEvent(prev, d));
+      if (!res.ok) {
+        await persistFinalMessage(`API 错误: ${res.status}`, 'error');
+        setIsStreaming(false);
+        return;
+      }
+
+      const reader = res.body?.getReader();
+      if (!reader) {
+        await persistFinalMessage('连接失败: 响应体为空', 'error');
+        setIsStreaming(false);
+        return;
+      }
+
+      const dec = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const d = JSON.parse(line.slice(6));
+            if (d.type === 'delta') {
+              if (d.thinking) {
+                thinking += d.text || '';
+                setMessages(prev => updateAssistantDraft(prev, draftId0, { thinking, status: 'streaming' }));
+              } else {
+                text += d.text || '';
+                setMessages(prev => updateAssistantDraft(prev, draftId0, { content: text, status: 'streaming' }));
               }
-            } catch {}
-          }
+            } else if (d.type === 'result') {
+              const content = text || d.text || '';
+              if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
+              if (d.cost_usd !== undefined || d.duration_ms !== undefined)
+                setRunStats({ costUsd: d.cost_usd, durationMs: d.duration_ms, inTok: d.usage?.input_tokens, outTok: d.usage?.output_tokens });
+              await persistFinalMessage(content, 'complete', d.sdkSessionId, d.sdkCwd);
+            } else if (d.type === 'permission_request') {
+              setPendingPermissions(prev => [...prev, {
+                reqId: d.reqId, toolName: d.toolName, input: d.input,
+                title: d.title, displayName: d.displayName, description: d.description,
+                toolUseID: d.toolUseID,
+              }]);
+            } else if (d.type === 'permission_resolved') {
+              if (d.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
+            } else if (d.type === 'ask_user_question') {
+              setPendingQuestions(prev => [...prev, {
+                reqId: d.reqId,
+                questions: d.questions || [],
+                toolUseID: d.toolUseID,
+              }]);
+            } else if (d.type === 'ask_user_question_resolved') {
+              if (d.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== d.reqId));
+            } else if (String(d.type || '').startsWith('task_')) {
+              setAgentTasks(prev => mergeAgentTaskEvent(prev, d));
+            } else if (d.type === 'error') {
+              await persistFinalMessage(`错误: ${d.message}`, 'error');
+            }
+          } catch {}
         }
       }
-    } catch {}
+      if (!didFinalize) {
+        await persistFinalMessage(text || '连接失败: 响应提前结束', text ? 'complete' : 'error');
+      }
+    } catch (error) {
+      await persistFinalMessage(`连接失败: ${(error as Error).message}`, 'error');
+    }
     setIsStreaming(false);
   }, [currentAgent, isStreaming, activeSessionId, messages, sessions]);
 
@@ -557,6 +591,23 @@ export default function Conversations() {
     setStructuredOutput(null);
     setRunStats(null);
 
+    let thinking = '';
+    let text = '';
+    let didFinalize = false;
+    const persistFinalMessage = async (
+      finalContent: string,
+      status: NonNullable<ChatMessage['status']>,
+      sdkSessionId?: string,
+      sdkCwd?: string,
+    ) => {
+      if (didFinalize) return;
+      didFinalize = true;
+      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, finalContent, status, thinking || undefined);
+      setMessages(finalMsgs);
+      const sid = await persistSession(finalMsgs, activeSessionId, sdkSessionId, sdkCwd);
+      if (sid) setActiveSessionId(sid);
+    };
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -574,22 +625,20 @@ export default function Conversations() {
       });
 
       if (!res.ok) {
-        const errMsg: ChatMessage = { role: 'assistant', content: `API 错误: ${res.status}`, timestamp: Date.now() };
-        const finalMsgs = [...newMsgs, errMsg];
-        setMessages(finalMsgs);
-        const sid = await persistSession(finalMsgs, activeSessionId);
-        if (sid) setActiveSessionId(sid);
+        await persistFinalMessage(`API 错误: ${res.status}`, 'error');
         setIsStreaming(false);
         return;
       }
 
       const reader = res.body?.getReader();
-      if (!reader) { setIsStreaming(false); return; }
+      if (!reader) {
+        await persistFinalMessage('连接失败: 响应体为空', 'error');
+        setIsStreaming(false);
+        return;
+      }
 
       const decoder = new TextDecoder();
       let buf = '';
-      let thinking = '';
-      let text = '';
 
       while (true) {
         const { done, value } = await reader.read();
@@ -610,14 +659,11 @@ export default function Conversations() {
                 setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
               }
             } else if (data.type === 'result') {
-              const content = data.text || text || '';
+              const finalContent = text || data.text || '';
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, content, 'complete', thinking || undefined);
-              setMessages(finalMsgs);
-              const sid = await persistSession(finalMsgs, activeSessionId, data.sdkSessionId, data.sdkCwd);
-              if (sid) setActiveSessionId(sid);
+              await persistFinalMessage(finalContent, 'complete', data.sdkSessionId, data.sdkCwd);
             } else if (data.type === 'permission_request') {
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
@@ -637,20 +683,16 @@ export default function Conversations() {
             } else if (String(data.type || '').startsWith('task_')) {
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
             } else if (data.type === 'error') {
-              const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, `错误: ${data.message}`, 'error');
-              setMessages(finalMsgs);
-              const sid = await persistSession(finalMsgs, activeSessionId);
-              if (sid) setActiveSessionId(sid);
+              await persistFinalMessage(`错误: ${data.message}`, 'error');
             }
           } catch {}
         }
       }
+      if (!didFinalize) {
+        await persistFinalMessage(text || '连接失败: 响应提前结束', text ? 'complete' : 'error');
+      }
     } catch (e) {
-      const err: ChatMessage = { role: 'assistant', content: `连接失败: ${(e as Error).message}`, timestamp: Date.now() };
-      const finalMsgs = [...newMsgs, err];
-      setMessages(finalMsgs);
-      const sid = await persistSession(finalMsgs, activeSessionId);
-      if (sid) setActiveSessionId(sid);
+      await persistFinalMessage(`连接失败: ${(e as Error).message}`, 'error');
     }
     setIsStreaming(false);
   }, [input, attachments, isStreaming, currentAgent, messages, activeSessionId, persistSession, sessions]);

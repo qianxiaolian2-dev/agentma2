@@ -141,11 +141,15 @@ export default function AgentChat() {
   }, [messages, agentTasks]);
 
   const handleSend = useCallback(async () => {
-    if (!input.trim() || isStreaming || !template) return;
+    const content = input.trim();
+    const messageAttachments = attachments;
+    if ((!content && messageAttachments.length === 0) || isStreaming || !template) return;
 
     const userMsg: ChatMessage = {
-      role: 'user', content: input.trim(), timestamp: Date.now(),
-      attachments: attachments.length > 0 ? attachments : undefined,
+      role: 'user',
+      content,
+      timestamp: Date.now(),
+      ...(messageAttachments.length > 0 ? { attachments: messageAttachments } : {}),
     };
     const newMessages = [...messages, userMsg];
     const assistantTimestamp = Date.now();
@@ -158,6 +162,22 @@ export default function AgentChat() {
     setAgentTasks([]);
     setStructuredOutput(null);
     setRunStats(null);
+
+    let thinking = '';
+    let text = '';
+    let didFinalize = false;
+    const persistFinalMessage = async (
+      content: string,
+      status: NonNullable<ChatMessage['status']>,
+      sdkSessionId?: string,
+      sdkCwd?: string,
+    ) => {
+      if (didFinalize) return;
+      didFinalize = true;
+      const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, content, status, thinking || undefined);
+      setMessages(finalMessages);
+      await persistSession(finalMessages, sdkSessionId, sdkCwd);
+    };
 
     try {
       const res = await fetch('/api/chat', {
@@ -176,26 +196,20 @@ export default function AgentChat() {
       });
 
       if (!res.ok) {
-        const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, `API 错误: ${res.status}`, 'error');
-        setMessages(finalMessages);
-        await persistSession(finalMessages);
+        await persistFinalMessage(`API 错误: ${res.status}`, 'error');
         setIsStreaming(false);
         return;
       }
 
       const reader = res.body?.getReader();
       if (!reader) {
-        const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, '连接失败: 响应体为空', 'error');
-        setMessages(finalMessages);
-        await persistSession(finalMessages);
+        await persistFinalMessage('连接失败: 响应体为空', 'error');
         setIsStreaming(false);
         return;
       }
 
       const decoder = new TextDecoder();
       let buf = '';
-      let thinking = '';
-      let text = '';
 
       while (true) {
         const { done, value } = await reader.read();
@@ -223,9 +237,7 @@ export default function AgentChat() {
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, finalContent, 'complete', thinking || undefined);
-              setMessages(finalMessages);
-              await persistSession(finalMessages, data.sdkSessionId, data.sdkCwd);
+              await persistFinalMessage(finalContent, 'complete', data.sdkSessionId, data.sdkCwd);
             } else if (data.type === 'permission_request') {
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
@@ -245,17 +257,16 @@ export default function AgentChat() {
             } else if (String(data.type || '').startsWith('task_')) {
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
             } else if (data.type === 'error') {
-              const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, `错误: ${data.message}`, 'error', thinking || undefined);
-              setMessages(finalMessages);
-              await persistSession(finalMessages);
+              await persistFinalMessage(`错误: ${data.message}`, 'error');
             }
           } catch {}
         }
       }
+      if (!didFinalize) {
+        await persistFinalMessage(text || '连接失败: 响应提前结束', text ? 'complete' : 'error');
+      }
     } catch (e) {
-      const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, `连接失败: ${(e as Error).message}`, 'error');
-      setMessages(finalMessages);
-      await persistSession(finalMessages);
+      await persistFinalMessage(`连接失败: ${(e as Error).message}`, 'error');
     }
     setIsStreaming(false);
   }, [input, attachments, isStreaming, template, messages, persistSession]);

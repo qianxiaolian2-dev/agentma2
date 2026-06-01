@@ -479,6 +479,8 @@ label {
   border-bottom-left-radius: 4px;
 }
 
+.chat-msg.assistant:hover .copy-btn { opacity: 1; }
+
 .chat-msg.thinking {
   align-self: flex-start;
   background: transparent; color: var(--ink-muted);
