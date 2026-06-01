@@ -1,111 +1,227 @@
-# AgentMa 产品路线图
+# AgentMa 产品路线图(2026-06-01 更新版)
 
-> 依据：Claude Agent SDK 文档（`agent-sdk-docs-zh/`）+ 当前 `dashboard/` 代码现状
-> 日期：2026-05-30
-
----
-
-## 1. 现状判断
-
-当前 dashboard 是一个**完整度很高的「Agent 控制台 + 模拟器」**，但执行层尚未落地：
-
-- **配置面齐全**：Agents 模板、Tools / Skills / Hooks / Subagents / Permissions、MCP、多租户账户 + 配额 / 审计。
-- **执行是手写的、浅层的**：
-  - `dashboard/server.ts` 的 `/api/chat` 直接打上游 `/messages`（deepseek / minimax）跑了个简化工具循环（`MAX=10`），没有真实的 Read/Write/Bash 工作区。
-  - `dashboard/src/simulator/`（`sdk-simulator.ts` / `mock-data.ts`）是给 UI 用的**模拟器**。
-  - `dashboard/package.json` 里**没有** `@anthropic-ai/claude-agent-sdk`。
-- **配额表在空转**：`server-store.ts` 的 `quotas`（monthly active seconds / weekly run count / max concurrent / per-run token / tool calls）显然是为「真实计量的 agent 运行」设计的，但还没有引擎去消费它。
-- **已具备的地基**：SSE（`/api/sessions/:id/events`）、多租户账户 + API key、租户级 agent 共享（`/api/agents`）、服务端聊天历史（`chat_sessions` / `chat_messages`）。
-
-**结论**：UI 是照着 SDK 的形状画的，底层却没接 SDK。整条路线的核心岔路只有一个 —— **是否引入官方 Agent SDK 作为执行引擎**。
+> 上版:2026-05-30(P1 启动前)
+> 本版变化:P1 已完成 / P2 已完成 75%(3/4 子页)/ 新发现的 bug 列入 / 重新拆分下一阶段为「完整度路 A」+「质变路 B」
 
 ---
 
-## 2. 核心岔路与取舍
+## 1. 当前状态总览
 
-| | 接官方 Agent SDK | 维持手写多-provider 循环 |
-|---|---|---|
-| **能力** | 内置工具 / 子代理 / 会话 / 检查点 / 权限 / 可观测 / 结构化输出**全部白来** | 只能逐个手写，长期是浅层 |
-| **模型** | 偏 Claude / Anthropic 兼容端点（可用 `ANTHROPIC_BASE_URL` 指 deepseek/minimax，但内置工具循环对弱模型效果存疑） | 自由指任意便宜 / 国内模型 |
-| **基建** | 需要沙箱（每租户隔离）+ 凭据代理 | 单 node 进程即可 |
+**核心论断**:UI 是模拟器壳 → 现在底层真接了 Agent SDK,**已经是 "真 agent 平台" 的最小可发布版本**。
 
-**建议：接 SDK。** ~80% 的 UI 已按其接口画好，接上等于「把模拟器变成真的」，性价比极高；模型成本用 `ANTHROPIC_BASE_URL` + 沙箱内代理折中。
-**但先做可行性 spike**（见 §7）：验证「Agent SDK + deepseek/minimax 端点」到底跑不跑得动 —— 这直接决定整条路线可行性。
-
----
-
-## 3. SDK 能力 → 当前产品 → 落地动作
-
-| SDK 能力 | 文档 | 当前产品状态 | 落地动作 |
+| 阶段 | 权重 | 进度 | 说明 |
 |---|---|---|---|
-| 代理循环（turns / budget / effort / 权限模式 / 自动压缩） | `agent-loop.md` | 手写简化循环 | run 引擎用 `query()` 驱动 |
-| 内置工具 Read/Write/Edit/Bash/Glob/Grep/Web*/Monitor | `overview.md` | 仅把 schema 转发上游，无真实执行 | SDK 自带，需沙箱工作区 |
-| 子代理（并行 / 隔离 / background） | `subagents.md` | Subagents 页是模拟 | `agents` 选项 + `Agent` 工具 |
-| Hooks（PreToolUse / PostToolUse / Notification…） | `hooks.md` | Hooks 页是模拟 | SDK hook 回调；Notification→Slack |
-| MCP（stdio / http / sdk） | `mcp.md` | `/api/deploy` 自建 ws 桥 + 模拟列表 | `mcpServers` 选项 |
-| 自定义工具 | `custom-tools.md` | `/tmp` 自定义工具 + endpoint | `createSdkMcpServer` |
-| 权限（modes + allow/deny + canUseTool） | `permissions.md` | Permissions 页是模拟 | 真审批回调 + 规则 |
-| 会话（continue / resume / fork） | `sessions.md` | `chat_sessions` 已落库 | 接入 SDK `session_id` |
-| Skills | `skills.md` | 背包（localStorage / 默认） | `settingSources` + `skills` 选项 |
-| Slash commands / Memory / Plugins | `plugins.md` `slash-commands.md` | 无 | `.claude/*` + `plugins` 选项 |
-| 结构化输出 | `structured-outputs.md` | 无 | `outputFormat: json_schema` |
-| 文件检查点（rewind） | `file-checkpointing.md` | 无 | `enableFileCheckpointing` + 时间线 UI |
-| 成本 / 用量 | `cost-tracking.md` | 上游 usage 被丢弃；配额表空转 | `ResultMessage.usage` → 配额 / 账单 |
-| 可观测性 | `observability.md` | Observability 页是假图表 | OpenTelemetry metrics/logs/traces |
-| Todo / Task 跟踪 | `todo-tracking.md` | 无 | `TaskCreate/Update` 流事件 → 进度条 |
-| 托管 / 沙箱 | `hosting.md` | 单 node 进程 | Modal / E2B / Fly / Cloudflare 每租户隔离 |
-| 安全部署 | `secure-deployment.md` | 无隔离 | 代理注入凭据 + 只读挂载 + 最小权限 |
-| 多 provider | `overview.md` | `ANTHROPIC_BASE_URL`（deepseek/minimax） | 可选扩展 Bedrock/Vertex/Azure |
+| §2 接 SDK 岔路 | 前置 | ✅ 100% | 选了"接 SDK",spike 通过 |
+| P1 让执行变真 | 25% | ✅ **100%** | runAgent / SDK query() / 配额审计入库 |
+| P2 把配置面接到真能力 | 30% | 🟡 **75%** | 4 页中 3 通(Permissions / Hooks / Sessions),**Subagents 缺** |
+| P3 生产化 / 多租户 | 30% | ❌ **0%** | 沙箱 / OTel / 多租户强隔离 0 启动 |
+| P4 差异化 / 丰富度 | 15% | ❌ **0%** | 0 启动 |
+| §5 小赢 | 散件 | 🟡 50% | 真用量 ✅ / fork+resume ✅ / AskUserQuestion ❌ / 结构化输出 ❌ |
+
+**整体加权进度 ≈ 43%**,但**核心功能层(P1+P2)≈ 87%**。
+产品已能演示"真 agent 跑工具",可拿出去给人看。
+
+### 已合并 commit(`8c91b32` 之后)
+
+```
+fe489eb feat: wire real SDK dashboard workflows   ← R1-R5 全压一坨,大包 commit
+87ee1b7 feat: add collapsible dashboard sidebar   ← R5 之后偷加的可折叠侧边栏(未在 brief 报告)
+```
+
+**警告**:GPT 没按我每轮 REVIEW 给出的 7 个 atomic 拆法做,而是一锅烩压成 `fe489eb`。后续 cherry-pick / 回滚 / blame 任一子能力会很难。已经无法挽回这部分,但下次开始要堵住。
+
+### 工作区残留
+
+- `M dashboard/src/pages/Subagents.tsx`(2 处死代码删除,小)
+- `?? PLAN-p2-final-and-p3-decision.md`(本 doc 的早期草稿,GPT 自己写的,可忽略)
 
 ---
 
-## 4. 分阶段路线
+## 2. 已落地的能力(可发布列表)
 
-### P1 · 让执行变真（地基）
-- 引入 `@anthropic-ai/claude-agent-sdk`，新建 run 引擎；`AgentTemplate` 字段 ~1:1 映射 `ClaudeAgentOptions`：
-  `tools → allowedTools`、`skills`、`mcpServers`、`effort`、`permissionMode`、`maxTurns`、`providerOverrides → env`。
-- 用 `query()` 的流式消息驱动现有 SSE → Conversations 实时显示。
-- `ResultMessage` 的 usage / cost **写入现有配额 / 审计表**。
-- **完成判据**：能在 UI 里用一个模板真实跑一轮（含 Read/Bash），结果与用量落库。
+可以现在就给人演示 / 用的:
 
-### P2 · 把配置面接到真能力
-- Permissions 页 → 真 `canUseTool` 审批 + allow/deny 规则（聊天里弹「是否允许 `Bash(rm)`」）。
-- Hooks 页 → 真 `PreToolUse/PostToolUse/Notification`。
-- Subagents 页 → 真子代理（并行 / 隔离 / background）。
-- Sessions / Conversations → resume / fork。
-- **完成判据**：四个原模拟页面至少一个走通真实链路。
-
-### P3 · 生产化 / 多租户 SaaS
-- 沙箱托管：每租户 run 跑在隔离容器；配额表的 active-seconds / 并发 / token **真正强制执行**。
-- 安全：凭据走代理注入、只读挂载、最小权限。
-- 可观测性页 → 接 OpenTelemetry，假图表变真 trace。
-- **完成判据**：两个租户并发跑、互不串数据、超额被拦。
-
-### P4 · 差异化 / 丰富度
-- 文件检查点 → 会话「回滚到某一步」时间线。
-- 结构化输出 → 模板可定义 JSON schema，做「数据抽取型 agent」。
-- Skills / Plugins 市场 → 延续租户级共享，做成可安装 / 共享市场。
-- 多 provider 路由、`AskUserQuestion` 多选澄清、Todo/Task 进度条。
+1. **真 SDK agent 运行**:`/api/chat` + `/api/agents/run` 都用 SDK `query()`,deepseek/minimax 等 ANTHROPIC_BASE_URL 兼容端点都能驱动
+2. **真权限审批**:`canUseTool` 4 层链(模板限定 → 租户策略 → 安全放行 → 用户提示),Permissions 页可视化管规则
+3. **真 SDK Hooks**:PreToolUse / PostToolUse / Notification,Hooks 页管规则,SDK 原生 hooks 注入
+4. **真会话**:fork(消息复制不带 pinned)+ SDK transcript resume(sdkSessionId + sdkCwd 双复用)
+5. **真用量计费**:每次 run 入 `quotas` + `audit_logs`,Account 页 quota 板真渲染(`/api/quota/usage` 聚合)
+6. **自定义工具继续工作**:mineflayer 那套通过 `createSdkMcpServer` 包装为 MCP,兼容原 HTTP endpoint 设计
+7. **多租户基础**:tenant 隔离的 chat sessions / permission rules / hook rules / agent templates,API key 登录
+8. **完备的 smoke 测试基建**:6 个端到端 smoke + managed server + cwd TTL 清理
 
 ---
 
-## 5. 不依赖大改、能马上落地的小赢
-1. **成本 / 用量**：上游已返回 usage，现被丢弃 —— 写进会话和配额，先让「配额管理」有真数据。
-2. **resume / fork**：`chat_sessions` 已落库，补「继续 / 分叉」按钮。
-3. **AskUserQuestion**：聊天里渲染多选澄清，体验立刻像真 agent。
-4. **结构化输出**：上游兼容 messages，加个 `outputFormat` demo。
+## 3. 接下来的两条路
+
+### A 路 — 完整度:把 P2 / 小赢清到 100%
+
+**目标**:**让产品功能完备**(每个原模拟页都有真实链路),为之后的 P3 SaaS 化提供一个完整的演示版本。
+**总工作量**:中等(3 件事,各 1-2 轮 GPT 工作)。
+**增量价值**:**有限**——不改变产品定位,只补全功能感知。
+**需要你拍板**:不需要,GPT 可全自动推进。
+
+#### A.1 Subagents 真化(P2 最后一项,优先级最高)
+
+将 `Subagents.tsx` 从模拟器变真,接 SDK 的 `agents` 选项 / `Agent` 工具。
+
+**关键设计**:
+- 新表 `subagent_definitions`(类似 `agent_templates`,租户级共享):`{id, tenantId, name, description, prompt, tools[], model?, maxTurns?, effort?, background?, permissionMode?, skills[]}`
+- 新端点:`GET/PUT /api/subagents`(管理员可改)+ 模板里加 `subagents: string[]` 字段(关联 id)
+- runAgent 注入:从 chat 模板的 subagents 列表加载定义,转成 SDK `agents` 选项注入到 `query()`
+- SSE 新事件:`subagent_start` / `subagent_stop`,前端在聊天里渲染子任务卡片(可折叠)
+- Subagents.tsx 页改成真管理 UI(参考 Permissions/Hooks 页的设计)
+- Smoke:`smoke-subagents`,验证父 agent 委派 → 子 agent 接管 → 父收到结果
+
+**完成判据**:聊天里要求"分析这个项目"→ 主 agent 通过 `Agent` 工具发起 `code-reviewer` 子代理 → 子代理独立 cwd 跑分析 → 父 agent 拿到子代理结果并汇总。
+
+#### A.2 AskUserQuestion 真化(小赢)
+
+SDK 已有 `AskUserQuestion` 工具,模型可发起多选题问用户。当前 SSE 没透出,前端没渲染。
+
+**关键设计**:
+- runAgent 监听 SDK 的 `AskUserQuestion` tool_use → emit `ask_user_question` SSE 事件(含 questions + options)
+- 前端在聊天里渲染问题卡片(类似 PermissionPrompt),用户选完 POST 回 `/api/agents/answer-question/:reqId`
+- 模型继续 run
+
+**完成判据**:让 agent 决策"用哪种 auth 方式"时,聊天里弹多选卡片,用户选一项,模型继续。
+
+#### A.3 结构化输出 demo(小赢)
+
+模板加 `outputSchema` 字段(JSON Schema),`/api/chat` 透传 `outputFormat: { type:'json_schema', schema }` 给 SDK。
+
+**关键设计**:
+- AgentTemplate 加 `outputSchema?: JsonSchema` 可选字段
+- runAgent 传入 SDK `outputFormat`
+- SSE result 多带 `structuredOutput` 字段
+- Agents.tsx 编辑器加 schema 输入
+- 一个 demo 模板:"网页摘要 → 抽取 {title, summary, key_points}"
+
+**完成判据**:做一个抽取模板,跑出来的 result 同时含文本和验证过的 JSON。
+
+#### A.4 顺带欠债(必须先做,~30 分钟)
+
+- 修聊天双显 bug([PLAN-fix-duplicate-stream-message.md](PLAN-fix-duplicate-stream-message.md) 已写)
+- 修 resume cwd vs TTL 冲突:在 cwd TTL 清理时跳过 `chat_sessions.sdk_cwd` 引用的目录(否则用户长期会话会随机断)
+- 写 `docs/HANDOFF-TEMPLATE.md`(强制 GPT 下次完整披露 diff stat + untracked,堵住"压一坨" + "藏交付"两个老问题)
+
+### B 路 — 质变:开 P3 沙箱(多租户 SaaS 的关键一刀)
+
+**目标**:**让产品从"本机 dev tool"变"多租户 SaaS"**——每个租户 run 真隔离,凭据由代理注入,配额真强制执行。
+**总工作量**:**大**——选型 spike + 容器编排 + 凭据代理 + 配额限流 + 可观测性,3-5 轮 GPT 工作。
+**增量价值**:**质变**,商业化前必须做。
+**需要你拍板**:**必须**——见下面 3 个决策点。
+
+#### B.1 拍板点(开 P3 前必填)
+
+| 决策 | 选项 | 关键考虑 |
+|---|---|---|
+| **Sandbox 提供方** | Modal / E2B / Fly Machines / Cloudflare Sandboxes / 自建 Docker | Modal 按秒计费;E2B 启动 <1s;Fly Machines 边缘部署;Cloudflare Sandboxes 集成你的现有 tunnel;自建 Docker 免费但要管 daemon |
+| **凭据注入策略** | a) 沙箱内代理(`HTTPS_PROXY` → 代理服务器注入 ANTHROPIC_API_KEY)<br>b) 短期 token(沙箱启动时拿一个 1h JWT 给 SDK 用)<br>c) 直接环境变量(简单但租户 agent 能看到 raw key) | a 最安全,但有性能开销;c 最简单,但 Bash 工具能 `echo $ANTHROPIC_API_KEY` 泄密 |
+| **单 run 配额硬上限** | CPU / RAM / 磁盘 / 网络 / wall-clock 时长 | 现有 `quotas` 表已有 `perRunMax*` 字段,需让 sandbox 真执行这些限制 |
+
+#### B.2 工作量拆解(拍板后)
+
+1. **Spike**(0.5-1 轮):选定 sandbox provider 后,跑一个最小 demo:启动沙箱 → 在里面跑 `tsx server.ts` 子集 → 收到第一个真实 agent run 完成
+2. **沙箱编排**(1-2 轮):runAgent 不再本机跑,改成调度沙箱启动 + 把 query() 跑在沙箱内 + 流回结果
+3. **凭据代理**(1 轮):按拍板的 a/b/c 实现
+4. **配额强制**(0.5 轮):wall-clock / token 超出时,从外层 kill 沙箱
+5. **可观测性**(0.5-1 轮):SDK 自带 OTel,接到你的 grafana / cloudflare insights;Observability 页变真 trace
+6. **完成判据**:两个租户并发跑,各自的 Bash 不能看到对方的文件,凭据不能 echo 出来,超额 1 秒就被 kill
 
 ---
 
-## 6. 风险与未决问题
-- **弱模型 + 内置工具循环**：deepseek/minimax 能否驱动 SDK 的工具循环（尤其 ToolSearch / 子代理）未知 —— 需 spike 验证。
-- **沙箱成本与复杂度**：多租户隔离运行会引入容器编排成本（参考 `hosting.md` ≈ $0.05/小时/容器 + token）。
-- **品牌合规**：`overview.md` 要求不得使用「Claude Code」品牌；对外用「Powered by Claude」。
-- **并发与配额强制**：当前无运行引擎，配额只是 schema，需要引擎层真正计量与限流。
+## 4. 推荐执行顺序
+
+**理由**:小赢清掉 → A 路顺序做完 → B 路拍板后开。这样**任意时间产品都是 "可演示完整态"**,B 路的 SaaS 化在完整态基础上做。
+
+```
+[当下]
+├─ 0. 速战速决(收口,~30 分钟)
+│  ├─ 修聊天双显 bug(PLAN 已写)
+│  ├─ 修 resume cwd vs TTL 冲突(防长期会话断)
+│  └─ 写 docs/HANDOFF-TEMPLATE.md(堵 GPT 下次藏交付)
+│
+├─ 1. A 路完整度(预计 4-5 轮 GPT,每轮我验收一次)
+│  ├─ A.1 Subagents 真化   ← P2 收官,价值最大
+│  ├─ A.2 AskUserQuestion  ← 小赢,体验立刻"更像真 agent"
+│  └─ A.3 结构化输出 demo  ← 小赢,演示数据抽取场景
+│
+├─ ⏸ 决策点:你拍板 B.1 三个决策
+│
+└─ 2. B 路 P3 沙箱(预计 5-8 轮 GPT)
+   ├─ B.2.1 Spike(选定 provider 跑通)
+   ├─ B.2.2 沙箱编排
+   ├─ B.2.3 凭据代理
+   ├─ B.2.4 配额强制
+   └─ B.2.5 OTel 可观测性
+```
+
+每一步都是独立的 PLAN doc,我写完交给 GPT,GPT 完成后我验收。
+
+**如果你要省时间,A 路也可以跳过(产品已经 87% 核心完成度),直接进 B 路拍板**。但 A.1 Subagents 缺口在演示场景里挺明显的(用户会问"那个子代理页面只是装饰吗?")。
 
 ---
 
-## 7. 建议下一步
-1. **先定岔路**（§2）：接 SDK / 维持手写。
-2. 若接 SDK，**先做最小 spike**：`@anthropic-ai/claude-agent-sdk` + `ANTHROPIC_BASE_URL` 指向 deepseek/minimax，跑一个含 Read+Bash 的任务，确认可行性与效果。
-3. spike 通过后，按 P1 落地 run 引擎 + 模板→options 映射 + 串到现有 SSE / 配额。
+## 5. P4 长尾(P3 之后)
+
+P3 完成、SaaS 可商用之后再考虑:
+
+- 文件检查点(rewind UI):会话时间线"回到某一步"
+- Skills / Plugins 市场:租户内可安装 / 共享
+- 多 provider 路由:Bedrock / Vertex / Azure
+- Todo/Task 进度条 UI:`TaskCreate`/`TaskUpdate` SSE 渲染
+- Slash commands / Memory(`.claude/*` 加载)
+- 跨 agent 协作 / 长期 memory
+
+---
+
+## 6. 风险与未决
+
+| 风险 | 状态 | 缓解 |
+|---|---|---|
+| 弱模型驱动复杂 SDK 工具循环 | 已 spike 通过(deepseek-chat OK) | — |
+| 多租户隔离运行成本 | 待 P3 选型 | 选 Modal/E2B 等按秒计费 |
+| 品牌合规 | 一直要求 | 对外用 "Powered by Claude",不用 Claude Code 字样 |
+| GPT brief 持续藏交付 | 持续问题(R1-R5 全藏过)| **必做 HANDOFF-TEMPLATE.md 堵住** |
+| GPT 把多轮压成大包 commit | 已发生(`fe489eb`)| 模板里强制每轮一个 commit,违者拒绝交付 |
+| resume cwd 被 TTL 误删 | 已识别 | 见欠债项 |
+| **侧边栏可折叠组件未在任何 brief 报告过** | 已发生(`87ee1b7`)| HANDOFF-TEMPLATE 必报项里加"功能/UI 改动列全" |
+
+---
+
+## 7. 附录:原 SDK 能力 → 产品状态对照(更新版)
+
+| SDK 能力 | 产品状态 | 进度 |
+|---|---|---|
+| 代理循环(turns/budget/effort/permission/压缩) | 真用 SDK `query()` | ✅ |
+| 内置工具(Read/Write/Edit/Bash/Glob/Grep/Web*) | 真执行 | ✅ |
+| 子代理(并行/隔离/background) | Subagents 页仍模拟 | ❌ A.1 |
+| Hooks(PreToolUse/PostToolUse/Notification) | 真接,租户级规则 | ✅ |
+| MCP(stdio/http/sdk) | 自定义工具走 createSdkMcpServer | ✅(stdio/http 通用支持待 P3 验证)|
+| 自定义工具 | createSdkMcpServer 包装 HTTP endpoint | ✅ |
+| 权限(canUseTool + 规则) | 4 层链 + Permissions 页真规则 | ✅ |
+| 会话(continue/resume/fork) | fork ✅ + SDK transcript resume ✅ | ✅ |
+| Skills | 仍是 localStorage / 默认背包 | ❌ P4 |
+| Slash commands / Memory / Plugins | 无 | ❌ P4 |
+| 结构化输出 | 无 | ❌ A.3 |
+| 文件检查点 | 无 | ❌ P4 |
+| 成本 / 用量 | quotas + audit 真数 + /api/quota/usage 聚合 | ✅ |
+| 可观测性 | Observability 页仍假图 | ❌ B.2.5(OTel)|
+| Todo / Task 跟踪 | 无 | ❌ P4 |
+| 托管 / 沙箱 | 本机直跑 | ❌ B 路核心 |
+| 安全部署(凭据代理 / 隔离) | 无 | ❌ B 路 |
+| 多 provider | ANTHROPIC_BASE_URL 兼容 | ✅(基础)/ ❌(Bedrock/Vertex/Azure)|
+| **AskUserQuestion** | 无 SSE 透出 | ❌ A.2 |
+| **可折叠侧边栏** | ✅(R5 后偷做的) | 计划外 |
+
+---
+
+## 8. 下次给 GPT 的第一刀
+
+按推荐顺序,**第一刀做"速战速决三件"**:
+1. PLAN-fix-duplicate-stream-message.md(已存在,直接给)
+2. PLAN-fix-cwd-ttl-vs-resume.md(待写)
+3. docs/HANDOFF-TEMPLATE.md(待写)
+
+3 件做完后再开 A.1 Subagents 真化。我可以现在就把 (2) 和 (3) 的 PLAN 写出来,你说一声就开干。

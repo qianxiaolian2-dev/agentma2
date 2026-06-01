@@ -1,7 +1,5 @@
 import { useState, useEffect } from 'react';
-import type { RateLimitInfo } from '../simulator/types';
-import { sdkSimulator } from '../simulator/sdk-simulator';
-import { generateStreamEvents } from '../simulator/mock-data';
+import { useAuth } from '../contexts/AuthContext';
 
 const OTEL_ENV_VARS = [
   { key: 'CLAUDE_CODE_ENABLE_TELEMETRY', value: '1', description: '启用遥测（必须设置）' },
@@ -48,23 +46,76 @@ const PROVIDER_ENV_VARS = [
   { key: 'CLAUDE_CODE_SUBAGENT_MODEL', value: 'deepseek-v4-flash', description: '子代理默认模型' },
 ];
 
+type StreamEv = {
+  type: string;
+  index?: number;
+  content_block?: { type: string; name?: string };
+  delta?: { type: string; text?: string; partial_json?: string };
+  usage?: { input_tokens?: number; output_tokens?: number };
+};
+
+const STREAM_EVENTS: StreamEv[] = [
+  { type: 'message_start' },
+  { type: 'content_block_start', index: 0, content_block: { type: 'text' } },
+  { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '好的，让我来分析' } },
+  { type: 'content_block_stop', index: 0 },
+  { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', name: 'Read' } },
+  { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"file_path":"src/index.ts"}' } },
+  { type: 'content_block_stop', index: 1 },
+  { type: 'message_stop', usage: { input_tokens: 450, output_tokens: 120 } },
+];
+
+type RunRow = {
+  id: string;
+  actor: string;
+  resource: string;
+  createdAt: number;
+  diff: { model?: string; durationMs?: number; inputTokens?: number; outputTokens?: number; costUsd?: number; status?: string };
+};
+
+function formatMs(ms?: number) {
+  if (!ms) return '-';
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatCost(usd?: number) {
+  if (!usd) return '-';
+  return `$${usd.toFixed(4)}`;
+}
+
 export default function Observability() {
-  const [rateLimit, setRateLimit] = useState<RateLimitInfo | null>(null);
-  const [streamEvents] = useState(generateStreamEvents());
+  const { token } = useAuth();
+  const [runs, setRuns] = useState<RunRow[]>([]);
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
-    setRateLimit(sdkSimulator.getRateLimit());
-  }, []);
+    if (!token) return;
+    fetch('/api/audit-logs', { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.json())
+      .then((rows: Array<Record<string, unknown>>) => {
+        const agentRuns = rows
+          .filter(r => r.action === 'agent_run')
+          .slice(0, 15)
+          .map(r => ({
+            id: String(r.id || ''),
+            actor: String(r.actor || ''),
+            resource: String(r.resource || ''),
+            createdAt: Number(r.createdAt || r.created_at || 0),
+            diff: (r.diff || r.diff_json || {}) as RunRow['diff'],
+          }));
+        setRuns(agentRuns);
+      })
+      .catch(e => setLoadError(String(e?.message || e)));
+  }, [token]);
 
   return (
     <div>
       <div className="page-header">
-        <h1>📊 可观测性</h1>
-        <p>OpenTelemetry 遥测 / RateLimitInfo / StreamEvent / 环境变量配置</p>
+        <h1>可观测性</h1>
+        <p>OpenTelemetry 遥测配置 / 最近运行记录 / 流事件结构</p>
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
-        {/* OTEL 配置 */}
         <div>
           <div className="card">
             <div className="card-header">OpenTelemetry 环境变量</div>
@@ -97,27 +148,62 @@ export default function Observability() {
               ))}
             </div>
           </div>
+
+          <div className="card mt-4">
+            <div className="card-header">StreamEvent 结构 (BetaRawMessageStreamEvent)</div>
+            <div className="grid-2">
+              {STREAM_EVENTS.map((ev, i) => (
+                <div key={i} className="tool-card">
+                  <div className="tool-card-name">{String(ev.type)}</div>
+                  {ev.content_block && (
+                    <div className="tool-card-desc">
+                      block: {ev.content_block.type}{ev.content_block.name ? ` (${ev.content_block.name})` : ''}
+                    </div>
+                  )}
+                  {ev.delta && (
+                    <div className="tool-card-desc">
+                      delta: {ev.delta.type}{ev.delta.text ? ` "${ev.delta.text}"` : ''}{ev.delta.partial_json ? ` "${ev.delta.partial_json}"` : ''}
+                    </div>
+                  )}
+                  {ev.usage && (
+                    <div className="tool-card-desc">
+                      tokens: {ev.usage.input_tokens ?? '-'} in / {ev.usage.output_tokens ?? '-'} out
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
 
-        {/* 速率限制 + 流事件 */}
         <div>
           <div className="card">
-            <div className="card-header">RateLimitInfo</div>
-            {rateLimit && (
-              <div className="grid-2">
-                <div className="kpi-card">
-                  <div className="kpi-label">5h 状态</div>
-                  <div className="kpi-value" style={{ fontSize: '1.2em' }}>{rateLimit.status}</div>
-                  <div className="kpi-sub">利用率: {(rateLimit.utilization! * 100).toFixed(0)}%</div>
-                </div>
-                <div className="kpi-card">
-                  <div className="kpi-label">重置时间</div>
-                  <div className="kpi-value" style={{ fontSize: '1em' }}>
-                    {rateLimit.resetsAt ? new Date(rateLimit.resetsAt).toLocaleTimeString() : '-'}
-                  </div>
-                </div>
+            <div className="card-header">最近运行记录</div>
+            {loadError && <div style={{ color: 'var(--danger)', fontSize: '.82em', marginBottom: 8 }}>{loadError}</div>}
+            {runs.length === 0 && !loadError && (
+              <div style={{ color: 'var(--ink-muted)', fontSize: '.82em', padding: '16px 0', textAlign: 'center' }}>
+                暂无运行记录
               </div>
             )}
+            {runs.map(run => (
+              <div key={run.id} className="tool-card mb-2">
+                <div className="flex-between">
+                  <div className="tool-card-name" style={{ fontFamily: 'var(--font-mono)', fontSize: '.8em' }}>
+                    {run.diff.model || run.resource.replace('run:', '')}
+                  </div>
+                  <span className={`badge ${run.diff.status === 'success' ? 'badge-success' : 'badge-danger'}`}>
+                    {run.diff.status || '?'}
+                  </span>
+                </div>
+                <div className="flex gap-3 mt-1" style={{ fontSize: '.76em', color: 'var(--ink-secondary)', flexWrap: 'wrap' }}>
+                  <span>时长 {formatMs(run.diff.durationMs)}</span>
+                  <span>in {run.diff.inputTokens ?? '-'} / out {run.diff.outputTokens ?? '-'} tokens</span>
+                  <span>费用 {formatCost(run.diff.costUsd)}</span>
+                  <span>{run.actor}</span>
+                  <span>{run.createdAt ? new Date(run.createdAt).toLocaleTimeString() : ''}</span>
+                </div>
+              </div>
+            ))}
           </div>
 
           <div className="card mt-4">
@@ -157,35 +243,6 @@ export default function Observability() {
                   ))}
                 </tbody>
               </table>
-            </div>
-          </div>
-
-          <div className="card mt-4">
-            <div className="card-header">StreamEvent 结构 (BetaRawMessageStreamEvent)</div>
-            <div className="grid-2">
-              {streamEvents.map((ev, i) => (
-                <div key={i} className="tool-card">
-                  <div className="tool-card-name">{ev.type}</div>
-                  {ev.content_block && (
-                    <div className="tool-card-desc">
-                      block: {ev.content_block.type}
-                      {ev.content_block.name && ` (${ev.content_block.name})`}
-                    </div>
-                  )}
-                  {ev.delta && (
-                    <div className="tool-card-desc">
-                      delta: {ev.delta.type}
-                      {ev.delta.text && ` "${ev.delta.text}"`}
-                      {ev.delta.partial_json && ` "${ev.delta.partial_json}"`}
-                    </div>
-                  )}
-                  {ev.usage && (
-                    <div className="tool-card-desc">
-                      tokens: {ev.usage.input_tokens} in / {ev.usage.output_tokens} out
-                    </div>
-                  )}
-                </div>
-              ))}
             </div>
           </div>
         </div>
