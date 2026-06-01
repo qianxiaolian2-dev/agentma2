@@ -433,9 +433,21 @@ export interface SkillInfo {
 }
 
 // --- 聊天消息 ---
+export type ChatImageMimeType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+
+export interface ChatImageAttachment {
+  id: string;
+  type: 'image';
+  mediaType: ChatImageMimeType;
+  data: string;
+  name?: string;
+  size: number;
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
+  attachments?: ChatImageAttachment[];
   timestamp: number;
 }
 

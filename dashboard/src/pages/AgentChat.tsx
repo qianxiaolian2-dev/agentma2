@@ -43,6 +43,7 @@ export default function AgentChat() {
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
   const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
+  const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(loadProvider());
 
@@ -155,6 +156,7 @@ export default function AgentChat() {
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
+    setRunStats(null);
 
     try {
       const res = await fetch('/api/chat', {
@@ -220,6 +222,8 @@ export default function AgentChat() {
               const finalContent = text || thinking || data.text || '';
               setStreamThinking('');
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
+              if (data.cost_usd !== undefined || data.duration_ms !== undefined)
+                setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
               const finalMessages = withAssistantDraft(newMessages, finalContent, assistantTimestamp);
               setMessages(finalMessages);
               await persistSession(finalMessages, data.sdkSessionId, data.sdkCwd);
@@ -346,6 +350,14 @@ export default function AgentChat() {
                 结构化输出 (outputSchema)
               </div>
               <JsonViewer data={structuredOutput} maxHeight={300} />
+            </div>
+          )}
+
+          {runStats && !isStreaming && (
+            <div style={{ textAlign: 'right', fontSize: '.72em', color: 'var(--ink-muted)', padding: '2px 4px' }}>
+              {runStats.durationMs != null && <span>{(runStats.durationMs / 1000).toFixed(1)}s</span>}
+              {runStats.inTok != null && <span style={{ marginLeft: 8 }}>{runStats.inTok}↑ {runStats.outTok ?? 0}↓ tok</span>}
+              {runStats.costUsd != null && <span style={{ marginLeft: 8 }}>${runStats.costUsd.toFixed(4)}</span>}
             </div>
           )}
 

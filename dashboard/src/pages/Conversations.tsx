@@ -107,6 +107,7 @@ export default function Conversations() {
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
   const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
+  const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
@@ -138,6 +139,7 @@ export default function Conversations() {
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
+    setRunStats(null);
 
     try {
       const res = await fetch('/api/chat', {
@@ -176,6 +178,8 @@ export default function Conversations() {
                 setHasResponseStarted(true);
                 const content = d.text || text || thinking || '';
                 if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
+                if (d.cost_usd !== undefined || d.duration_ms !== undefined)
+                  setRunStats({ costUsd: d.cost_usd, durationMs: d.duration_ms, inTok: d.usage?.input_tokens, outTok: d.usage?.output_tokens });
                 const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
                 setStreamThinking('');
                 setMessages(finalMsgs);
@@ -465,6 +469,7 @@ export default function Conversations() {
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
+    setRunStats(null);
 
     try {
       const res = await fetch('/api/chat', {
@@ -522,6 +527,8 @@ export default function Conversations() {
               const content = data.text || text || thinking || '';
               setStreamThinking('');
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
+              if (data.cost_usd !== undefined || data.duration_ms !== undefined)
+                setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
               const finalMsgs = withAssistantDraft(newMsgs, content, assistantTimestamp);
               setMessages(finalMsgs);
               const sid = await persistSession(finalMsgs, activeSessionId, data.sdkSessionId, data.sdkCwd);
@@ -835,6 +842,13 @@ export default function Conversations() {
                     结构化输出 (outputSchema)
                   </div>
                   <JsonViewer data={structuredOutput} maxHeight={300} />
+                </div>
+              )}
+              {runStats && !isStreaming && (
+                <div style={{ textAlign: 'right', fontSize: '.72em', color: 'var(--ink-muted)', padding: '2px 4px' }}>
+                  {runStats.durationMs != null && <span>{(runStats.durationMs / 1000).toFixed(1)}s</span>}
+                  {runStats.inTok != null && <span style={{ marginLeft: 8 }}>{runStats.inTok}↑ {runStats.outTok ?? 0}↓ tok</span>}
+                  {runStats.costUsd != null && <span style={{ marginLeft: 8 }}>${runStats.costUsd.toFixed(4)}</span>}
                 </div>
               )}
               <div ref={bottomRef} />

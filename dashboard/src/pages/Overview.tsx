@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { SLASH_COMMANDS, MODELS, BUILT_IN_TOOLS, HOOK_EVENTS } from '../simulator/mock-data';
+import { MODELS, BUILT_IN_TOOLS, HOOK_EVENTS } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import type { AgentTemplate } from '../simulator/types';
@@ -19,8 +19,9 @@ const SECTIONS = [
 ];
 
 export default function Overview() {
-  const { user } = useAuth();
+  const { user, token } = useAuth();
   const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
+  const [weeklyRuns, setWeeklyRuns] = useState<number | null>(null);
 
   useEffect(() => {
     if (!user?.tenantId) return;
@@ -30,6 +31,16 @@ export default function Overview() {
       .catch(() => {});
     return () => { cancelled = true; };
   }, [user?.tenantId]);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    void fetch('/api/quota/usage', { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.json())
+      .then(data => { if (!cancelled) setWeeklyRuns(data?.usage?.weeklyRunCount?.used ?? data?.usage?.totalRuns ?? null); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [token]);
 
   return (
     <div>
@@ -51,14 +62,14 @@ export default function Overview() {
           <div className="kpi-sub">种事件可监听</div>
         </div>
         <div className="kpi-card">
-          <div className="kpi-label">斜杠命令</div>
-          <div className="kpi-value">{SLASH_COMMANDS.length}</div>
-          <div className="kpi-sub">个 CLI 命令</div>
+          <div className="kpi-label">Agent 模板</div>
+          <div className="kpi-value">{templates.length}</div>
+          <div className="kpi-sub">个已配置模板</div>
         </div>
         <div className="kpi-card">
-          <div className="kpi-label">SDK Options</div>
-          <div className="kpi-value">50+</div>
-          <div className="kpi-sub">个可配置参数</div>
+          <div className="kpi-label">本周运行</div>
+          <div className="kpi-value">{weeklyRuns ?? '—'}</div>
+          <div className="kpi-sub">次 Agent 执行</div>
         </div>
       </div>
 

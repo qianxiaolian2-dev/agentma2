@@ -1,18 +1,41 @@
-import type { ChatMessage, ChatSession } from '../simulator/types';
+import type { ChatImageAttachment, ChatMessage, ChatSession } from '../simulator/types';
 import { getAuthHeaders } from './client-runtime';
 
 const LEGACY_SESSION_KEY = 'agentma_chat_sessions';
+const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+function normalizeAttachments(value: unknown): ChatImageAttachment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const raw = item as Record<string, unknown>;
+    if (raw.type !== 'image') return [];
+    const mediaType = String(raw.mediaType || '');
+    const data = String(raw.data || '');
+    if (!IMAGE_TYPES.has(mediaType) || !data) return [];
+    return [{
+      id: String(raw.id || crypto.randomUUID()),
+      type: 'image' as const,
+      mediaType: mediaType as ChatImageAttachment['mediaType'],
+      data,
+      name: typeof raw.name === 'string' ? raw.name : undefined,
+      size: Number(raw.size) || 0,
+    }];
+  });
+}
 
 function normalizeMessage(message: unknown): ChatMessage | null {
   if (!message || typeof message !== 'object') return null;
   const role = (message as { role?: unknown }).role;
   const content = (message as { content?: unknown }).content;
+  const attachments = normalizeAttachments((message as { attachments?: unknown }).attachments);
   const timestamp = Number((message as { timestamp?: unknown }).timestamp);
   if (!['user', 'assistant', 'system'].includes(String(role))) return null;
   if (typeof content !== 'string') return null;
   return {
     role: role as ChatMessage['role'],
     content,
+    ...(attachments.length ? { attachments } : {}),
     timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
   };
 }

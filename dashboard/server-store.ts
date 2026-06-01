@@ -162,7 +162,17 @@ export type HookRuleDecision = {
 export type ChatHistoryMessage = {
   role: 'user' | 'assistant' | 'system';
   content: string;
+  attachments?: ChatHistoryAttachment[];
   timestamp: number;
+};
+
+export type ChatHistoryAttachment = {
+  id: string;
+  type: 'image';
+  mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+  data: string;
+  name?: string;
+  size: number;
 };
 
 export type ChatHistorySession = {
@@ -352,6 +362,7 @@ function initSchema() {
   `);
   ensureColumn('chat_sessions', 'sdk_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
+  ensureColumn('chat_messages', 'attachments_json', 'TEXT');
 }
 
 function readOrCreateSecret() {
@@ -662,18 +673,51 @@ function mapHookRule(row: any): HookRuleRow {
   };
 }
 
+const IMAGE_ATTACHMENT_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+function normalizeChatAttachments(value: unknown): ChatHistoryAttachment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const raw = item as Record<string, unknown>;
+    if (raw.type !== 'image') return [];
+    const mediaType = String(raw.mediaType || '');
+    const data = String(raw.data || '');
+    if (!IMAGE_ATTACHMENT_MIME_TYPES.has(mediaType) || !data) return [];
+    return [{
+      id: String(raw.id || crypto.randomUUID()),
+      type: 'image' as const,
+      mediaType: mediaType as ChatHistoryAttachment['mediaType'],
+      data,
+      name: typeof raw.name === 'string' ? raw.name : undefined,
+      size: Number(raw.size) || 0,
+    }];
+  });
+}
+
+function parseChatAttachments(value: unknown): ChatHistoryAttachment[] {
+  if (typeof value !== 'string' || !value.trim()) return [];
+  try {
+    return normalizeChatAttachments(JSON.parse(value));
+  } catch {
+    return [];
+  }
+}
+
 function normalizeChatMessages(messages: unknown): ChatHistoryMessage[] {
   if (!Array.isArray(messages)) return [];
   return messages.flatMap((message, index) => {
     if (!message || typeof message !== 'object') return [];
     const role = (message as { role?: unknown }).role;
     const content = (message as { content?: unknown }).content;
+    const attachments = normalizeChatAttachments((message as { attachments?: unknown }).attachments);
     const timestamp = Number((message as { timestamp?: unknown }).timestamp);
     if (!['user', 'assistant', 'system'].includes(String(role))) return [];
     if (typeof content !== 'string') return [];
     return [{
       role: role as ChatHistoryMessage['role'],
       content,
+      ...(attachments.length ? { attachments } : {}),
       timestamp: Number.isFinite(timestamp) ? timestamp : now() + index,
     }];
   });
@@ -1435,18 +1479,20 @@ function getAnyChatSessionRow(sessionId: string) {
 
 function listMessagesForSession(sessionId: string) {
   const rows = db.prepare(`
-    SELECT role, content, timestamp
+    SELECT role, content, attachments_json, timestamp
     FROM chat_messages
     WHERE session_id = ?
     ORDER BY seq ASC
   `).all(sessionId) as Array<{
     role: ChatHistoryMessage['role'];
     content: string;
+    attachments_json?: string | null;
     timestamp: number;
   }>;
   return rows.map((row) => ({
     role: row.role,
     content: row.content,
+    ...(parseChatAttachments(row.attachments_json).length ? { attachments: parseChatAttachments(row.attachments_json) } : {}),
     timestamp: row.timestamp,
   }));
 }
@@ -1526,11 +1572,12 @@ export function saveChatSession(
     db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(id);
     if (messages.length > 0) {
       const insertMessage = db.prepare(`
-        INSERT INTO chat_messages (session_id, seq, role, content, timestamp)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO chat_messages (session_id, seq, role, content, attachments_json, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?)
       `);
       messages.forEach((message, index) => {
-        insertMessage.run(id, index, message.role, message.content, Number(message.timestamp) || updatedAt + index);
+        const attachmentsJson = message.attachments?.length ? JSON.stringify(message.attachments) : null;
+        insertMessage.run(id, index, message.role, message.content, attachmentsJson, Number(message.timestamp) || updatedAt + index);
       });
     }
 
