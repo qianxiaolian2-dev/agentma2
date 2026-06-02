@@ -14,7 +14,7 @@ import {
   type SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { evaluateHookRules, evaluatePermissionRules, listHookRules, listProtectedSdkCwds, recordAgentRun } from './server-store.ts';
+import { evaluateHookRules, evaluatePermissionRules, listHookRules, listKnowledgeSources, listProtectedSdkCwds, recordAgentRun } from './server-store.ts';
 import type { HookRuleEvent } from './server-store.ts';
 
 // ─── Pricing ─────────────────────────────────────────────────────────────────
@@ -274,6 +274,8 @@ export interface RunAgentOptions {
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   /** Snapshot files before edits so /rewind can restore them. */
   enableFileCheckpointing?: boolean;
+  /** Allow the agent to read tenant-configured knowledge source directories. */
+  useKnowledge?: boolean;
   maxTurns?: number;
   cwd?: string;
   resumeSdkSessionId?: string;
@@ -424,6 +426,15 @@ function buildFallbackAnswers(questions: AskUserQuestionItem[]) {
   return answers;
 }
 
+function buildKnowledgeSystemPrompt(sources: Array<{ name: string; path: string }>) {
+  return [
+    '你可以访问以下用户知识来源(只读):',
+    ...sources.map((source) => `- "${source.name}": ${source.path}`),
+    '回答涉及个人知识、笔记、历史记录或知识库内容时,主动使用 Glob 找文件、Grep 全文搜索、Read 读取内容。',
+    '引用时给出文件路径和 markdown 段落标题。Obsidian 风格的 [[wikilink]] 和 #tag 可以直接 grep。',
+  ].join('\n');
+}
+
 async function* buildUserPromptStream(text: string, images: NonNullable<RunAgentOptions['promptImages']>): AsyncIterable<SDKUserMessage> {
   const content: any[] = [];
   const cleanText = text.trim();
@@ -462,6 +473,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
   const customMcp = buildCustomToolsMcp(opts.requestTools || []);
   const hooks = buildTenantHooks(opts.tenantId, opts.emit);
+  const knowledgeSources = opts.useKnowledge
+    ? listKnowledgeSources(opts.tenantId).filter((source) => source.enabled)
+    : [];
+  const additionalDirectories = knowledgeSources.map((source) => source.path);
+  const knowledgeSystemPrompt = knowledgeSources.length ? buildKnowledgeSystemPrompt(knowledgeSources) : '';
+  const effectiveSystemPrompt = [opts.systemPrompt, knowledgeSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
   const agentNames = Object.keys(opts.subagents || {});
   const subagentToolNames = new Set<string>();
   for (const agent of Object.values(opts.subagents || {})) {
@@ -486,6 +503,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     }
     for (const t of subagentToolNames) {
       if (!customNames.has(t) && !t.startsWith('mcp__')) sdkBuiltinTools.add(t);
+    }
+  }
+  if (knowledgeSources.length) {
+    for (const toolName of ['Read', 'Grep', 'Glob']) {
+      templateToolNames.add(toolName);
+      sdkBuiltinTools.add(toolName);
     }
   }
 
@@ -564,6 +587,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         canUseTool,
         maxTurns: Number(opts.maxTurns) || 20,
         cwd,
+        ...(additionalDirectories.length ? { additionalDirectories } : {}),
         ...(agentNames.length ? { agents: opts.subagents, forwardSubagentText: true, agentProgressSummaries: true } : {}),
         ...(opts.resumeSdkSessionId ? { resume: opts.resumeSdkSessionId } : {}),
         ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
@@ -572,7 +596,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         env,
         ...(hooks ? { hooks, includeHookEvents: true } : {}),
         ...(customMcp ? { mcpServers: { custom: customMcp } } : {}),
-        ...(opts.systemPrompt && opts.systemPrompt.trim() ? { systemPrompt: opts.systemPrompt } : {}),
+        ...(effectiveSystemPrompt ? { systemPrompt: effectiveSystemPrompt } : {}),
       },
     })) {
       const m = msg as any;

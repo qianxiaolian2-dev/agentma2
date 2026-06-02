@@ -13,6 +13,7 @@
     "smoke:chat-write": "node scripts/smoke-chat-write.mjs",
     "smoke:hook-rules": "node scripts/smoke-hook-rules.mjs",
     "smoke:hook-runtime": "AGENTMA_SMOKE_EXPECT_HOOK=1 node scripts/smoke-chat-write.mjs",
+    "smoke:knowledge": "node scripts/smoke-knowledge.mjs",
     "smoke:permission-rules": "node scripts/smoke-permission-rules.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",

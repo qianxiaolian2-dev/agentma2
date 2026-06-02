@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import type { AgentDefinition, EffortLevel, PermissionMode } from '@anthropic-ai/claude-agent-sdk';
@@ -25,6 +26,7 @@ import {
   listAuditLogs,
   listChatSessions,
   listHookRules,
+  listKnowledgeSources,
   listPermissionRules,
   listTeamMembers,
   listTeams,
@@ -33,11 +35,14 @@ import {
   registerUser,
   removeTeamMember,
   replaceHookRules,
+  replaceKnowledgeSources,
   replacePermissionRules,
   replaceAgentTemplates,
   revokeApiKey,
   saveChatSession,
+  scanKnowledgeSources,
   signJWT,
+  testKnowledgeSource,
   updateChatSession,
   updateQuota,
   updateTenant,
@@ -68,6 +73,125 @@ function normalizeStringArray(value: unknown) {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
     : undefined;
+}
+
+const MAX_SKILL_MD_BYTES = 512 * 1024;
+const MAX_LOCAL_SKILL_SCAN_RESULTS = 200;
+
+function makeHttpError(message: string, status: number) {
+  const error = new Error(message) as Error & { status?: number };
+  error.status = status;
+  return error;
+}
+
+function expandLocalPath(input: string) {
+  const value = input.trim();
+  if (value.startsWith('file://')) {
+    return new URL(value).pathname;
+  }
+  if (value === '~') return os.homedir();
+  if (value.startsWith('~/')) return path.join(os.homedir(), value.slice(2));
+  return value;
+}
+
+function resolveLocalSkillPath(input: string) {
+  const expanded = expandLocalPath(input);
+  if (!expanded) throw makeHttpError('need path', 400);
+  const resolved = path.resolve(expanded);
+  if (!fs.existsSync(resolved)) throw makeHttpError('路径不存在', 404);
+
+  const stat = fs.statSync(resolved);
+  const skillFile = stat.isDirectory() ? path.join(resolved, 'SKILL.md') : resolved;
+  const skillDir = stat.isDirectory() ? resolved : path.dirname(resolved);
+  if (path.basename(skillFile) !== 'SKILL.md') {
+    throw makeHttpError('请选择 SKILL.md 文件或包含 SKILL.md 的技能目录', 400);
+  }
+  if (!fs.existsSync(skillFile)) throw makeHttpError('目录下没有 SKILL.md', 404);
+
+  const fileStat = fs.statSync(skillFile);
+  if (!fileStat.isFile()) throw makeHttpError('SKILL.md 不是文件', 400);
+  if (fileStat.size > MAX_SKILL_MD_BYTES) throw makeHttpError('SKILL.md 不能超过 512KB', 400);
+
+  return { skillFile, skillDir };
+}
+
+function createLocalSkillInfo(skillFile: string, skillDir: string) {
+  if (path.basename(skillFile) !== 'SKILL.md') {
+    throw makeHttpError('请选择 SKILL.md 文件或包含 SKILL.md 的技能目录', 400);
+  }
+  const fileStat = fs.statSync(skillFile);
+  if (!fileStat.isFile()) throw makeHttpError('SKILL.md 不是文件', 400);
+  if (fileStat.size > MAX_SKILL_MD_BYTES) throw makeHttpError('SKILL.md 不能超过 512KB', 400);
+
+  const content = fs.readFileSync(skillFile, 'utf-8');
+  const frontmatterName = readFrontmatterValue(content, 'name');
+  const title = content.match(/^#\s+(.+)/m)?.[1]?.trim() || '';
+  const description = readFrontmatterValue(content, 'description') || title || `本地技能: ${skillDir}`;
+
+  return {
+    name: normalizeSkillName(frontmatterName || path.basename(skillDir)),
+    description,
+    location: 'user' as const,
+    path: `${skillDir}${path.sep}`,
+    enabled: true,
+  };
+}
+
+function collectLocalSkillDirs(root: string, depth: number, found: Array<{ skillFile: string; skillDir: string }>) {
+  if (depth > 3 || found.length >= MAX_LOCAL_SKILL_SCAN_RESULTS) return;
+  const ownSkillFile = path.join(root, 'SKILL.md');
+  if (fs.existsSync(ownSkillFile) && fs.statSync(ownSkillFile).isFile()) {
+    found.push({ skillFile: ownSkillFile, skillDir: root });
+    return;
+  }
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (found.length >= MAX_LOCAL_SKILL_SCAN_RESULTS) return;
+    if (!entry.isDirectory()) continue;
+    if (['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', '.cache'].includes(entry.name)) continue;
+    collectLocalSkillDirs(path.join(root, entry.name), depth + 1, found);
+  }
+}
+
+function scanLocalSkills(input: string) {
+  const expanded = expandLocalPath(input);
+  if (!expanded) throw makeHttpError('need path', 400);
+  const resolved = path.resolve(expanded);
+  if (!fs.existsSync(resolved)) throw makeHttpError('路径不存在', 404);
+
+  const stat = fs.statSync(resolved);
+  const found: Array<{ skillFile: string; skillDir: string }> = [];
+  if (stat.isFile()) {
+    const { skillFile, skillDir } = resolveLocalSkillPath(resolved);
+    found.push({ skillFile, skillDir });
+  } else if (stat.isDirectory()) {
+    collectLocalSkillDirs(resolved, 0, found);
+  } else {
+    throw makeHttpError('路径不是文件或目录', 400);
+  }
+
+  const deduped = Array.from(new Map(found.map(item => [path.resolve(item.skillFile), item])).values());
+  if (!deduped.length) throw makeHttpError('没有找到 SKILL.md', 404);
+  return deduped.map(({ skillFile, skillDir }) => createLocalSkillInfo(skillFile, skillDir));
+}
+
+function readFrontmatterValue(content: string, key: string) {
+  const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!match) return '';
+  const line = match[1].split('\n').find((item) => item.trim().startsWith(`${key}:`));
+  if (!line) return '';
+  return line.split(':').slice(1).join(':').trim().replace(/^['"]|['"]$/g, '');
+}
+
+function normalizeSkillName(value: string) {
+  return value.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'local-skill';
 }
 
 function normalizeSubagents(value: unknown): Record<string, AgentDefinition> | undefined {
@@ -262,6 +386,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const resumeSdkSessionId = typeof req.body?.sdkSessionId === 'string' ? req.body.sdkSessionId.trim() : '';
   const sdkCwd = typeof req.body?.sdkCwd === 'string' ? req.body.sdkCwd.trim() : '';
   const enableFileCheckpointing = req.body?.enableFileCheckpointing === true;
+  const useKnowledge = req.body?.useKnowledge === true;
   const outputSchema = req.body?.outputSchema && typeof req.body.outputSchema === 'object' && !Array.isArray(req.body.outputSchema)
     ? req.body.outputSchema as Record<string, unknown>
     : undefined;
@@ -327,6 +452,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     cwd: sdkCwd || undefined,
     resumeSdkSessionId: resumeSdkSessionId || undefined,
     enableFileCheckpointing: enableFileCheckpointing || undefined,
+    useKnowledge,
     outputFormat: outputSchema ? { type: 'json_schema', schema: outputSchema } : undefined,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
@@ -589,6 +715,61 @@ app.post('/api/permission-rules/evaluate', authMiddleware, (req: any, res) => {
   });
 });
 
+// ═══ Knowledge Sources Routes (tenant-shared) ═══
+app.get('/api/knowledge/sources', authMiddleware, (req: any, res) => {
+  res.json(listKnowledgeSources(req.auth.tenantId));
+});
+
+app.put('/api/knowledge/sources', authMiddleware, requireAdmin, (req: any, res) => {
+  const list = Array.isArray(req.body) ? req.body : [];
+  try {
+    const saved = replaceKnowledgeSources(req.auth.tenantId, list);
+    audit(req.auth.tenantId, 'replace_knowledge_sources', req.auth.sub, 'user', `knowledge:${req.auth.tenantId}`, { count: saved.length });
+    res.json(saved);
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || '保存知识库失败' });
+  }
+});
+
+app.post('/api/knowledge/sources/test', authMiddleware, (req: any, res) => {
+  const sourcePath = String(req.body?.path || '').trim();
+  if (!sourcePath) { res.status(400).json({ error: 'need path' }); return; }
+  res.json(testKnowledgeSource(sourcePath));
+});
+
+app.post('/api/knowledge/sources/scan', authMiddleware, requireAdmin, (req: any, res) => {
+  try {
+    const sourcePath = typeof req.body?.path === 'string' ? req.body.path : '';
+    res.json(scanKnowledgeSources(sourcePath));
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || '扫描知识库失败' });
+  }
+});
+
+// ═══ Skills Routes ═══
+app.post('/api/skills/scan-local', authMiddleware, (req: any, res) => {
+  try {
+    const inputPath = typeof req.body?.path === 'string' ? req.body.path : '';
+    res.json({ skills: scanLocalSkills(inputPath) });
+  } catch (error) {
+    const err = error as Error & { status?: number };
+    res.status(err.status || 500).json({ error: err.message || '扫描失败' });
+  }
+});
+
+app.post('/api/skills/import-local', authMiddleware, (req: any, res) => {
+  try {
+    const inputPath = typeof req.body?.path === 'string' ? req.body.path : '';
+    const { skillFile, skillDir } = resolveLocalSkillPath(inputPath);
+    const skill = createLocalSkillInfo(skillFile, skillDir);
+    audit(req.auth.tenantId, 'import_local_skill', req.auth.sub, 'skill', skill.path, { name: skill.name });
+    res.json(skill);
+  } catch (error) {
+    const err = error as Error & { status?: number };
+    res.status(err.status || 500).json({ error: err.message || '导入失败' });
+  }
+});
+
 // ═══ Agent Templates Routes (tenant-shared) ═══
 app.get('/api/agents', authMiddleware, (req: any, res) => {
   res.json(listAgentTemplates(req.auth.tenantId));
@@ -667,6 +848,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
     subagents,
     outputFormat: tmpl?.outputSchema ? { type: 'json_schema', schema: tmpl.outputSchema } : undefined,
     enableFileCheckpointing: tmpl?.enableFileCheckpointing === true || undefined,
+    useKnowledge: tmpl?.useKnowledge === true,
     maxTurns: Number(tmpl?.maxTurns) || 20,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,

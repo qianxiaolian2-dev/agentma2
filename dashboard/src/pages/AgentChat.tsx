@@ -201,6 +201,7 @@ export default function AgentChat() {
           tools: buildRequestToolsForAgent(template),
           subagents: template.subagents,
           enableFileCheckpointing: template.enableFileCheckpointing || undefined,
+          useKnowledge: template.useKnowledge || undefined,
           outputSchema: template.outputSchema || undefined,
           sdkSessionId: sessionMeta?.sdkSessionId,
           sdkCwd: sessionMeta?.sdkCwd,

@@ -401,6 +401,8 @@ export interface AgentTemplate {
   outputSchema?: Record<string, unknown>;
   // 文件检查点：编辑前快照文件，支持 /rewind 回滚
   enableFileCheckpointing?: boolean;
+  // 知识库：允许 agent 只读访问租户配置的本地笔记目录
+  useKnowledge?: boolean;
   createdAt: number;
   updatedAt: number;
 }

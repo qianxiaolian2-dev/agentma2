@@ -17,6 +17,7 @@ const SECTIONS = [
     title: '接口',
     items: [
       { path: '/tools', label: '工具背包', icon: '🎒' },
+      { path: '/knowledge', label: '知识库', icon: '📚' },
       { path: '/skills', label: '技能背包', icon: '✨' },
       { path: '/hooks', label: 'Hook 系统', icon: '🪝' },
       { path: '/subagents', label: '子代理管理', icon: '🤖' },

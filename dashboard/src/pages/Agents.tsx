@@ -45,6 +45,7 @@ const TOOL_CATEGORIES = [
   { name: 'mcp', label: 'MCP', tools: ['ListMcpResources', 'ReadMcpResource'] },
   { name: 'notebook', label: 'Notebook', tools: ['NotebookEdit'] },
 ];
+const KNOWLEDGE_TOOLS = ['Read', 'Grep', 'Glob'];
 
 export default function Agents() {
   const navigate = useNavigate();
@@ -132,6 +133,7 @@ export default function Agents() {
       ...form,
       id: form.id || `agent-${now}`,
       name: form.name.trim(),
+      tools: form.useKnowledge ? Array.from(new Set([...form.tools, ...KNOWLEDGE_TOOLS])) : form.tools,
       createdAt: form.createdAt || now,
       updatedAt: now,
     };
@@ -175,6 +177,14 @@ export default function Agents() {
       tools: prev.tools.includes(tool)
         ? prev.tools.filter(t => t !== tool)
         : [...prev.tools, tool],
+    }));
+  };
+
+  const toggleKnowledge = (enabled: boolean) => {
+    setForm(prev => ({
+      ...prev,
+      useKnowledge: enabled || undefined,
+      tools: enabled ? Array.from(new Set([...prev.tools, ...KNOWLEDGE_TOOLS])) : prev.tools,
     }));
   };
 
@@ -298,6 +308,7 @@ export default function Agents() {
                   <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
                   <div className="agent-card-tags">
                     <span className="badge badge-muted">{t.model}</span>
+                    {t.useKnowledge && <span className="badge badge-success">知识库</span>}
                     {t.tools.slice(0, 3).map(tool => <span key={tool} className="badge badge-info">{tool}</span>)}
                     {t.tools.length > 3 && <span className="badge badge-muted">+{t.tools.length - 3}</span>}
                   </div>
@@ -379,11 +390,11 @@ export default function Agents() {
             </div>
 
             {/* 供应商配置覆盖 (Agent 级别) */}
-            <details style={{ marginBottom: 14 }}>
-              <summary style={{ cursor: 'pointer', fontWeight: 600, fontSize: '.85em', color: 'var(--warning)', marginBottom: 10 }}>
+            <details className="provider-overrides-panel">
+              <summary className="provider-overrides-summary">
                 ⚡ 供应商配置覆盖 (可选 — 留空则使用全局配置)
               </summary>
-              <div className="grid-2" style={{ marginTop: 10, padding: '10px 14px', background: 'var(--warning-bg)', borderRadius: 6 }}>
+              <div className="grid-2 provider-overrides-grid">
                 <div className="form-group">
                   <label>ANTHROPIC_AUTH_TOKEN</label>
                   <input
@@ -490,6 +501,19 @@ export default function Agents() {
               />
               <span style={{ fontSize: '.85em' }}>
                 enableFileCheckpointing — 编辑前快照文件，支持 /rewind 回滚
+              </span>
+            </label>
+
+            {/* 知识库 */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <input
+                type="checkbox"
+                checked={Boolean(form.useKnowledge)}
+                onChange={e => toggleKnowledge(e.target.checked)}
+                style={{ width: 'auto' }}
+              />
+              <span style={{ fontSize: '.85em' }}>
+                启用知识库 — agent 可以读取你配置的本地笔记目录
               </span>
             </label>
 

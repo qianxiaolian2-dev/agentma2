@@ -188,6 +188,31 @@ export type ChatHistorySession = {
   updatedAt: number;
 };
 
+export type KnowledgeSourceRow = {
+  id: string;
+  tenantId: string;
+  name: string;
+  path: string;
+  readOnly: boolean;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type KnowledgeSourceTestResult = {
+  ok: boolean;
+  reason?: string;
+  fileCount?: number;
+  sampleFiles?: string[];
+};
+
+export type KnowledgeSourceCandidate = {
+  name: string;
+  path: string;
+  fileCount: number;
+  sampleFiles: string[];
+};
+
 const LEGACY_PREFIX = 'legacy_sha256$';
 const DEFAULT_QUOTA = {
   monthlyActiveSecondsLimit: 36000,
@@ -359,6 +384,18 @@ function initSchema() {
       PRIMARY KEY (tenant_id, id)
     );
     CREATE INDEX IF NOT EXISTS idx_hook_rules_tenant_position ON hook_rules (tenant_id, position ASC, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS knowledge_sources (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      path TEXT NOT NULL,
+      read_only INTEGER NOT NULL DEFAULT 1,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_knowledge_sources_tenant ON knowledge_sources (tenant_id);
   `);
   ensureColumn('chat_sessions', 'sdk_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
@@ -537,6 +574,209 @@ function now() {
   return Date.now();
 }
 
+function expandHome(value: string) {
+  if (value === '~') return os.homedir();
+  if (value.startsWith('~/')) return path.join(os.homedir(), value.slice(2));
+  return value.replace(/\$HOME\b/g, os.homedir());
+}
+
+function defaultKnowledgeAllowlist() {
+  return [
+    '$HOME/Documents',
+    '$HOME/Obsidian',
+    '$HOME/Notes',
+    '$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents',
+  ];
+}
+
+function knowledgeAllowlistRoots() {
+  const raw = process.env.AGENTMA_KNOWLEDGE_ROOT_ALLOWLIST;
+  const entries = (raw && raw.trim() ? raw.split(path.delimiter) : defaultKnowledgeAllowlist())
+    .map((item) => expandHome(item.trim()))
+    .filter(Boolean);
+
+  return entries.flatMap((entry) => {
+    try {
+      return [fs.realpathSync.native(path.resolve(entry))];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function isPathWithinRoot(candidate: string, root: string) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (relative.length > 0 && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function findAllowedKnowledgeRoot(resolvedPath: string) {
+  return knowledgeAllowlistRoots().find((root) => isPathWithinRoot(resolvedPath, root));
+}
+
+function resolveKnowledgeDirectory(inputPath: string): { ok: true; path: string } | { ok: false; reason: string } {
+  const trimmed = inputPath.trim();
+  if (!trimmed) return { ok: false, reason: '路径不能为空' };
+
+  const absolute = path.resolve(expandHome(trimmed));
+  let stat: fs.Stats;
+  let realPath: string;
+  try {
+    stat = fs.statSync(absolute);
+    realPath = fs.realpathSync.native(absolute);
+  } catch {
+    return { ok: false, reason: '目录不存在' };
+  }
+  if (!stat.isDirectory()) return { ok: false, reason: '路径不是目录' };
+  try {
+    fs.accessSync(realPath, fs.constants.R_OK);
+  } catch {
+    return { ok: false, reason: '无读取权限' };
+  }
+  if (!findAllowedKnowledgeRoot(realPath)) {
+    return { ok: false, reason: '路径不在允许范围,请联系管理员加白名单' };
+  }
+  return { ok: true, path: realPath };
+}
+
+function collectMarkdownFiles(root: string) {
+  const sampleFiles: string[] = [];
+  let fileCount = 0;
+  const stack = [root];
+
+  while (stack.length) {
+    const current = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+        fileCount += 1;
+        if (sampleFiles.length < 20) {
+          sampleFiles.push(path.relative(root, fullPath).split(path.sep).join('/'));
+        }
+      }
+    }
+  }
+
+  return { fileCount, sampleFiles };
+}
+
+function collectMarkdownFilesBounded(root: string) {
+  const sampleFiles: string[] = [];
+  let fileCount = 0;
+  let scannedEntries = 0;
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+  const maxDepth = 3;
+  const maxEntries = 4000;
+
+  while (stack.length && scannedEntries < maxEntries) {
+    const current = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      scannedEntries += 1;
+      if (scannedEntries >= maxEntries) break;
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      const fullPath = path.join(current.dir, entry.name);
+      if (entry.isDirectory() && current.depth < maxDepth) {
+        stack.push({ dir: fullPath, depth: current.depth + 1 });
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+        fileCount += 1;
+        if (sampleFiles.length < 8) {
+          sampleFiles.push(path.relative(root, fullPath).split(path.sep).join('/'));
+        }
+      }
+    }
+  }
+
+  return { fileCount, sampleFiles };
+}
+
+function hasDirectMarkdownFile(dir: string) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .some((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'));
+  } catch {
+    return false;
+  }
+}
+
+function knowledgeCandidateForDirectory(dir: string): KnowledgeSourceCandidate | null {
+  let resolved: string;
+  try {
+    resolved = fs.realpathSync.native(dir);
+  } catch {
+    return null;
+  }
+  if (!findAllowedKnowledgeRoot(resolved)) return null;
+  const hasObsidian = fs.existsSync(path.join(resolved, '.obsidian'));
+  if (!hasObsidian && !hasDirectMarkdownFile(resolved)) return null;
+  const result = collectMarkdownFilesBounded(resolved);
+  if (!hasObsidian && result.fileCount === 0) return null;
+  return {
+    name: path.basename(resolved) || '知识库',
+    path: resolved,
+    fileCount: result.fileCount,
+    sampleFiles: result.sampleFiles,
+  };
+}
+
+function scanKnowledgeCandidateDirs(root: string, maxDepth: number) {
+  const candidates: KnowledgeSourceCandidate[] = [];
+  const seen = new Set<string>();
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+  const maxCandidates = 100;
+
+  while (stack.length && candidates.length < maxCandidates) {
+    const current = stack.pop()!;
+    let resolved: string;
+    try {
+      resolved = fs.realpathSync.native(current.dir);
+    } catch {
+      continue;
+    }
+    if (seen.has(resolved) || !findAllowedKnowledgeRoot(resolved)) continue;
+    seen.add(resolved);
+
+    const candidate = knowledgeCandidateForDirectory(resolved);
+    if (candidate) {
+      candidates.push(candidate);
+      if (fs.existsSync(path.join(resolved, '.obsidian'))) continue;
+    }
+    if (current.depth >= maxDepth) continue;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(resolved, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('.') || ['node_modules', 'dist', 'build', '.next', 'coverage'].includes(entry.name)) continue;
+      stack.push({ dir: path.join(resolved, entry.name), depth: current.depth + 1 });
+    }
+  }
+
+  return candidates;
+}
+
 function parseJsonArray(value: string | null) {
   if (!value) return [];
   try {
@@ -668,6 +908,19 @@ function mapHookRule(row: any): HookRuleRow {
     message: row.message || '',
     enabled: Boolean(row.enabled),
     position: Number(row.position || 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapKnowledgeSource(row: any): KnowledgeSourceRow {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    name: row.name,
+    path: row.path,
+    readOnly: Boolean(row.read_only),
+    enabled: Boolean(row.enabled),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1419,6 +1672,94 @@ export function evaluateHookRules(tenantId: string, eventName: HookRuleEvent, in
     reason,
     output: buildHookRuleOutput(rule, reason),
   };
+}
+
+export function listKnowledgeSources(tenantId: string): KnowledgeSourceRow[] {
+  const rows = db.prepare(`
+    SELECT id, tenant_id, name, path, read_only, enabled, created_at, updated_at
+    FROM knowledge_sources
+    WHERE tenant_id = ?
+    ORDER BY updated_at DESC, name ASC
+  `).all(tenantId);
+  return rows.map(mapKnowledgeSource);
+}
+
+export function replaceKnowledgeSources(tenantId: string, sources: Array<Partial<KnowledgeSourceRow> & Record<string, unknown>>): KnowledgeSourceRow[] {
+  const timestamp = now();
+  const normalized = sources.flatMap((source): KnowledgeSourceRow[] => {
+    const sourcePath = String(source?.path || '').trim();
+    const resolved = resolveKnowledgeDirectory(sourcePath);
+    if (!resolved.ok) {
+      throw new Error(`知识库路径无效: ${resolved.reason}`);
+    }
+
+    const rawName = String(source?.name || '').trim();
+    const name = (rawName || path.basename(resolved.path) || '知识库').slice(0, 80);
+    return [{
+      id: String(source?.id || crypto.randomUUID()),
+      tenantId,
+      name,
+      path: resolved.path,
+      readOnly: true,
+      enabled: source?.enabled !== false,
+      createdAt: Number(source?.createdAt) || timestamp,
+      updatedAt: timestamp,
+    }];
+  });
+
+  db.exec('BEGIN');
+  try {
+    db.prepare('DELETE FROM knowledge_sources WHERE tenant_id = ?').run(tenantId);
+    const insert = db.prepare(`
+      INSERT INTO knowledge_sources (
+        id, tenant_id, name, path, read_only, enabled, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const source of normalized) {
+      insert.run(
+        source.id,
+        tenantId,
+        source.name,
+        source.path,
+        source.readOnly ? 1 : 0,
+        source.enabled ? 1 : 0,
+        source.createdAt,
+        source.updatedAt,
+      );
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+
+  return listKnowledgeSources(tenantId);
+}
+
+export function testKnowledgeSource(sourcePath: string): KnowledgeSourceTestResult {
+  const resolved = resolveKnowledgeDirectory(sourcePath);
+  if (!resolved.ok) return { ok: false, reason: resolved.reason };
+  const result = collectMarkdownFiles(resolved.path);
+  return { ok: true, fileCount: result.fileCount, sampleFiles: result.sampleFiles };
+}
+
+export function scanKnowledgeSources(sourcePath?: string): { roots: string[]; candidates: KnowledgeSourceCandidate[] } {
+  const roots = knowledgeAllowlistRoots();
+  const inputPath = String(sourcePath || '').trim();
+  if (!inputPath) {
+    const candidates = roots.flatMap((root) => scanKnowledgeCandidateDirs(root, 2));
+    const deduped = Array.from(new Map(candidates.map((candidate) => [candidate.path, candidate])).values());
+    return { roots, candidates: deduped };
+  }
+
+  const resolved = resolveKnowledgeDirectory(inputPath);
+  if (!resolved.ok) throw new Error(`本地导入路径无效: ${resolved.reason}`);
+  const candidates = scanKnowledgeCandidateDirs(resolved.path, 3);
+  const exact = knowledgeCandidateForDirectory(resolved.path);
+  const withExact = exact ? [exact, ...candidates] : candidates;
+  const deduped = Array.from(new Map(withExact.map((candidate) => [candidate.path, candidate])).values());
+  return { roots, candidates: deduped };
 }
 
 export function audit(tenantId: string, action: string, actor: string, actorType: string, resource: string, diff?: unknown) {

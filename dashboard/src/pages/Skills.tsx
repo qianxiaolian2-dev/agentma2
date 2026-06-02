@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import type { SkillInfo } from '../simulator/types';
 import { initSkills, saveSkills } from '../simulator/mock-data';
+import { getAuthHeaders } from '../utils/client-runtime';
 import StatusBadge from '../components/common/StatusBadge';
 
 const LOCATION_LABELS: Record<string, { label: string; color: string }> = {
@@ -24,6 +25,11 @@ export default function Skills() {
   const [ghUrl, setGhUrl] = useState('');
   const [ghLoading, setGhLoading] = useState(false);
   const [ghMsg, setGhMsg] = useState('');
+  const [localPath, setLocalPath] = useState('');
+  const [localLoading, setLocalLoading] = useState(false);
+  const [localMsg, setLocalMsg] = useState('');
+  const [localCandidates, setLocalCandidates] = useState<SkillInfo[]>([]);
+  const [selectedLocalPaths, setSelectedLocalPaths] = useState<string[]>([]);
 
   const handleImportFromGitHub = async () => {
     if (!ghUrl.trim()) return;
@@ -83,6 +89,87 @@ export default function Skills() {
     setGhLoading(false);
   };
 
+  const toSkillInfo = (data: Record<string, unknown>, fallbackPath: string): SkillInfo => {
+    const location = data.location === 'project' || data.location === 'plugin' ? data.location : 'user';
+    return {
+      name: String(data.name || '').trim() || 'local-skill',
+      description: String(data.description || '').trim() || `本地技能: ${fallbackPath}`,
+      location,
+      path: String(data.path || fallbackPath),
+      enabled: true,
+    };
+  };
+
+  const handleScanLocalPath = async () => {
+    const inputPath = localPath.trim();
+    if (!inputPath) return;
+    setLocalLoading(true);
+    setLocalMsg('');
+    setLocalCandidates([]);
+    setSelectedLocalPaths([]);
+
+    try {
+      const res = await fetch('/api/skills/scan-local', {
+        method: 'POST',
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ path: inputPath }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setLocalMsg(`扫描失败: ${data.error || `HTTP ${res.status}`}`);
+        return;
+      }
+
+      const candidates: SkillInfo[] = Array.isArray(data.skills)
+        ? data.skills.map((item: Record<string, unknown>) => toSkillInfo(item, inputPath))
+        : [];
+      if (!candidates.length) {
+        setLocalMsg('没有找到可导入的技能');
+        return;
+      }
+
+      const existingNames = new Set(skills.map(s => s.name));
+      const defaultSelected = candidates
+        .filter((skill: SkillInfo) => !existingNames.has(skill.name))
+        .map((skill: SkillInfo) => skill.path);
+      setLocalCandidates(candidates);
+      setSelectedLocalPaths(defaultSelected);
+      setLocalMsg(`✓ 找到 ${candidates.length} 个技能，已选择 ${defaultSelected.length} 个可导入项`);
+    } catch (e) {
+      setLocalMsg(`扫描失败: ${(e as Error).message}`);
+    } finally {
+      setLocalLoading(false);
+    }
+  };
+
+  const toggleLocalCandidate = (skillPath: string) => {
+    setSelectedLocalPaths(prev => (
+      prev.includes(skillPath) ? prev.filter(path => path !== skillPath) : [...prev, skillPath]
+    ));
+  };
+
+  const selectAllLocalCandidates = () => {
+    const existingNames = new Set(skills.map(s => s.name));
+    setSelectedLocalPaths(localCandidates.filter(skill => !existingNames.has(skill.name)).map(skill => skill.path));
+  };
+
+  const importSelectedLocalSkills = () => {
+    const selected = localCandidates.filter(skill => selectedLocalPaths.includes(skill.path));
+    if (!selected.length) {
+      setLocalMsg('请先选择要导入的技能');
+      return;
+    }
+
+    const existingNames = new Set(skills.map(s => s.name));
+    const toAdd = selected.filter(skill => !existingNames.has(skill.name));
+    const skipped = selected.length - toAdd.length;
+    if (toAdd.length > 0) setSkills(prev => [...prev, ...toAdd]);
+    setLocalPath('');
+    setLocalCandidates([]);
+    setSelectedLocalPaths([]);
+    setLocalMsg(`✓ 已导入 ${toAdd.length} 个技能${skipped ? `，跳过 ${skipped} 个已存在` : ''}`);
+  };
+
   const enabledCount = skills.filter(s => s.enabled).length;
 
   return (
@@ -130,6 +217,90 @@ export default function Skills() {
             color: ghMsg.startsWith('✓') ? 'var(--success)' : 'var(--danger)',
           }}>
             {ghMsg}
+          </div>
+        )}
+      </div>
+
+      {/* 从本地路径导入 */}
+      <div className="card mb-4">
+        <div className="card-header">从本地路径导入技能</div>
+        <div style={{ fontSize: '.82em', color: 'var(--ink-secondary)', marginBottom: 10 }}>
+          输入本机技能目录或 SKILL.md 路径，页面会读取元数据并加入技能列表
+        </div>
+        <div className="flex gap-2" style={{ alignItems: 'flex-start' }}>
+          <input
+            value={localPath}
+            onChange={e => setLocalPath(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleScanLocalPath(); }}
+            placeholder="/Users/xiaoqin/.codex/skills 或 /path/to/SKILL.md"
+            style={{ fontFamily: 'var(--font-mono)', fontSize: '.8em', flex: 1 }}
+          />
+          <button className="btn btn-primary" onClick={handleScanLocalPath} disabled={localLoading}>
+            {localLoading ? '扫描中...' : '扫描'}
+          </button>
+        </div>
+        {localCandidates.length > 0 && (
+          <div className="mt-3" style={{ border: '1px solid var(--border)', borderRadius: 6, overflow: 'hidden' }}>
+            <div className="flex-between" style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', background: 'var(--bg-hover)', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '.82em', fontWeight: 600 }}>
+                候选技能 {selectedLocalPaths.length}/{localCandidates.length}
+              </span>
+              <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+                <button className="btn btn-sm" onClick={selectAllLocalCandidates}>全选</button>
+                <button className="btn btn-sm" onClick={() => setSelectedLocalPaths([])}>清空</button>
+                <button className="btn btn-primary btn-sm" onClick={importSelectedLocalSkills}>
+                  导入选中
+                </button>
+              </div>
+            </div>
+            <div style={{ maxHeight: 260, overflowY: 'auto' }}>
+              {localCandidates.map(skill => {
+                const exists = skills.some(item => item.name === skill.name);
+                return (
+                  <label
+                    key={skill.path}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'auto 1fr auto',
+                      gap: 10,
+                      alignItems: 'start',
+                      padding: '9px 10px',
+                      borderBottom: '1px solid var(--border)',
+                      opacity: exists ? .55 : 1,
+                      cursor: exists ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedLocalPaths.includes(skill.path)}
+                      disabled={exists}
+                      onChange={() => toggleLocalCandidate(skill.path)}
+                      style={{ width: 'auto', marginTop: 3 }}
+                    />
+                    <span>
+                      <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.82em', fontWeight: 600 }}>
+                        {skill.name}
+                      </span>
+                      <span style={{ display: 'block', fontSize: '.75em', color: 'var(--ink-secondary)', marginTop: 2 }}>
+                        {skill.description}
+                      </span>
+                      <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.68em', color: 'var(--ink-muted)', marginTop: 2 }}>
+                        {skill.path}
+                      </span>
+                    </span>
+                    {exists && <span className="badge badge-muted">已存在</span>}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        {localMsg && (
+          <div className="mt-2" style={{
+            fontSize: '.8em',
+            color: localMsg.startsWith('✓') ? 'var(--success)' : 'var(--danger)',
+          }}>
+            {localMsg}
           </div>
         )}
       </div>

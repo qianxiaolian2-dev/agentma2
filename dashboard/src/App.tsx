@@ -10,6 +10,7 @@ import AgentChat from './pages/AgentChat';
 import Conversations from './pages/Conversations';
 import Sessions from './pages/Sessions';
 import Tools from './pages/Tools';
+import Knowledge from './pages/Knowledge';
 import Hooks from './pages/Hooks';
 import Skills from './pages/Skills';
 import Subagents from './pages/Subagents';
@@ -34,6 +35,7 @@ export default function App() {
                 <Route path="/conversations" element={<Conversations />} />
                 <Route path="/sessions" element={<Sessions />} />
                 <Route path="/tools" element={<Tools />} />
+                <Route path="/knowledge" element={<Knowledge />} />
                 <Route path="/skills" element={<Skills />} />
                 <Route path="/hooks" element={<Hooks />} />
                 <Route path="/subagents" element={<Subagents />} />
