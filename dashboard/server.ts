@@ -3,6 +3,7 @@ import cors from 'cors';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import type { AgentDefinition, EffortLevel, PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 import {

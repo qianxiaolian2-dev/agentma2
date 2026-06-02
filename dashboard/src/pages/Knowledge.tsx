@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { getAuthHeaders } from '../utils/client-runtime';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -19,11 +19,13 @@ type KnowledgeTestResult = {
   sampleFiles?: string[];
 };
 
-type KnowledgeCandidate = {
+type UploadSelection = {
+  id: string;
   name: string;
-  path: string;
-  fileCount: number;
-  sampleFiles: string[];
+  relativePath: string;
+  size: number;
+  selected: boolean;
+  file: File;
 };
 
 type TestState = {
@@ -47,6 +49,12 @@ function defaultSourceNameFromPath(sourcePath: string) {
   const normalized = sourcePath.trim().replace(/[\\/]+$/, '');
   const parts = normalized.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || '知识库';
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -93,6 +101,7 @@ function normalizeSources(value: unknown): KnowledgeSource[] {
 export default function Knowledge() {
   const { user } = useAuth();
   const canSave = user?.role === 'tenant_admin';
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
   const [sources, setSources] = useState<KnowledgeSource[]>([]);
   const [savedSources, setSavedSources] = useState<KnowledgeSource[]>([]);
   const [tests, setTests] = useState<Record<string, TestState>>({});
@@ -100,17 +109,13 @@ export default function Knowledge() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [status, setStatus] = useState('');
-  const [scanPath, setScanPath] = useState('');
-  const [scanLoading, setScanLoading] = useState(false);
   const [directImportLoading, setDirectImportLoading] = useState(false);
   const [scanError, setScanError] = useState('');
-  const [scanRoots, setScanRoots] = useState<string[]>([]);
-  const [candidates, setCandidates] = useState<KnowledgeCandidate[]>([]);
-  const [selectedCandidatePaths, setSelectedCandidatePaths] = useState<string[]>([]);
+  const [folderName, setFolderName] = useState('');
+  const [uploadFiles, setUploadFiles] = useState<UploadSelection[]>([]);
 
   const changed = useMemo(() => JSON.stringify(sources) !== JSON.stringify(savedSources), [sources, savedSources]);
   const enabledCount = sources.filter((source) => source.enabled && source.path.trim()).length;
-  const existingPaths = useMemo(() => new Set(sources.map((source) => source.path.trim()).filter(Boolean)), [sources]);
 
   const loadSources = async () => {
     setLoading(true);
@@ -139,35 +144,70 @@ export default function Knowledge() {
     setSources((current) => [...current, createSource()]);
   };
 
-  const scanLocalSources = async () => {
-    setScanLoading(true);
+  const handleFolderPicked = (fileList: FileList | null) => {
+    const files = Array.from(fileList || []);
+    const textFiles = files.filter((file) => {
+      const name = file.name.toLowerCase();
+      return name.endsWith('.md') || name.endsWith('.markdown') || name.endsWith('.txt');
+    });
+    const next = textFiles.map((file) => {
+      const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+      return {
+        id: `${relativePath}:${file.size}:${file.lastModified}`,
+        name: file.name,
+        relativePath,
+        size: file.size,
+        selected: true,
+        file,
+      };
+    });
+    const firstPath = next[0]?.relativePath || '';
+    setFolderName(firstPath.includes('/') ? firstPath.split('/')[0] : defaultSourceNameFromPath(firstPath || '上传知识库'));
+    setUploadFiles(next);
+    setScanError(next.length ? '' : '这个文件夹里没有可上传的 markdown 或文本文件');
+    setStatus('');
+    if (folderInputRef.current) folderInputRef.current.value = '';
+  };
+
+  const toggleUploadFile = (id: string) => {
+    setUploadFiles((current) => current.map((item) => (
+      item.id === id ? { ...item, selected: !item.selected } : item
+    )));
+  };
+
+  const uploadSelectedFolderFiles = async () => {
+    const selected = uploadFiles.filter((file) => file.selected);
+    if (!selected.length) {
+      setScanError('请先勾选要上传的文件');
+      return;
+    }
+    setDirectImportLoading(true);
     setScanError('');
     setStatus('');
     try {
-      const response = await fetch('/api/knowledge/sources/scan', {
+      const files = await Promise.all(selected.map(async (item) => ({
+        relativePath: item.relativePath,
+        content: await item.file.text(),
+      })));
+      const response = await fetch('/api/knowledge/sources/upload', {
         method: 'POST',
         headers: jsonAuthHeaders(),
-        body: JSON.stringify({ path: scanPath.trim() }),
+        body: JSON.stringify({
+          name: folderName.trim() || '上传知识库',
+          files,
+        }),
       });
-      const data = await readJson<{ roots?: string[]; candidates?: KnowledgeCandidate[] }>(response);
-      const nextCandidates = Array.isArray(data.candidates) ? data.candidates : [];
-      setScanRoots(Array.isArray(data.roots) ? data.roots : []);
-      setCandidates(nextCandidates);
-      setSelectedCandidatePaths(nextCandidates.filter((candidate) => !existingPaths.has(candidate.path)).map((candidate) => candidate.path));
-      if (!nextCandidates.length) setScanError('没有找到包含 markdown 的候选目录');
-    } catch (scanFailure) {
-      setScanError((scanFailure as Error).message || '扫描知识库失败');
+      const data = await readJson<unknown>(response);
+      const next = normalizeSources(data);
+      setSources(next);
+      setSavedSources(next);
+      setUploadFiles([]);
+      setStatus(`已上传 ${selected.length} 个文件并导入知识库，现在可以在 Agent 创建页勾选。`);
+    } catch (uploadFailure) {
+      setScanError((uploadFailure as Error).message || '上传知识库失败');
     } finally {
-      setScanLoading(false);
+      setDirectImportLoading(false);
     }
-  };
-
-  const toggleCandidate = (candidatePath: string) => {
-    setSelectedCandidatePaths((current) => (
-      current.includes(candidatePath)
-        ? current.filter((item) => item !== candidatePath)
-        : [...current, candidatePath]
-    ));
   };
 
   const saveSourceList = async (sourceList: KnowledgeSource[], successMessage: string) => {
@@ -198,67 +238,6 @@ export default function Knowledge() {
       throw saveError;
     } finally {
       setSaving(false);
-    }
-  };
-
-  const importInputPathDirectly = async () => {
-    const sourcePath = scanPath.trim();
-    if (!sourcePath) {
-      setScanError('请输入要导入的本地文件夹路径');
-      return;
-    }
-    if (existingPaths.has(sourcePath)) {
-      setScanError('这个文件夹已经在我的知识库里');
-      return;
-    }
-    setDirectImportLoading(true);
-    setScanError('');
-    setStatus('');
-    try {
-      const response = await fetch('/api/knowledge/sources/test', {
-        method: 'POST',
-        headers: jsonAuthHeaders(),
-        body: JSON.stringify({ path: sourcePath }),
-      });
-      const result = await readJson<KnowledgeTestResult>(response);
-      if (!result.ok) throw new Error(result.reason || '文件夹不可用');
-      const sourceName = defaultSourceNameFromPath(sourcePath);
-      const nextSources = [...sources, {
-        ...createSource(),
-        name: sourceName,
-        path: sourcePath,
-      }];
-      await saveSourceList(nextSources, `已导入「${sourceName}」，现在可以在 Agent 创建页勾选。`);
-    } catch (importFailure) {
-      setScanError((importFailure as Error).message || '直接导入文件夹失败');
-    } finally {
-      setDirectImportLoading(false);
-    }
-  };
-
-  const importSelectedCandidates = async () => {
-    const selected = candidates.filter((candidate) => selectedCandidatePaths.includes(candidate.path));
-    if (!selected.length) {
-      setScanError('请先选择要导入的目录');
-      return;
-    }
-    const paths = new Set(sources.map((source) => source.path.trim()).filter(Boolean));
-    const additions = selected
-      .filter((candidate) => !paths.has(candidate.path))
-      .map((candidate) => ({
-        ...createSource(),
-        name: candidate.name,
-        path: candidate.path,
-      }));
-    if (!additions.length) {
-      setScanError('选中的目录都已经导入');
-      return;
-    }
-    setScanError('');
-    try {
-      await saveSourceList([...sources, ...additions], `已导入 ${additions.length} 个知识库，现在可以在 Agent 创建页勾选。`);
-    } catch {
-      // saveSourceList 已写入错误状态。
     }
   };
 
@@ -314,97 +293,82 @@ export default function Knowledge() {
       <div className="card" style={{ marginBottom: 16 }}>
         <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 12 }}>
           <div>
-            <div className="card-header" style={{ marginBottom: 4 }}>导入本地文件夹</div>
+            <div className="card-header" style={{ marginBottom: 4 }}>上传本地文件夹</div>
             <div className="tool-card-desc">
-              扫描服务端本机允许目录，把 Obsidian vault 或 markdown 笔记目录加入我的知识库。
+              打开本地文件夹后勾选要上传的 markdown 或文本文件，上传后会生成一个可绑定到 Agent 的知识库。
             </div>
           </div>
           <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            <button className="btn btn-sm" onClick={() => void importInputPathDirectly()} disabled={directImportLoading || !canSave}>
-              {directImportLoading ? '导入中...' : '直接导入文件夹'}
-            </button>
-            <button className="btn btn-sm btn-primary" onClick={() => void scanLocalSources()} disabled={scanLoading || !canSave}>
-              {scanLoading ? '扫描中...' : '扫描'}
-            </button>
-          </div>
-        </div>
-        <div className="grid-2" style={{ alignItems: 'start' }}>
-          <div className="form-group" style={{ marginBottom: 0 }}>
-            <label>本地文件夹或允许根目录</label>
             <input
-              value={scanPath}
-              onChange={e => setScanPath(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') void scanLocalSources(); }}
-              placeholder="/Users/xiaoqin/Documents 或 /Users/xiaoqin/Documents/每日AI分享"
-              style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}
-              disabled={!canSave}
+              ref={folderInputRef}
+              type="file"
+              multiple
+              {...{ webkitdirectory: '', directory: '' }}
+              onChange={e => handleFolderPicked(e.currentTarget.files)}
+              style={{ display: 'none' }}
             />
-          </div>
-          <div style={{ fontSize: '.76em', color: 'var(--ink-muted)', lineHeight: 1.6 }}>
-            {scanRoots.length > 0 ? (
-              <>
-                <div style={{ fontWeight: 600, color: 'var(--ink-secondary)' }}>允许根目录</div>
-                {scanRoots.map((root) => <div key={root} style={{ fontFamily: 'var(--font-mono)' }}>{root}</div>)}
-              </>
-            ) : (
-              <div>可以输入 /Users/xiaoqin/Documents 作为扫描根目录，也可以输入其中任意子文件夹后直接导入。</div>
-            )}
+            <button className="btn btn-sm" onClick={() => folderInputRef.current?.click()} disabled={!canSave || directImportLoading}>
+              打开文件夹
+            </button>
+            <button className="btn btn-sm btn-primary" onClick={() => void uploadSelectedFolderFiles()} disabled={!canSave || directImportLoading || uploadFiles.filter(file => file.selected).length === 0}>
+              {directImportLoading ? '上传中...' : '上传选中文件'}
+            </button>
           </div>
         </div>
+
         {scanError && <div style={{ color: 'var(--danger)', fontSize: '.8em', marginTop: 10 }}>{scanError}</div>}
-        {candidates.length > 0 && (
+
+        {uploadFiles.length > 0 && (
           <div style={{ marginTop: 12, border: '1px solid var(--border)', borderRadius: 6, overflow: 'hidden' }}>
             <div className="flex-between" style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', background: 'var(--bg-hover)', gap: 8, flexWrap: 'wrap' }}>
-              <span style={{ fontSize: '.82em', fontWeight: 600 }}>
-                候选目录 {selectedCandidatePaths.length}/{candidates.length}
-              </span>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: '.82em', fontWeight: 700 }}>
+                  {folderName || '上传知识库'}
+                </div>
+                <div style={{ fontSize: '.74em', color: 'var(--ink-muted)' }}>
+                  已选 {uploadFiles.filter(file => file.selected).length}/{uploadFiles.length} 个文件
+                </div>
+              </div>
               <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-                <button className="btn btn-sm" onClick={() => setSelectedCandidatePaths(candidates.filter((candidate) => !existingPaths.has(candidate.path)).map((candidate) => candidate.path))}>全选新目录</button>
-                <button className="btn btn-sm" onClick={() => setSelectedCandidatePaths([])}>清空</button>
-                <button className="btn btn-sm btn-primary" onClick={() => void importSelectedCandidates()} disabled={saving}>导入选中</button>
+                <input
+                  value={folderName}
+                  onChange={e => setFolderName(e.target.value)}
+                  placeholder="知识库名称"
+                  style={{ width: 180 }}
+                />
+                <button className="btn btn-sm" onClick={() => setUploadFiles(current => current.map(file => ({ ...file, selected: true })))}>全选</button>
+                <button className="btn btn-sm" onClick={() => setUploadFiles(current => current.map(file => ({ ...file, selected: false })))}>清空</button>
               </div>
             </div>
             <div style={{ maxHeight: 280, overflowY: 'auto' }}>
-              {candidates.map((candidate) => {
-                const exists = existingPaths.has(candidate.path);
-                return (
-                  <label
-                    key={candidate.path}
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'auto minmax(0, 1fr) auto',
-                      gap: 10,
-                      alignItems: 'start',
-                      padding: '10px',
-                      borderBottom: '1px solid var(--border)',
-                      opacity: exists ? .55 : 1,
-                      cursor: exists ? 'not-allowed' : 'pointer',
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedCandidatePaths.includes(candidate.path)}
-                      disabled={exists}
-                      onChange={() => toggleCandidate(candidate.path)}
-                      style={{ width: 'auto', marginTop: 3 }}
-                    />
-                    <span style={{ minWidth: 0 }}>
-                      <span style={{ display: 'block', fontWeight: 700 }}>{candidate.name}</span>
-                      <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.72em', color: 'var(--ink-secondary)', overflowWrap: 'anywhere', marginTop: 2 }}>
-                        {candidate.path}
-                      </span>
-                      {candidate.sampleFiles.length > 0 && (
-                        <span style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
-                          {candidate.sampleFiles.slice(0, 4).map((file) => <span className="badge badge-muted" key={file}>{file}</span>)}
-                        </span>
-                      )}
+              {uploadFiles.map((item) => (
+                <label
+                  key={item.id}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'auto minmax(0, 1fr) auto',
+                    gap: 10,
+                    alignItems: 'start',
+                    padding: '10px',
+                    borderBottom: '1px solid var(--border)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={item.selected}
+                    onChange={() => toggleUploadFile(item.id)}
+                    style={{ width: 'auto', marginTop: 3 }}
+                  />
+                  <span style={{ minWidth: 0 }}>
+                    <span style={{ display: 'block', fontWeight: 700 }}>{item.name}</span>
+                    <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.72em', color: 'var(--ink-secondary)', overflowWrap: 'anywhere', marginTop: 2 }}>
+                      {item.relativePath}
                     </span>
-                    <span className={exists ? 'badge badge-muted' : 'badge badge-info'}>
-                      {exists ? '已添加' : `${candidate.fileCount} .md`}
-                    </span>
-                  </label>
-                );
-              })}
+                  </span>
+                  <span className="badge badge-muted">{formatBytes(item.size)}</span>
+                </label>
+              ))}
             </div>
           </div>
         )}
