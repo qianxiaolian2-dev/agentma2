@@ -152,6 +152,7 @@ export default function Conversations() {
   const [eventSources, setEventSources] = useState<EventSourceConfig[]>([]);
   const [subbedSources, setSubbedSources] = useState<string[]>([]);
   const [showEventToggles, setShowEventToggles] = useState(false);
+  const [sessionSearch, setSessionSearch] = useState('');
   const persistRef = useRef<((msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => Promise<string>) | null>(null);
 
   // 自动回复
@@ -727,9 +728,22 @@ export default function Conversations() {
           </button>
         </div>
 
+        {/* 会话搜索 */}
+        {sessions.length > 5 && (
+          <div style={{ padding: '6px 8px', borderBottom: '1px solid var(--border)' }}>
+            <input
+              value={sessionSearch}
+              onChange={e => setSessionSearch(e.target.value)}
+              placeholder="搜索会话..."
+              style={{ width: '100%', fontSize: '.78em', padding: '4px 8px', borderRadius: 4, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--ink)' }}
+            />
+          </div>
+        )}
+
         {/* 会话列表 */}
         <div ref={sidebarRef} style={{ flex: 1, overflowY: 'auto', padding: '8px 8px' }}>
           {[...sessions]
+            .filter(s => !sessionSearch || s.title?.toLowerCase().includes(sessionSearch.toLowerCase()))
             .sort((a, b) => {
               if (a.pinned && !b.pinned) return -1;
               if (!a.pinned && b.pinned) return 1;

@@ -15,11 +15,12 @@
 | P1 让执行变真 | 25% | ✅ **100%** | runAgent / SDK query() / 配额审计入库 |
 | P2 把配置面接到真能力 | 30% | ✅ **100%** | Permissions ✅ / Hooks ✅ / Sessions ✅ / Subagents ✅ / McpServers ✅ |
 | P3 生产化 / 多租户 | 30% | ❌ **0%** | 沙箱 / OTel / 多租户强隔离 0 启动（需拍板） |
-| P4 差异化 / 丰富度 | 15% | 🟡 **25%** | 结构化输出 ✅ / AskUserQuestion ✅ / Observability 真数据 ✅ / 其余 ❌ |
+| P4 差异化 / 丰富度 | 15% | 🟡 **55%** | 结构化输出 ✅ / AskUserQuestion ✅ / Observability 真数据 ✅ / enableFileCheckpointing ✅ / 图片粘贴 ✅ / ChatMessageBubble(thinking/copy/timestamp) ✅ / 运行统计条 ✅ / 会话搜索 ✅ / 文件回滚 rewind UI ❌ / Skills 市场 ❌ |
 | §5 小赢 | 散件 | ✅ **100%** | 全部完成 |
 
-**整体加权进度 ≈ 56%**，**核心功能层(P1+P2)= 100%**。
+**整体加权进度 ≈ 64%**，**核心功能层(P1+P2)= 100%**。
 sdkSimulator 活跃调用归零，所有页面使用真实 API 或合理静态配置。
+聊天体验已达行业标准：图片粘贴、thinking 展示、复制按钮、运行成本、结构化输出渲染。
 
 ### 已合并 commit(`8c91b32` 之后)
 
