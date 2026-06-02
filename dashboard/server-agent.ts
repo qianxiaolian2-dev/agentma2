@@ -470,6 +470,26 @@ function getSelectedSkillSlashCommand(prompt: string, skills?: string[]) {
   return null;
 }
 
+function getThinkingText(block: Record<string, unknown>) {
+  if (block.type !== 'thinking') return '';
+  for (const key of ['thinking', 'text', 'content', 'summary']) {
+    if (typeof block[key] === 'string') return block[key] as string;
+  }
+  return '';
+}
+
+function getThinkingDeltaText(event: Record<string, unknown>) {
+  if (event.type !== 'content_block_delta') return '';
+  const delta = event.delta;
+  if (!delta || typeof delta !== 'object' || Array.isArray(delta)) return '';
+  const record = delta as Record<string, unknown>;
+  if (record.type !== 'thinking_delta') return '';
+  for (const key of ['thinking', 'text']) {
+    if (typeof record[key] === 'string') return record[key] as string;
+  }
+  return '';
+}
+
 async function* buildUserPromptStream(text: string, images: NonNullable<RunAgentOptions['promptImages']>): AsyncIterable<SDKUserMessage> {
   const content: any[] = [];
   const cleanText = text.trim();
@@ -618,6 +638,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
   const startTime = Date.now();
   let inTok = 0, outTok = 0, finalText = '', status = 'success', sdkSessionId = opts.resumeSdkSessionId || '', structuredOutput: unknown = undefined;
+  let emittedThinking = false;
+  const emitThinking = (text: string) => {
+    if (!text) return;
+    emittedThinking = true;
+    opts.emit({ type: 'delta', text, thinking: true });
+  };
 
   try {
     const selectedSkillCommand = getSelectedSkillSlashCommand(opts.prompt, opts.skills);
@@ -635,7 +661,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         permissionMode: 'default',  // canUseTool decides everything
         ...(sdkBuiltinTools.size ? { tools: Array.from(sdkBuiltinTools) } : {}),
         canUseTool,
+        includePartialMessages: true,
         maxTurns: Number(opts.maxTurns) || 20,
+        thinking: { type: 'adaptive', display: 'summarized' },
         cwd,
         ...(additionalDirectories.length ? { additionalDirectories } : {}),
         ...(agentNames.length ? { agents: opts.subagents, forwardSubagentText: true, agentProgressSummaries: true } : {}),
@@ -644,6 +672,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         ...(opts.enableFileCheckpointing ? { enableFileCheckpointing: true } : {}),
         ...(opts.skills?.length ? { skills: opts.skills } : {}),
         env,
+        settings: { showThinkingSummaries: true },
         ...(hooks ? { hooks, includeHookEvents: true } : {}),
         ...(customMcp ? { mcpServers: { custom: customMcp } } : {}),
         ...(effectiveSystemPrompt ? { systemPrompt: effectiveSystemPrompt } : {}),
@@ -651,11 +680,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     })) {
       const m = msg as any;
       if (m.session_id && !sdkSessionId) sdkSessionId = m.session_id;
-      if (m.type === 'system' && m.subtype === 'init') {
+      if (m.type === 'stream_event') {
+        emitThinking(getThinkingDeltaText(m.event || {}));
+      } else if (m.type === 'system' && m.subtype === 'init') {
         opts.emit({ type: 'system', subtype: 'init', model: m.model, tools: (m.tools || []).length, cwd, sdkSessionId: m.session_id || sdkSessionId || undefined });
       } else if (m.type === 'assistant') {
         for (const b of m.message?.content || []) {
           if (b.type === 'text' && b.text) { finalText += b.text; opts.emit({ type: 'delta', text: b.text }); }
+          else if (b.type === 'thinking') {
+            const thinkingText = getThinkingText(b);
+            if (!emittedThinking) emitThinking(thinkingText);
+          }
           else if (b.type === 'tool_use') opts.emit({ type: 'delta', text: `\n🔧 ${b.name}(${JSON.stringify(b.input).slice(0, 150)})\n` });
         }
       } else if (m.type === 'user') {
