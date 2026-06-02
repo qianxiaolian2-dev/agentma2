@@ -170,10 +170,41 @@ export default function Knowledge() {
     ));
   };
 
+  const saveSourceList = async (sourceList: KnowledgeSource[], successMessage: string) => {
+    setSaving(true);
+    setError('');
+    setStatus('');
+    try {
+      const payload = sourceList
+        .filter((source) => source.path.trim())
+        .map((source) => ({
+          ...source,
+          name: source.name.trim(),
+          path: source.path.trim(),
+          readOnly: true,
+        }));
+      const response = await fetch('/api/knowledge/sources', {
+        method: 'PUT',
+        headers: jsonAuthHeaders(),
+        body: JSON.stringify(payload),
+      });
+      const data = await readJson<unknown>(response);
+      const next = normalizeSources(data);
+      setSources(next);
+      setSavedSources(next);
+      setStatus(successMessage);
+    } catch (saveError) {
+      setError((saveError as Error).message || '保存知识库失败');
+      throw saveError;
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const importInputPathDirectly = async () => {
     const sourcePath = scanPath.trim();
     if (!sourcePath) {
-      setScanError('请输入要创建为知识库的本地文件夹路径');
+      setScanError('请输入要导入的本地文件夹路径');
       return;
     }
     if (existingPaths.has(sourcePath)) {
@@ -192,42 +223,43 @@ export default function Knowledge() {
       const result = await readJson<KnowledgeTestResult>(response);
       if (!result.ok) throw new Error(result.reason || '文件夹不可用');
       const sourceName = defaultSourceNameFromPath(sourcePath);
-      setSources((current) => {
-        const paths = new Set(current.map((source) => source.path.trim()).filter(Boolean));
-        if (paths.has(sourcePath)) return current;
-        return [...current, {
-          ...createSource(),
-          name: sourceName,
-          path: sourcePath,
-        }];
-      });
-      setStatus(`已加入「${sourceName}」知识库草稿，保存后可在 Agent 创建页勾选。`);
+      const nextSources = [...sources, {
+        ...createSource(),
+        name: sourceName,
+        path: sourcePath,
+      }];
+      await saveSourceList(nextSources, `已导入「${sourceName}」，现在可以在 Agent 创建页勾选。`);
     } catch (importFailure) {
-      setScanError((importFailure as Error).message || '直接创建知识库失败');
+      setScanError((importFailure as Error).message || '直接导入文件夹失败');
     } finally {
       setDirectImportLoading(false);
     }
   };
 
-  const importSelectedCandidates = () => {
+  const importSelectedCandidates = async () => {
     const selected = candidates.filter((candidate) => selectedCandidatePaths.includes(candidate.path));
     if (!selected.length) {
       setScanError('请先选择要导入的目录');
       return;
     }
-    setSources((current) => {
-      const paths = new Set(current.map((source) => source.path.trim()).filter(Boolean));
-      const additions = selected
-        .filter((candidate) => !paths.has(candidate.path))
-        .map((candidate) => ({
-          ...createSource(),
-          name: candidate.name,
-          path: candidate.path,
-        }));
-      return [...current, ...additions];
-    });
-    setStatus(`已加入 ${selected.filter((candidate) => !existingPaths.has(candidate.path)).length} 个知识库草稿，保存后可在 Agent 创建页勾选。`);
+    const paths = new Set(sources.map((source) => source.path.trim()).filter(Boolean));
+    const additions = selected
+      .filter((candidate) => !paths.has(candidate.path))
+      .map((candidate) => ({
+        ...createSource(),
+        name: candidate.name,
+        path: candidate.path,
+      }));
+    if (!additions.length) {
+      setScanError('选中的目录都已经导入');
+      return;
+    }
     setScanError('');
+    try {
+      await saveSourceList([...sources, ...additions], `已导入 ${additions.length} 个知识库，现在可以在 Agent 创建页勾选。`);
+    } catch {
+      // saveSourceList 已写入错误状态。
+    }
   };
 
   const deleteSource = (id: string) => {
@@ -261,40 +293,14 @@ export default function Knowledge() {
   };
 
   const saveSources = async () => {
-    setSaving(true);
-    setError('');
-    setStatus('');
-    try {
-      const payload = sources
-        .filter((source) => source.path.trim())
-        .map((source) => ({
-          ...source,
-          name: source.name.trim(),
-          path: source.path.trim(),
-          readOnly: true,
-        }));
-      const response = await fetch('/api/knowledge/sources', {
-        method: 'PUT',
-        headers: jsonAuthHeaders(),
-        body: JSON.stringify(payload),
-      });
-      const data = await readJson<unknown>(response);
-      const next = normalizeSources(data);
-      setSources(next);
-      setSavedSources(next);
-      setStatus('已保存。现在可以在 Agent 创建页按需勾选这些知识库。');
-    } catch (saveError) {
-      setError((saveError as Error).message || '保存知识库失败');
-    } finally {
-      setSaving(false);
-    }
+    await saveSourceList(sources, '已保存。现在可以在 Agent 创建页按需勾选这些知识库。').catch(() => {});
   };
 
   return (
     <div>
       <div className="page-header">
         <h1>📚 知识库</h1>
-        <p>创建可绑定到 Agent 的本地知识库，每个知识库对应一个只读文件夹。</p>
+        <p>导入可绑定到 Agent 的本地文件夹，每个知识库对应一个只读目录。</p>
       </div>
 
       {error && <div className="card mb-4" style={{ borderColor: 'var(--danger)', background: 'var(--danger-bg)', color: 'var(--danger)' }}>{error}</div>}
@@ -308,14 +314,14 @@ export default function Knowledge() {
       <div className="card" style={{ marginBottom: 16 }}>
         <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 12 }}>
           <div>
-            <div className="card-header" style={{ marginBottom: 4 }}>创建 / 导入知识库</div>
+            <div className="card-header" style={{ marginBottom: 4 }}>导入本地文件夹</div>
             <div className="tool-card-desc">
               扫描服务端本机允许目录，把 Obsidian vault 或 markdown 笔记目录加入我的知识库。
             </div>
           </div>
           <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <button className="btn btn-sm" onClick={() => void importInputPathDirectly()} disabled={directImportLoading || !canSave}>
-              {directImportLoading ? '创建中...' : '直接创建此文件夹'}
+              {directImportLoading ? '导入中...' : '直接导入文件夹'}
             </button>
             <button className="btn btn-sm btn-primary" onClick={() => void scanLocalSources()} disabled={scanLoading || !canSave}>
               {scanLoading ? '扫描中...' : '扫描'}
@@ -341,7 +347,7 @@ export default function Knowledge() {
                 {scanRoots.map((root) => <div key={root} style={{ fontFamily: 'var(--font-mono)' }}>{root}</div>)}
               </>
             ) : (
-              <div>可以输入 /Users/xiaoqin/Documents 作为扫描根目录，也可以输入其中任意子文件夹后直接创建知识库。</div>
+              <div>可以输入 /Users/xiaoqin/Documents 作为扫描根目录，也可以输入其中任意子文件夹后直接导入。</div>
             )}
           </div>
         </div>
@@ -355,7 +361,7 @@ export default function Knowledge() {
               <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
                 <button className="btn btn-sm" onClick={() => setSelectedCandidatePaths(candidates.filter((candidate) => !existingPaths.has(candidate.path)).map((candidate) => candidate.path))}>全选新目录</button>
                 <button className="btn btn-sm" onClick={() => setSelectedCandidatePaths([])}>清空</button>
-                <button className="btn btn-sm btn-primary" onClick={importSelectedCandidates}>创建选中</button>
+                <button className="btn btn-sm btn-primary" onClick={() => void importSelectedCandidates()} disabled={saving}>导入选中</button>
               </div>
             </div>
             <div style={{ maxHeight: 280, overflowY: 'auto' }}>
@@ -408,7 +414,7 @@ export default function Knowledge() {
         <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
           <div>
             <div className="card-header" style={{ marginBottom: 4 }}>我的知识库</div>
-            <div className="tool-card-desc">已创建 {sources.length} 个知识库，{enabledCount} 个可被 Agent 勾选。保存时会校验目录存在、可读，并且位于服务器允许的根目录内。</div>
+            <div className="tool-card-desc">已导入 {sources.length} 个知识库，{enabledCount} 个可被 Agent 勾选。保存时会校验目录存在、可读，并且位于服务器允许的根目录内。</div>
           </div>
           <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <button className="btn btn-sm" onClick={addSource} disabled={saving}>+ 添加</button>
@@ -423,7 +429,7 @@ export default function Knowledge() {
           <div style={{ color: 'var(--ink-muted)', padding: 24, textAlign: 'center' }}>加载中...</div>
         ) : sources.length === 0 ? (
           <div style={{ color: 'var(--ink-muted)', padding: 24, textAlign: 'center' }}>
-            还没有知识库。添加一个 Obsidian vault 或 markdown 笔记目录后，就能在 Agent 创建页勾选它。
+            还没有知识库。导入一个 Obsidian vault 或 markdown 笔记目录后，就能在 Agent 创建页勾选它。
           </div>
         ) : (
           <div className="table-wrap">
