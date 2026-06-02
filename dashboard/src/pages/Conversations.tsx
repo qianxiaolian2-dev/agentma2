@@ -16,8 +16,9 @@ import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
 import {
   bootstrapChatSessions,
+  createChatSessionTitle,
   deleteChatSession as deleteChatSessionApi,
-  forkChatSession as forkChatSessionApi,
+  getChatSessionDisplayTitle,
   patchChatSession,
   saveChatSession as saveChatSessionApi,
 } from '../utils/chat-sessions';
@@ -398,7 +399,7 @@ export default function Conversations() {
     const draft: ChatSession = {
       id,
       templateId: selectedAgentId,
-      title: existing?.title || msgs[0]?.content?.slice(0, 40) || '新对话',
+      title: createChatSessionTitle(msgs, existing?.title),
       messages: msgs,
       model: currentAgent?.model || provider.current.ANTHROPIC_MODEL || existing?.model || '',
       sdkSessionId: sdkSessionId || existing?.sdkSessionId,
@@ -502,18 +503,6 @@ export default function Conversations() {
       setSessions(prev => prev.map(s => s.id === id ? saved : s));
     } catch (error) {
       console.error('failed to pin chat session', error);
-    }
-  };
-
-  const handleFork = async (source: ChatSession, e: React.MouseEvent) => {
-    e.stopPropagation();
-    const title = `${source.title || source.messages[0]?.content?.slice(0, 40) || '新对话'} · fork`;
-    try {
-      const forked = await forkChatSessionApi(source.id, { title });
-      setSessions(prev => [forked, ...prev.filter(s => s.id !== forked.id)]);
-      handleSelect(forked);
-    } catch (error) {
-      console.error('failed to fork chat session', error);
     }
   };
 
@@ -780,7 +769,7 @@ export default function Conversations() {
         {/* 会话列表 */}
         <div ref={sidebarRef} style={{ flex: 1, overflowY: 'auto', padding: '8px 8px' }}>
           {[...sessions]
-            .filter(s => !sessionSearch || s.title?.toLowerCase().includes(sessionSearch.toLowerCase()))
+            .filter(s => !sessionSearch || getChatSessionDisplayTitle(s).toLowerCase().includes(sessionSearch.toLowerCase()))
             .sort((a, b) => {
               if (a.pinned && !b.pinned) return -1;
               if (!a.pinned && b.pinned) return 1;
@@ -818,10 +807,9 @@ export default function Conversations() {
                     <div
                       style={{ fontSize: '.84em', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}
                       onDoubleClick={e => { e.stopPropagation(); startRename(s); }}
-                      title="双击编辑标题"
+                      title={`${getChatSessionDisplayTitle(s)} · 双击编辑标题`}
                     >
-                      {s.pinned && <span style={{ marginRight: 4 }}>📌</span>}
-                      {s.title || s.messages[0]?.content?.slice(0, 25) || '(无标题)'}
+                      {getChatSessionDisplayTitle(s)}
                     </div>
                   )}
                   <span
@@ -837,12 +825,6 @@ export default function Conversations() {
                 <div className="flex-between" style={{ fontSize: '.68em', color: 'var(--ink-muted)', marginTop: 2 }}>
                   <span>{new Date(s.updatedAt).toLocaleDateString()}</span>
                   <span className="flex gap-2">
-                    <button
-                      className="btn btn-sm"
-                      style={{ padding: '0 6px', fontSize: '.85em' }}
-                      title="从当前消息历史分叉一个新会话"
-                      onClick={e => { void handleFork(s, e); }}
-                    >分叉</button>
                     <button
                       className="btn btn-sm"
                       style={{ padding: '0 6px', fontSize: '.85em', color: 'var(--danger)' }}

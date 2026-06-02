@@ -3,6 +3,32 @@ import { getAuthHeaders } from './client-runtime';
 
 const LEGACY_SESSION_KEY = 'agentma_chat_sessions';
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const GENERIC_TITLES = new Set(['新对话', '(无标题)', '未命名对话']);
+const MEANINGLESS_TITLE_RE = /^[\d\s,，.。、;；:：|/\\_-]+$/;
+
+function compactTitleText(value: unknown): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+}
+
+function isMeaningfulTitle(value: string): boolean {
+  return Boolean(value) && !GENERIC_TITLES.has(value) && !MEANINGLESS_TITLE_RE.test(value);
+}
+
+export function createChatSessionTitle(messages: ChatMessage[], existingTitle?: string): string {
+  const current = compactTitleText(existingTitle);
+  if (isMeaningfulTitle(current)) return current.slice(0, 60);
+
+  const firstUser = messages.find((message) => message.role === 'user') || messages[0];
+  const content = compactTitleText(firstUser?.content);
+  if (isMeaningfulTitle(content)) return content.slice(0, 40);
+  if (firstUser?.attachments?.some((attachment) => attachment.type === 'image')) return '图片对话';
+  if (content) return '未命名对话';
+  return '新对话';
+}
+
+export function getChatSessionDisplayTitle(session: Pick<ChatSession, 'title' | 'messages'>): string {
+  return createChatSessionTitle(session.messages, session.title);
+}
 
 function normalizeAttachments(value: unknown): ChatImageAttachment[] {
   if (!Array.isArray(value)) return [];

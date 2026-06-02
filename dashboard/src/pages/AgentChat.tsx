@@ -7,7 +7,7 @@ import { bootstrapAgentTemplates, getCachedAgentTemplateById } from '../utils/ag
 import { isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
 import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
 import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../components/AskUserQuestionPrompt';
-import { bootstrapChatSessions, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
+import { bootstrapChatSessions, createChatSessionTitle, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
@@ -115,7 +115,7 @@ export default function AgentChat() {
     const draft: ChatSession = {
       id: nextId,
       templateId: id,
-      title: sessionMeta?.title || nextMessages[0]?.content?.slice(0, 40) || '新对话',
+      title: createChatSessionTitle(nextMessages, sessionMeta?.title),
       messages: nextMessages,
       model: template.model || provider.current.ANTHROPIC_MODEL || sessionMeta?.model || '',
       sdkSessionId: sdkSessionId || sessionMeta?.sdkSessionId,
