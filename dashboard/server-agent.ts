@@ -447,6 +447,15 @@ function buildSkillsSystemPrompt(skills: string[]) {
   ].join('\n');
 }
 
+function buildAskUserQuestionSystemPrompt() {
+  return [
+    '当前 Agent 模板已启用 AskUserQuestion 工具。',
+    '当用户需求、范围、输出格式、偏好或关键约束不明确,且用户答案会明显改变结果时,主动调用 AskUserQuestion,不要直接猜。',
+    'AskUserQuestion 输入格式必须是: { questions: [{ question, header, options, multiSelect }] }。',
+    '每个问题提供 2-4 个 options;每个 option 包含 label 和 description,可选 preview;header 保持简短。',
+  ].join('\n');
+}
+
 function getSelectedSkillSlashCommand(prompt: string, skills?: string[]) {
   if (!skills?.length) return null;
   const match = prompt.trim().match(/^\/([a-zA-Z0-9._:-]+)(?:\s+|$)([\s\S]*)$/);
@@ -539,7 +548,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   const additionalDirectories = knowledgeSources.map((source) => source.path);
   const knowledgeSystemPrompt = knowledgeSources.length ? buildKnowledgeSystemPrompt(knowledgeSources) : '';
   const skillsSystemPrompt = opts.skills?.length ? buildSkillsSystemPrompt(opts.skills) : '';
-  const effectiveSystemPrompt = [opts.systemPrompt, knowledgeSystemPrompt, skillsSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
+  const askUserQuestionSystemPrompt = opts.tools?.includes('AskUserQuestion') ? buildAskUserQuestionSystemPrompt() : '';
+  const effectiveSystemPrompt = [opts.systemPrompt, knowledgeSystemPrompt, skillsSystemPrompt, askUserQuestionSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
   const agentNames = Object.keys(opts.subagents || {});
   const subagentToolNames = new Set<string>();
   for (const agent of Object.values(opts.subagents || {})) {
@@ -661,6 +671,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         permissionMode: 'default',  // canUseTool decides everything
         ...(sdkBuiltinTools.size ? { tools: Array.from(sdkBuiltinTools) } : {}),
         canUseTool,
+        ...(opts.tools?.includes('AskUserQuestion') ? { toolConfig: { askUserQuestion: { previewFormat: 'markdown' } } } : {}),
         includePartialMessages: true,
         maxTurns: Number(opts.maxTurns) || 20,
         thinking: { type: 'adaptive', display: 'summarized' },
