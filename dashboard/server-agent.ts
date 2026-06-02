@@ -438,6 +438,38 @@ function buildKnowledgeSystemPrompt(sources: Array<{ name: string; path: string 
   ].join('\n');
 }
 
+function buildSkillsSystemPrompt(skills: string[]) {
+  return [
+    '当前 Agent 模板已启用以下 Skills:',
+    ...skills.map((skill) => `- ${skill}`),
+    '当用户请求以 /<skill> 开头,或请求明显匹配某个 Skill 的用途时,优先使用 Skill 工具加载并执行对应 Skill。',
+    '不要在相关请求中只凭通用能力回答;如果使用了 Skill,在回答中说明使用了哪个 Skill。',
+  ].join('\n');
+}
+
+function getSelectedSkillSlashCommand(prompt: string, skills?: string[]) {
+  if (!skills?.length) return null;
+  const match = prompt.trim().match(/^\/([a-zA-Z0-9._:-]+)(?:\s+|$)([\s\S]*)$/);
+  if (!match) return null;
+
+  const command = match[1].toLowerCase();
+  for (const skill of skills) {
+    const name = skill.trim();
+    if (!name) continue;
+    const aliases = [name, name.includes(':') ? name.split(':').pop() || '' : '']
+      .filter(Boolean)
+      .map((alias) => alias.toLowerCase());
+    if (aliases.includes(command)) {
+      return {
+        command: match[1],
+        skill: name,
+        args: (match[2] || '').trim(),
+      };
+    }
+  }
+  return null;
+}
+
 async function* buildUserPromptStream(text: string, images: NonNullable<RunAgentOptions['promptImages']>): AsyncIterable<SDKUserMessage> {
   const content: any[] = [];
   const cleanText = text.trim();
@@ -486,7 +518,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     : [];
   const additionalDirectories = knowledgeSources.map((source) => source.path);
   const knowledgeSystemPrompt = knowledgeSources.length ? buildKnowledgeSystemPrompt(knowledgeSources) : '';
-  const effectiveSystemPrompt = [opts.systemPrompt, knowledgeSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
+  const skillsSystemPrompt = opts.skills?.length ? buildSkillsSystemPrompt(opts.skills) : '';
+  const effectiveSystemPrompt = [opts.systemPrompt, knowledgeSystemPrompt, skillsSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
   const agentNames = Object.keys(opts.subagents || {});
   const subagentToolNames = new Set<string>();
   for (const agent of Object.values(opts.subagents || {})) {
@@ -587,6 +620,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   let inTok = 0, outTok = 0, finalText = '', status = 'success', sdkSessionId = opts.resumeSdkSessionId || '', structuredOutput: unknown = undefined;
 
   try {
+    const selectedSkillCommand = getSelectedSkillSlashCommand(opts.prompt, opts.skills);
+    if (selectedSkillCommand) {
+      const args = selectedSkillCommand.args ? ` ${selectedSkillCommand.args.slice(0, 160)}` : '';
+      opts.emit({ type: 'delta', text: `\n[Skill] /${selectedSkillCommand.command}${args} -> ${selectedSkillCommand.skill}\n` });
+    }
     const queryPrompt = opts.promptImages?.length
       ? buildUserPromptStream(opts.prompt, opts.promptImages)
       : opts.prompt;
