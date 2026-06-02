@@ -61,6 +61,17 @@ import {
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '25mb' }));
+app.use((error: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (error?.type === 'entity.too.large') {
+    res.status(413).json({ error: '上传内容超过限制，单次最多上传 20MB 文本文件' });
+    return;
+  }
+  if (error instanceof SyntaxError && 'body' in error) {
+    res.status(400).json({ error: '请求 JSON 格式无效' });
+    return;
+  }
+  next(error);
+});
 // 生产模式：serve 前端静态文件
 app.use(express.static(path.join(import.meta.dirname, 'dist')));
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));

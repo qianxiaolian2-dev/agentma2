@@ -34,6 +34,7 @@ type TestState = {
 };
 
 const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 
 function createSource(): KnowledgeSource {
   return {
@@ -179,6 +180,11 @@ export default function Knowledge() {
     const selected = uploadFiles.filter((file) => file.selected);
     if (!selected.length) {
       setScanError('请先勾选要上传的文件');
+      return;
+    }
+    const totalBytes = selected.reduce((sum, file) => sum + file.size, 0);
+    if (totalBytes > MAX_UPLOAD_BYTES) {
+      setScanError(`选中文件总大小 ${formatBytes(totalBytes)}，单次最多上传 ${formatBytes(MAX_UPLOAD_BYTES)}`);
       return;
     }
     setDirectImportLoading(true);
