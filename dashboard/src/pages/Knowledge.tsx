@@ -43,6 +43,12 @@ function createSource(): KnowledgeSource {
   };
 }
 
+function defaultSourceNameFromPath(sourcePath: string) {
+  const normalized = sourcePath.trim().replace(/[\\/]+$/, '');
+  const parts = normalized.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || '知识库';
+}
+
 async function readJson<T>(response: Response): Promise<T> {
   const text = await response.text();
   let data: unknown = {};
@@ -96,6 +102,7 @@ export default function Knowledge() {
   const [status, setStatus] = useState('');
   const [scanPath, setScanPath] = useState('');
   const [scanLoading, setScanLoading] = useState(false);
+  const [directImportLoading, setDirectImportLoading] = useState(false);
   const [scanError, setScanError] = useState('');
   const [scanRoots, setScanRoots] = useState<string[]>([]);
   const [candidates, setCandidates] = useState<KnowledgeCandidate[]>([]);
@@ -161,6 +168,45 @@ export default function Knowledge() {
         ? current.filter((item) => item !== candidatePath)
         : [...current, candidatePath]
     ));
+  };
+
+  const importInputPathDirectly = async () => {
+    const sourcePath = scanPath.trim();
+    if (!sourcePath) {
+      setScanError('请输入要创建为知识库的本地文件夹路径');
+      return;
+    }
+    if (existingPaths.has(sourcePath)) {
+      setScanError('这个文件夹已经在我的知识库里');
+      return;
+    }
+    setDirectImportLoading(true);
+    setScanError('');
+    setStatus('');
+    try {
+      const response = await fetch('/api/knowledge/sources/test', {
+        method: 'POST',
+        headers: jsonAuthHeaders(),
+        body: JSON.stringify({ path: sourcePath }),
+      });
+      const result = await readJson<KnowledgeTestResult>(response);
+      if (!result.ok) throw new Error(result.reason || '文件夹不可用');
+      const sourceName = defaultSourceNameFromPath(sourcePath);
+      setSources((current) => {
+        const paths = new Set(current.map((source) => source.path.trim()).filter(Boolean));
+        if (paths.has(sourcePath)) return current;
+        return [...current, {
+          ...createSource(),
+          name: sourceName,
+          path: sourcePath,
+        }];
+      });
+      setStatus(`已加入「${sourceName}」知识库草稿，保存后可在 Agent 创建页勾选。`);
+    } catch (importFailure) {
+      setScanError((importFailure as Error).message || '直接创建知识库失败');
+    } finally {
+      setDirectImportLoading(false);
+    }
   };
 
   const importSelectedCandidates = () => {
@@ -267,18 +313,23 @@ export default function Knowledge() {
               扫描服务端本机允许目录，把 Obsidian vault 或 markdown 笔记目录加入我的知识库。
             </div>
           </div>
-          <button className="btn btn-sm btn-primary" onClick={() => void scanLocalSources()} disabled={scanLoading || !canSave}>
-            {scanLoading ? '扫描中...' : '扫描'}
-          </button>
+          <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <button className="btn btn-sm" onClick={() => void importInputPathDirectly()} disabled={directImportLoading || !canSave}>
+              {directImportLoading ? '创建中...' : '直接创建此文件夹'}
+            </button>
+            <button className="btn btn-sm btn-primary" onClick={() => void scanLocalSources()} disabled={scanLoading || !canSave}>
+              {scanLoading ? '扫描中...' : '扫描'}
+            </button>
+          </div>
         </div>
         <div className="grid-2" style={{ alignItems: 'start' }}>
           <div className="form-group" style={{ marginBottom: 0 }}>
-            <label>本地路径</label>
+            <label>本地文件夹或允许根目录</label>
             <input
               value={scanPath}
               onChange={e => setScanPath(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') void scanLocalSources(); }}
-              placeholder="留空扫描默认白名单，或输入 /Users/xiaoqin/Obsidian"
+              placeholder="/Users/xiaoqin/Documents 或 /Users/xiaoqin/Documents/每日AI分享"
               style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}
               disabled={!canSave}
             />
@@ -290,7 +341,7 @@ export default function Knowledge() {
                 {scanRoots.map((root) => <div key={root} style={{ fontFamily: 'var(--font-mono)' }}>{root}</div>)}
               </>
             ) : (
-              <div>留空会扫描当前配置的 allowlist 根目录；路径不在 allowlist 内会被拒绝。</div>
+              <div>可以输入 /Users/xiaoqin/Documents 作为扫描根目录，也可以输入其中任意子文件夹后直接创建知识库。</div>
             )}
           </div>
         </div>
