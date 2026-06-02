@@ -88,6 +88,21 @@ function normalizeStringArray(value: unknown) {
     : undefined;
 }
 
+function rewriteKnowledgeSlashPrompt(input: string) {
+  const trimmed = input.trim();
+  const match = trimmed.match(/^\/wiki(?:\s+|$)(.*)$/s);
+  if (!match) return input;
+
+  const query = match[1].trim() || '总结知识库中最重要的观点。';
+  return [
+    '这是应用层 /wiki 知识库查询，不是 CLI 斜杠命令。不要调用或转发 `/wiki` 命令。',
+    `用户问题: ${query}`,
+    '请基于当前 Agent 已勾选并可访问的知识库作答。',
+    '先使用 Glob、Grep、Read 检索已授权的知识库目录，再综合回答。',
+    '如果当前 Agent 没有可访问知识库，或检索不到相关内容，请直接说明，并提示需要先给 Agent 勾选或导入知识库。',
+  ].join('\n');
+}
+
 const MAX_SKILL_MD_BYTES = 512 * 1024;
 const MAX_LOCAL_SKILL_SCAN_RESULTS = 200;
 
@@ -438,6 +453,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   } else {
     res.status(400).json({ error: 'need prompt or messages' }); return;
   }
+  runPrompt = rewriteKnowledgeSlashPrompt(runPrompt);
 
   const apiKey = provider?.ANTHROPIC_AUTH_TOKEN || '';
   if (!apiKey) { res.status(400).json({ error: 'no ANTHROPIC_AUTH_TOKEN' }); return; }
@@ -941,7 +957,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   const requestUserQuestion = createAskUserQuestionRequester({ emit, tenantId: req.auth.tenantId });
 
   await runAgent({
-    prompt,
+    prompt: rewriteKnowledgeSlashPrompt(prompt),
     systemPrompt: typeof tmpl?.systemPrompt === 'string' ? tmpl.systemPrompt : undefined,
     model: tmpl?.providerOverrides?.ANTHROPIC_MODEL || tmpl?.model || provider?.ANTHROPIC_MODEL || 'deepseek-chat',
     baseUrl: provider?.ANTHROPIC_BASE_URL || tmpl?.providerOverrides?.ANTHROPIC_BASE_URL,
