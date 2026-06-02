@@ -45,7 +45,18 @@ function createSource(): KnowledgeSource {
 
 async function readJson<T>(response: Response): Promise<T> {
   const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
+  let data: unknown = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      const contentType = response.headers.get('content-type') || '';
+      const looksHtml = contentType.includes('text/html') || text.trim().startsWith('<');
+      throw new Error(looksHtml
+        ? `接口返回了 HTML，说明当前后端没有命中这个 API 路由: ${response.url}`
+        : `接口返回了非 JSON 内容: ${text.slice(0, 120)}`);
+    }
+  }
   if (!response.ok) {
     const message = data && typeof data === 'object' && 'error' in data
       ? String((data as Record<string, unknown>).error || '请求失败')

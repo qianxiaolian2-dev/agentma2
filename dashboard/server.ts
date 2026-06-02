@@ -746,6 +746,15 @@ app.post('/api/knowledge/sources/scan', authMiddleware, requireAdmin, (req: any,
   }
 });
 
+app.get('/api/knowledge/sources/scan', authMiddleware, requireAdmin, (req: any, res) => {
+  try {
+    const sourcePath = typeof req.query?.path === 'string' ? req.query.path : '';
+    res.json(scanKnowledgeSources(sourcePath));
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || '扫描知识库失败' });
+  }
+});
+
 // ═══ Skills Routes ═══
 app.post('/api/skills/scan-local', authMiddleware, (req: any, res) => {
   try {
