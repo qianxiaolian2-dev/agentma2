@@ -120,6 +120,8 @@ export default function AgentChat() {
       model: template.model || provider.current.ANTHROPIC_MODEL || sessionMeta?.model || '',
       sdkSessionId: sdkSessionId || sessionMeta?.sdkSessionId,
       sdkCwd: sdkCwd || sessionMeta?.sdkCwd,
+      forkedFromSessionId: sessionMeta?.forkedFromSessionId,
+      forkedFromTitle: sessionMeta?.forkedFromTitle,
       pinned: sessionMeta?.pinned,
       createdAt: sessionMeta?.createdAt || now,
       updatedAt: now,

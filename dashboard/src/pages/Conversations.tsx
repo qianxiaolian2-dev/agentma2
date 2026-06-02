@@ -18,6 +18,7 @@ import {
   bootstrapChatSessions,
   createChatSessionTitle,
   deleteChatSession as deleteChatSessionApi,
+  forkChatSession as forkChatSessionApi,
   getChatSessionDisplayTitle,
   patchChatSession,
   saveChatSession as saveChatSessionApi,
@@ -404,6 +405,8 @@ export default function Conversations() {
       model: currentAgent?.model || provider.current.ANTHROPIC_MODEL || existing?.model || '',
       sdkSessionId: sdkSessionId || existing?.sdkSessionId,
       sdkCwd: sdkCwd || existing?.sdkCwd,
+      forkedFromSessionId: existing?.forkedFromSessionId,
+      forkedFromTitle: existing?.forkedFromTitle,
       pinned: existing?.pinned,
       createdAt: existing?.createdAt || now,
       updatedAt: now,
@@ -503,6 +506,18 @@ export default function Conversations() {
       setSessions(prev => prev.map(s => s.id === id ? saved : s));
     } catch (error) {
       console.error('failed to pin chat session', error);
+    }
+  };
+
+  const handleCopySession = async (source: ChatSession, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const copied = await forkChatSessionApi(source.id);
+      setSessions(prev => [copied, ...prev.filter(s => s.id !== copied.id)]);
+      setSessionSearch('');
+      handleSelect(copied);
+    } catch (error) {
+      alert(`复制会话失败: ${(error as Error).message || '未知错误'}`);
     }
   };
 
@@ -822,9 +837,20 @@ export default function Conversations() {
                   <span>{templates.find(t => t.id === s.templateId)?.name || 'Agent'}</span>
                   <span style={{ marginLeft: 8, whiteSpace: 'nowrap' }}>{s.messages.length} 条</span>
                 </div>
+                {s.forkedFromTitle && (
+                  <div style={{ fontSize: '.68em', color: 'var(--ink-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    来自：{s.forkedFromTitle}
+                  </div>
+                )}
                 <div className="flex-between" style={{ fontSize: '.68em', color: 'var(--ink-muted)', marginTop: 2 }}>
                   <span>{new Date(s.updatedAt).toLocaleDateString()}</span>
                   <span className="flex gap-2">
+                    <button
+                      className="btn btn-sm"
+                      style={{ padding: '0 6px', fontSize: '.85em' }}
+                      title="复制当前历史为一个新对话，并立即切换过去"
+                      onClick={e => { void handleCopySession(s, e); }}
+                    >复制</button>
                     <button
                       className="btn btn-sm"
                       style={{ padding: '0 6px', fontSize: '.85em', color: 'var(--danger)' }}

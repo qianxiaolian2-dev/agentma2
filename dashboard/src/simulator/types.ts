@@ -477,6 +477,8 @@ export interface ChatSession {
   model: string;
   sdkSessionId?: string;
   sdkCwd?: string;
+  forkedFromSessionId?: string;
+  forkedFromTitle?: string;
   createdAt: number;
   updatedAt: number;
 }

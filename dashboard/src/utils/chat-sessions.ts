@@ -74,6 +74,8 @@ function normalizeSession(session: unknown): ChatSession | null {
   const model = String((session as { model?: unknown }).model || '');
   const sdkSessionId = String((session as { sdkSessionId?: unknown }).sdkSessionId || '');
   const sdkCwd = String((session as { sdkCwd?: unknown }).sdkCwd || '');
+  const forkedFromSessionId = String((session as { forkedFromSessionId?: unknown }).forkedFromSessionId || '');
+  const forkedFromTitle = String((session as { forkedFromTitle?: unknown }).forkedFromTitle || '');
   const createdAt = Number((session as { createdAt?: unknown }).createdAt);
   const updatedAt = Number((session as { updatedAt?: unknown }).updatedAt);
   if (!id || !templateId) return null;
@@ -92,6 +94,8 @@ function normalizeSession(session: unknown): ChatSession | null {
     model,
     sdkSessionId: sdkSessionId || undefined,
     sdkCwd: sdkCwd || undefined,
+    forkedFromSessionId: forkedFromSessionId || undefined,
+    forkedFromTitle: forkedFromTitle || undefined,
     pinned: Boolean((session as { pinned?: unknown }).pinned),
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
@@ -171,6 +175,17 @@ export async function patchChatSession(
   const data = await readJson<unknown>(res);
   const normalized = normalizeSession(data);
   if (!normalized) throw new Error('会话更新失败');
+  return normalized;
+}
+
+export async function forkChatSession(sessionId: string): Promise<ChatSession> {
+  const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}/fork`, {
+    method: 'POST',
+    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+  });
+  const data = await readJson<unknown>(res);
+  const normalized = normalizeSession(data);
+  if (!normalized) throw new Error('会话复制失败');
   return normalized;
 }
 

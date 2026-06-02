@@ -13,6 +13,8 @@ import {
   createTeam,
   deleteUser,
   deleteChatSession,
+  forkChatSession,
+  getDataLocation,
   getMe,
   getQuota,
   getQuotaUsageSummary,
@@ -747,6 +749,53 @@ app.post('/api/knowledge/sources/scan', authMiddleware, requireAdmin, (req: any,
   }
 });
 
+function safeUploadedKnowledgePath(input: string) {
+  const normalized = input.replace(/\\/g, '/').split('/').filter((part) => part && part !== '.').join('/');
+  if (!normalized || normalized.startsWith('/') || normalized.split('/').includes('..')) return '';
+  return normalized;
+}
+
+app.post('/api/knowledge/sources/upload', authMiddleware, requireAdmin, (req: any, res) => {
+  try {
+    const files = Array.isArray(req.body?.files) ? req.body.files : [];
+    if (!files.length) { res.status(400).json({ error: '请选择要上传的文件' }); return; }
+    if (files.length > 500) { res.status(400).json({ error: '单次最多上传 500 个文件' }); return; }
+
+    const timestamp = Date.now();
+    const uploadId = crypto.randomUUID();
+    const baseName = String(req.body?.name || '').trim() || `uploaded-${timestamp}`;
+    const uploadRoot = path.join(getDataLocation().dataDir, 'knowledge-uploads', req.auth.tenantId, uploadId);
+    let totalBytes = 0;
+    fs.mkdirSync(uploadRoot, { recursive: true });
+
+    for (const item of files) {
+      const relativePath = safeUploadedKnowledgePath(String(item?.relativePath || item?.name || ''));
+      const content = typeof item?.content === 'string' ? item.content : '';
+      if (!relativePath) { res.status(400).json({ error: '上传文件路径无效' }); return; }
+      totalBytes += Buffer.byteLength(content, 'utf8');
+      if (totalBytes > 20 * 1024 * 1024) { res.status(400).json({ error: '单次上传总大小不能超过 20MB' }); return; }
+      const target = path.join(uploadRoot, relativePath);
+      const resolvedTarget = path.resolve(target);
+      if (!resolvedTarget.startsWith(path.resolve(uploadRoot) + path.sep)) {
+        res.status(400).json({ error: '上传文件路径越界' });
+        return;
+      }
+      fs.mkdirSync(path.dirname(resolvedTarget), { recursive: true });
+      fs.writeFileSync(resolvedTarget, content, 'utf8');
+    }
+
+    const current = listKnowledgeSources(req.auth.tenantId);
+    const saved = replaceKnowledgeSources(req.auth.tenantId, [
+      ...current,
+      { name: baseName.slice(0, 80), path: uploadRoot, enabled: true, readOnly: true },
+    ]);
+    audit(req.auth.tenantId, 'upload_knowledge_source', req.auth.sub, 'user', `knowledge:${req.auth.tenantId}`, { count: files.length, path: uploadRoot });
+    res.json(saved);
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || '上传知识库失败' });
+  }
+});
+
 app.get('/api/knowledge/sources/scan', authMiddleware, requireAdmin, (req: any, res) => {
   try {
     const sourcePath = typeof req.query?.path === 'string' ? req.query.path : '';
@@ -812,6 +861,13 @@ app.post('/api/chat-sessions', authMiddleware, (req: any, res) => {
 app.patch('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
   const session = updateChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id, req.body || {});
   if (!session) { res.status(404).json({ error: 'not found' }); return; }
+  res.json(session);
+});
+
+app.post('/api/chat-sessions/:id/fork', authMiddleware, (req: any, res) => {
+  const session = forkChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id);
+  if (!session) { res.status(404).json({ error: 'not found' }); return; }
+  audit(req.auth.tenantId, 'copy_chat_session', req.auth.sub, 'user', `chat_session:${req.params.id}`, { copiedId: session.id });
   res.json(session);
 });
 

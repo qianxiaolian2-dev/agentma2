@@ -183,6 +183,8 @@ export type ChatHistorySession = {
   model: string;
   sdkSessionId?: string;
   sdkCwd?: string;
+  forkedFromSessionId?: string;
+  forkedFromTitle?: string;
   pinned?: boolean;
   createdAt: number;
   updatedAt: number;
@@ -339,6 +341,7 @@ function initSchema() {
       model TEXT NOT NULL,
       sdk_session_id TEXT,
       sdk_cwd TEXT,
+      forked_from_session_id TEXT,
       pinned INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
@@ -399,6 +402,7 @@ function initSchema() {
   `);
   ensureColumn('chat_sessions', 'sdk_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
+  ensureColumn('chat_sessions', 'forked_from_session_id', 'TEXT');
   ensureColumn('chat_messages', 'attachments_json', 'TEXT');
 }
 
@@ -586,6 +590,7 @@ function defaultKnowledgeAllowlist() {
     '$HOME/Obsidian',
     '$HOME/Notes',
     '$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents',
+    path.join(DATA_DIR, 'knowledge-uploads'),
   ];
 }
 
@@ -985,6 +990,8 @@ function mapChatSession(row: any, messages: ChatHistoryMessage[]): ChatHistorySe
     model: row.model,
     sdkSessionId: row.sdk_session_id || undefined,
     sdkCwd: row.sdk_cwd || undefined,
+    forkedFromSessionId: row.forked_from_session_id || undefined,
+    forkedFromTitle: row.forked_from_title || undefined,
     pinned: Boolean(row.pinned),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -1786,11 +1793,22 @@ export function audit(tenantId: string, action: string, actor: string, actorType
   `).run();
 }
 
+const CHAT_SESSION_SELECT = `
+  s.id, s.tenant_id, s.owner_sub, s.template_id, s.title, s.model,
+  s.sdk_session_id, s.sdk_cwd, s.forked_from_session_id,
+  parent.title AS forked_from_title,
+  s.pinned, s.created_at, s.updated_at
+`;
+
 function getChatSessionRow(tenantId: string, ownerSub: string, sessionId: string) {
   return db.prepare(`
-    SELECT id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, pinned, created_at, updated_at
-    FROM chat_sessions
-    WHERE tenant_id = ? AND owner_sub = ? AND id = ?
+    SELECT ${CHAT_SESSION_SELECT}
+    FROM chat_sessions s
+    LEFT JOIN chat_sessions parent
+      ON parent.id = s.forked_from_session_id
+      AND parent.tenant_id = s.tenant_id
+      AND parent.owner_sub = s.owner_sub
+    WHERE s.tenant_id = ? AND s.owner_sub = ? AND s.id = ?
   `).get(tenantId, ownerSub, sessionId) as {
     id: string;
     tenant_id: string;
@@ -1800,6 +1818,8 @@ function getChatSessionRow(tenantId: string, ownerSub: string, sessionId: string
     model: string;
     sdk_session_id?: string | null;
     sdk_cwd?: string | null;
+    forked_from_session_id?: string | null;
+    forked_from_title?: string | null;
     pinned: number;
     created_at: number;
     updated_at: number;
@@ -1840,10 +1860,14 @@ function listMessagesForSession(sessionId: string) {
 
 export function listChatSessions(tenantId: string, ownerSub: string) {
   const rows = db.prepare(`
-    SELECT id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, pinned, created_at, updated_at
-    FROM chat_sessions
-    WHERE tenant_id = ? AND owner_sub = ?
-    ORDER BY pinned DESC, updated_at DESC
+    SELECT ${CHAT_SESSION_SELECT}
+    FROM chat_sessions s
+    LEFT JOIN chat_sessions parent
+      ON parent.id = s.forked_from_session_id
+      AND parent.tenant_id = s.tenant_id
+      AND parent.owner_sub = s.owner_sub
+    WHERE s.tenant_id = ? AND s.owner_sub = ?
+    ORDER BY s.pinned DESC, s.updated_at DESC
   `).all(tenantId, ownerSub);
   return rows.map((row: any) => mapChatSession(row, listMessagesForSession(row.id)));
 }
@@ -1890,6 +1914,7 @@ export function saveChatSession(
   const model = String(session.model || existing?.model || '');
   const sdkSessionId = String(session.sdkSessionId || existing?.sdkSessionId || '').trim();
   const sdkCwd = String(session.sdkCwd || existing?.sdkCwd || '').trim();
+  const forkedFromSessionId = String(session.forkedFromSessionId || existing?.forkedFromSessionId || '').trim();
   const pinned = typeof session.pinned === 'boolean' ? session.pinned : Boolean(existing?.pinned);
   const templateId = String(session.templateId || existing?.templateId);
 
@@ -1897,18 +1922,19 @@ export function saveChatSession(
   try {
     db.prepare(`
       INSERT INTO chat_sessions (
-        id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, pinned, created_at, updated_at
+        id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, forked_from_session_id, pinned, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         template_id = excluded.template_id,
         title = excluded.title,
         model = excluded.model,
         sdk_session_id = excluded.sdk_session_id,
         sdk_cwd = excluded.sdk_cwd,
+        forked_from_session_id = excluded.forked_from_session_id,
         pinned = excluded.pinned,
         updated_at = excluded.updated_at
-    `).run(id, tenantId, ownerSub, templateId, title, model, sdkSessionId || null, sdkCwd || null, pinned ? 1 : 0, createdAt, updatedAt);
+    `).run(id, tenantId, ownerSub, templateId, title, model, sdkSessionId || null, sdkCwd || null, forkedFromSessionId || null, pinned ? 1 : 0, createdAt, updatedAt);
 
     db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(id);
     if (messages.length > 0) {
@@ -1935,7 +1961,7 @@ export function updateChatSession(
   tenantId: string,
   ownerSub: string,
   sessionId: string,
-  patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd'>>,
+  patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'forkedFromSessionId'>>,
 ) {
   const current = getChatSession(tenantId, ownerSub, sessionId);
   if (!current) return null;
@@ -1948,7 +1974,28 @@ export function updateChatSession(
     model: patch.model ?? current.model,
     sdkSessionId: patch.sdkSessionId ?? current.sdkSessionId,
     sdkCwd: patch.sdkCwd ?? current.sdkCwd,
+    forkedFromSessionId: patch.forkedFromSessionId ?? current.forkedFromSessionId,
     updatedAt: now(),
+  });
+  return next.ok ? next.session : null;
+}
+
+export function forkChatSession(tenantId: string, ownerSub: string, sessionId: string) {
+  const current = getChatSession(tenantId, ownerSub, sessionId);
+  if (!current) return null;
+  const timestamp = now();
+  const next = saveChatSession(tenantId, ownerSub, {
+    id: crypto.randomUUID(),
+    title: `${current.title || '新对话'} · 副本`,
+    templateId: current.templateId,
+    model: current.model,
+    sdkSessionId: undefined,
+    sdkCwd: undefined,
+    forkedFromSessionId: current.id,
+    pinned: false,
+    messages: current.messages,
+    createdAt: timestamp,
+    updatedAt: timestamp,
   });
   return next.ok ? next.session : null;
 }
