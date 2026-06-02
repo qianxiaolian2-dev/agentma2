@@ -83,9 +83,13 @@ const sessionSubs = new Map<string, Set<string>>();
 const sessionSSE = new Map<string, Set<express.Response>>();
 
 function normalizeStringArray(value: unknown) {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    : undefined;
+  if (!Array.isArray(value)) return undefined;
+  const normalized = value.flatMap((item) => {
+    if (typeof item !== 'string') return [];
+    const trimmed = item.trim();
+    return trimmed ? [trimmed] : [];
+  });
+  return Array.from(new Set(normalized));
 }
 
 const MAX_SKILL_MD_BYTES = 512 * 1024;
@@ -235,6 +239,30 @@ function normalizeSubagents(value: unknown): Record<string, AgentDefinition> | u
     return [[agentName, agent] as const];
   });
   return entries.length ? Object.fromEntries(entries) : undefined;
+}
+
+function normalizeAgentTemplateForApi(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const template = { ...(value as Record<string, unknown>) };
+
+  for (const key of ['tools', 'mcpServers', 'eventSources', 'skills', 'knowledgeSourceIds']) {
+    if (Array.isArray(template[key])) template[key] = normalizeStringArray(template[key]) || [];
+  }
+
+  if (template.subagents && typeof template.subagents === 'object' && !Array.isArray(template.subagents)) {
+    const normalizedSubagents = Object.entries(template.subagents as Record<string, unknown>).flatMap(([name, agent]) => {
+      const normalizedName = name.trim();
+      if (!normalizedName || !agent || typeof agent !== 'object' || Array.isArray(agent)) return [];
+      const normalizedAgent = { ...(agent as Record<string, unknown>) };
+      for (const key of ['tools', 'disallowedTools', 'skills']) {
+        if (Array.isArray(normalizedAgent[key])) normalizedAgent[key] = normalizeStringArray(normalizedAgent[key]) || [];
+      }
+      return [[normalizedName, normalizedAgent] as const];
+    });
+    template.subagents = Object.fromEntries(normalizedSubagents);
+  }
+
+  return template;
 }
 
 type ChatImageMimeType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
@@ -871,11 +899,11 @@ app.post('/api/skills/import-local', authMiddleware, (req: any, res) => {
 
 // ═══ Agent Templates Routes (tenant-shared) ═══
 app.get('/api/agents', authMiddleware, (req: any, res) => {
-  res.json(listAgentTemplates(req.auth.tenantId));
+  res.json(listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi));
 });
 
 app.put('/api/agents', authMiddleware, (req: any, res) => {
-  const list = Array.isArray(req.body) ? req.body : [];
+  const list = Array.isArray(req.body) ? req.body.map(normalizeAgentTemplateForApi) : [];
   const saved = replaceAgentTemplates(req.auth.tenantId, list);
   audit(req.auth.tenantId, 'replace_agents', req.auth.sub, 'user', `agents:${req.auth.tenantId}`, { count: saved.length });
   res.json(saved);

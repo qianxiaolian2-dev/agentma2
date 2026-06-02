@@ -11,9 +11,13 @@ function getCacheKey(tenantId?: string) {
 }
 
 function normalizeStringArray(value: unknown) {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === 'string')
-    : [];
+  if (!Array.isArray(value)) return [];
+  const normalized = value.flatMap((item) => {
+    if (typeof item !== 'string') return [];
+    const trimmed = item.trim();
+    return trimmed ? [trimmed] : [];
+  });
+  return Array.from(new Set(normalized));
 }
 
 function normalizeProviderOverrides(value: unknown): Partial<ProviderConfig> | undefined {
