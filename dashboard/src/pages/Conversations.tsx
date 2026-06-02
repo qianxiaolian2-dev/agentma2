@@ -1020,13 +1020,13 @@ export default function Conversations() {
                 )}
                 <textarea
                   value={input}
-                  onChange={e => setInput(e.target.value)}
+                  onChange={e => { setInput(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; }}
                   onKeyDown={e => {
                     if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); handleSend(); }
                   }}
                   onPaste={handlePaste}
                   placeholder="输入消息，Shift+Enter 发送，可粘贴图片"
-                  rows={1}
+                  style={{ resize: 'none', overflowY: 'hidden', minHeight: 38, maxHeight: 200 }}
                   disabled={isStreaming}
                 />
                 <button className="btn btn-primary" onClick={handleSend} disabled={isStreaming || (!input.trim() && attachments.length === 0)}>
