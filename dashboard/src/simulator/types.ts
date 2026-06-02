@@ -403,6 +403,7 @@ export interface AgentTemplate {
   enableFileCheckpointing?: boolean;
   // 知识库：允许 agent 只读访问租户配置的本地笔记目录
   useKnowledge?: boolean;
+  knowledgeSourceIds?: string[];
   createdAt: number;
   updatedAt: number;
 }

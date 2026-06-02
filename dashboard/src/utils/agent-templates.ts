@@ -84,6 +84,7 @@ function normalizeAgentTemplate(value: unknown): AgentTemplate | null {
       : undefined,
     enableFileCheckpointing: raw.enableFileCheckpointing === true ? true : undefined,
     useKnowledge: raw.useKnowledge === true ? true : undefined,
+    knowledgeSourceIds: normalizeStringArray(raw.knowledgeSourceIds),
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
   };

@@ -387,6 +387,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const sdkCwd = typeof req.body?.sdkCwd === 'string' ? req.body.sdkCwd.trim() : '';
   const enableFileCheckpointing = req.body?.enableFileCheckpointing === true;
   const useKnowledge = req.body?.useKnowledge === true;
+  const knowledgeSourceIds = normalizeStringArray(req.body?.knowledgeSourceIds);
   const outputSchema = req.body?.outputSchema && typeof req.body.outputSchema === 'object' && !Array.isArray(req.body.outputSchema)
     ? req.body.outputSchema as Record<string, unknown>
     : undefined;
@@ -452,7 +453,8 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     cwd: sdkCwd || undefined,
     resumeSdkSessionId: resumeSdkSessionId || undefined,
     enableFileCheckpointing: enableFileCheckpointing || undefined,
-    useKnowledge,
+    useKnowledge: useKnowledge || knowledgeSourceIds.length > 0,
+    knowledgeSourceIds,
     outputFormat: outputSchema ? { type: 'json_schema', schema: outputSchema } : undefined,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
@@ -833,6 +835,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   if (!prompt || typeof prompt !== 'string') { res.status(400).json({ error: 'need prompt' }); return; }
   const tmpl = template || {};
   const subagents = normalizeSubagents(tmpl?.subagents);
+  const knowledgeSourceIds = normalizeStringArray(tmpl?.knowledgeSourceIds);
   const apiKey = provider?.ANTHROPIC_AUTH_TOKEN || tmpl?.providerOverrides?.ANTHROPIC_AUTH_TOKEN || '';
   if (!apiKey) { res.status(400).json({ error: 'no api key' }); return; }
 
@@ -857,7 +860,8 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
     subagents,
     outputFormat: tmpl?.outputSchema ? { type: 'json_schema', schema: tmpl.outputSchema } : undefined,
     enableFileCheckpointing: tmpl?.enableFileCheckpointing === true || undefined,
-    useKnowledge: tmpl?.useKnowledge === true,
+    useKnowledge: tmpl?.useKnowledge === true || knowledgeSourceIds.length > 0,
+    knowledgeSourceIds,
     maxTurns: Number(tmpl?.maxTurns) || 20,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,

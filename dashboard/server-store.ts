@@ -675,8 +675,8 @@ function collectMarkdownFilesBounded(root: string) {
   let fileCount = 0;
   let scannedEntries = 0;
   const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
-  const maxDepth = 3;
-  const maxEntries = 4000;
+  const maxDepth = 6;
+  const maxEntries = 12000;
 
   while (stack.length && scannedEntries < maxEntries) {
     const current = stack.pop()!;
@@ -716,7 +716,7 @@ function hasDirectMarkdownFile(dir: string) {
   }
 }
 
-function knowledgeCandidateForDirectory(dir: string): KnowledgeSourceCandidate | null {
+function knowledgeCandidateForDirectory(dir: string, opts: { allowRecursiveOnly?: boolean } = {}): KnowledgeSourceCandidate | null {
   let resolved: string;
   try {
     resolved = fs.realpathSync.native(dir);
@@ -725,9 +725,9 @@ function knowledgeCandidateForDirectory(dir: string): KnowledgeSourceCandidate |
   }
   if (!findAllowedKnowledgeRoot(resolved)) return null;
   const hasObsidian = fs.existsSync(path.join(resolved, '.obsidian'));
-  if (!hasObsidian && !hasDirectMarkdownFile(resolved)) return null;
+  const hasDirectMarkdown = hasDirectMarkdownFile(resolved);
   const result = collectMarkdownFilesBounded(resolved);
-  if (!hasObsidian && result.fileCount === 0) return null;
+  if (!hasObsidian && !hasDirectMarkdown && (!opts.allowRecursiveOnly || result.fileCount === 0)) return null;
   return {
     name: path.basename(resolved) || '知识库',
     path: resolved,
@@ -1748,15 +1748,15 @@ export function scanKnowledgeSources(sourcePath?: string): { roots: string[]; ca
   const roots = knowledgeAllowlistRoots();
   const inputPath = String(sourcePath || '').trim();
   if (!inputPath) {
-    const candidates = roots.flatMap((root) => scanKnowledgeCandidateDirs(root, 2));
+    const candidates = roots.flatMap((root) => scanKnowledgeCandidateDirs(root, 5));
     const deduped = Array.from(new Map(candidates.map((candidate) => [candidate.path, candidate])).values());
     return { roots, candidates: deduped };
   }
 
   const resolved = resolveKnowledgeDirectory(inputPath);
   if (!resolved.ok) throw new Error(`本地导入路径无效: ${resolved.reason}`);
-  const candidates = scanKnowledgeCandidateDirs(resolved.path, 3);
-  const exact = knowledgeCandidateForDirectory(resolved.path);
+  const candidates = scanKnowledgeCandidateDirs(resolved.path, 6);
+  const exact = knowledgeCandidateForDirectory(resolved.path, { allowRecursiveOnly: true });
   const withExact = exact ? [exact, ...candidates] : candidates;
   const deduped = Array.from(new Map(withExact.map((candidate) => [candidate.path, candidate])).values());
   return { roots, candidates: deduped };

@@ -276,6 +276,7 @@ export interface RunAgentOptions {
   enableFileCheckpointing?: boolean;
   /** Allow the agent to read tenant-configured knowledge source directories. */
   useKnowledge?: boolean;
+  knowledgeSourceIds?: string[];
   maxTurns?: number;
   cwd?: string;
   resumeSdkSessionId?: string;
@@ -473,8 +474,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
   const customMcp = buildCustomToolsMcp(opts.requestTools || []);
   const hooks = buildTenantHooks(opts.tenantId, opts.emit);
-  const knowledgeSources = opts.useKnowledge
-    ? listKnowledgeSources(opts.tenantId).filter((source) => source.enabled)
+  const requestedKnowledgeIds = Array.isArray(opts.knowledgeSourceIds) && opts.knowledgeSourceIds.length
+    ? new Set(opts.knowledgeSourceIds)
+    : null;
+  const knowledgeSources = (opts.useKnowledge || requestedKnowledgeIds)
+    ? listKnowledgeSources(opts.tenantId).filter((source) => (
+      source.enabled && (!requestedKnowledgeIds || requestedKnowledgeIds.has(source.id))
+    ))
     : [];
   const additionalDirectories = knowledgeSources.map((source) => source.path);
   const knowledgeSystemPrompt = knowledgeSources.length ? buildKnowledgeSystemPrompt(knowledgeSources) : '';

@@ -202,6 +202,7 @@ export default function AgentChat() {
           subagents: template.subagents,
           enableFileCheckpointing: template.enableFileCheckpointing || undefined,
           useKnowledge: template.useKnowledge || undefined,
+          knowledgeSourceIds: template.knowledgeSourceIds || [],
           outputSchema: template.outputSchema || undefined,
           sdkSessionId: sessionMeta?.sdkSessionId,
           sdkCwd: sessionMeta?.sdkCwd,
@@ -311,6 +312,9 @@ export default function AgentChat() {
         </div>
         <div className="flex gap-2 mt-2" style={{ flexWrap: 'wrap' }}>
           <span className="badge badge-muted">{template.model}</span>
+          {((template.knowledgeSourceIds || []).length > 0 || template.useKnowledge) && (
+            <span className="badge badge-success">知识库×{(template.knowledgeSourceIds || []).length || '全部'}</span>
+          )}
           {template.tools.slice(0, 5).map(t => <span key={t} className="badge badge-info">{t}</span>)}
           {template.tools.length > 5 && <span className="badge badge-muted">+{template.tools.length - 5}</span>}
         </div>

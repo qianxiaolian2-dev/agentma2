@@ -211,6 +211,7 @@ export default function Conversations() {
           subagents: agent.subagents,
           enableFileCheckpointing: agent.enableFileCheckpointing || undefined,
           useKnowledge: agent.useKnowledge || undefined,
+          knowledgeSourceIds: agent.knowledgeSourceIds || [],
           outputSchema: agent.outputSchema || undefined,
           sdkSessionId: sessions.find((session) => session.id === activeSessionId)?.sdkSessionId,
           sdkCwd: sessions.find((session) => session.id === activeSessionId)?.sdkCwd,
@@ -645,6 +646,7 @@ export default function Conversations() {
           subagents: currentAgent.subagents,
           enableFileCheckpointing: currentAgent.enableFileCheckpointing || undefined,
           useKnowledge: currentAgent.useKnowledge || undefined,
+          knowledgeSourceIds: currentAgent.knowledgeSourceIds || [],
           outputSchema: currentAgent.outputSchema || undefined,
           sdkSessionId: activeSessionId ? sessions.find((session) => session.id === activeSessionId)?.sdkSessionId : undefined,
           sdkCwd: activeSessionId ? sessions.find((session) => session.id === activeSessionId)?.sdkCwd : undefined,
@@ -883,6 +885,9 @@ export default function Conversations() {
               <div style={{ fontWeight: 700, fontSize: '.95em' }}>{currentAgent?.name}</div>
               <div className="flex gap-2" style={{ flexWrap: 'wrap', flex: 1 }}>
                 {currentAgent?.model && <span className="badge badge-muted">{currentAgent.model}</span>}
+                {((currentAgent?.knowledgeSourceIds || []).length > 0 || currentAgent?.useKnowledge) && (
+                  <span className="badge badge-success">知识库×{(currentAgent?.knowledgeSourceIds || []).length || '全部'}</span>
+                )}
                 {(() => {
                   const tools = currentAgent?.tools || [];
                   const customs = initCustomTools();

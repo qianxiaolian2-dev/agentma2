@@ -180,7 +180,7 @@ export default function Knowledge() {
         }));
       return [...current, ...additions];
     });
-    setStatus(`已导入 ${selected.filter((candidate) => !existingPaths.has(candidate.path)).length} 个候选目录，保存后生效。`);
+    setStatus(`已加入 ${selected.filter((candidate) => !existingPaths.has(candidate.path)).length} 个知识库草稿，保存后可在 Agent 创建页勾选。`);
     setScanError('');
   };
 
@@ -236,7 +236,7 @@ export default function Knowledge() {
       const next = normalizeSources(data);
       setSources(next);
       setSavedSources(next);
-      setStatus('已保存。启用知识库的 Agent 下次运行会读取这些目录。');
+      setStatus('已保存。现在可以在 Agent 创建页按需勾选这些知识库。');
     } catch (saveError) {
       setError((saveError as Error).message || '保存知识库失败');
     } finally {
@@ -248,7 +248,7 @@ export default function Knowledge() {
     <div>
       <div className="page-header">
         <h1>📚 知识库</h1>
-        <p>配置 agent 可只读访问的本地文件夹，建议指向 Obsidian vault 或 markdown 笔记目录。</p>
+        <p>创建可绑定到 Agent 的本地知识库，每个知识库对应一个只读文件夹。</p>
       </div>
 
       {error && <div className="card mb-4" style={{ borderColor: 'var(--danger)', background: 'var(--danger-bg)', color: 'var(--danger)' }}>{error}</div>}
@@ -262,9 +262,9 @@ export default function Knowledge() {
       <div className="card" style={{ marginBottom: 16 }}>
         <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 12 }}>
           <div>
-            <div className="card-header" style={{ marginBottom: 4 }}>从本地扫描导入</div>
+            <div className="card-header" style={{ marginBottom: 4 }}>创建 / 导入知识库</div>
             <div className="tool-card-desc">
-              扫描服务端本机允许目录，找到 Obsidian vault 或包含 markdown 的笔记目录。
+              扫描服务端本机允许目录，把 Obsidian vault 或 markdown 笔记目录加入我的知识库。
             </div>
           </div>
           <button className="btn btn-sm btn-primary" onClick={() => void scanLocalSources()} disabled={scanLoading || !canSave}>
@@ -304,7 +304,7 @@ export default function Knowledge() {
               <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
                 <button className="btn btn-sm" onClick={() => setSelectedCandidatePaths(candidates.filter((candidate) => !existingPaths.has(candidate.path)).map((candidate) => candidate.path))}>全选新目录</button>
                 <button className="btn btn-sm" onClick={() => setSelectedCandidatePaths([])}>清空</button>
-                <button className="btn btn-sm btn-primary" onClick={importSelectedCandidates}>导入选中</button>
+                <button className="btn btn-sm btn-primary" onClick={importSelectedCandidates}>创建选中</button>
               </div>
             </div>
             <div style={{ maxHeight: 280, overflowY: 'auto' }}>
@@ -356,8 +356,8 @@ export default function Knowledge() {
       <div className="card">
         <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
           <div>
-            <div className="card-header" style={{ marginBottom: 4 }}>本地知识来源</div>
-            <div className="tool-card-desc">已启用 {enabledCount} 个目录。保存时会校验目录存在、可读，并且位于服务器允许的根目录内。</div>
+            <div className="card-header" style={{ marginBottom: 4 }}>我的知识库</div>
+            <div className="tool-card-desc">已创建 {sources.length} 个知识库，{enabledCount} 个可被 Agent 勾选。保存时会校验目录存在、可读，并且位于服务器允许的根目录内。</div>
           </div>
           <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
             <button className="btn btn-sm" onClick={addSource} disabled={saving}>+ 添加</button>
@@ -372,16 +372,16 @@ export default function Knowledge() {
           <div style={{ color: 'var(--ink-muted)', padding: 24, textAlign: 'center' }}>加载中...</div>
         ) : sources.length === 0 ? (
           <div style={{ color: 'var(--ink-muted)', padding: 24, textAlign: 'center' }}>
-            还没有知识来源。添加一个 Obsidian vault 路径后，在 Agent 模板里勾选“启用知识库”。
+            还没有知识库。添加一个 Obsidian vault 或 markdown 笔记目录后，就能在 Agent 创建页勾选它。
           </div>
         ) : (
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th style={{ width: 170 }}>名称</th>
+                  <th style={{ width: 170 }}>知识库名称</th>
                   <th>路径</th>
-                  <th style={{ width: 90 }}>启用</th>
+                  <th style={{ width: 90 }}>可选</th>
                   <th style={{ width: 110 }}>只读</th>
                   <th style={{ width: 220 }}>测试</th>
                   <th style={{ width: 90 }}>操作</th>
@@ -415,7 +415,7 @@ export default function Knowledge() {
                             onChange={e => updateSource(source.id, { enabled: e.target.checked })}
                             style={{ width: 'auto', margin: 0 }}
                           />
-                          <span>{source.enabled ? '开' : '关'}</span>
+                          <span>{source.enabled ? '可选' : '停用'}</span>
                         </label>
                       </td>
                       <td><span className="badge badge-muted">只读</span></td>

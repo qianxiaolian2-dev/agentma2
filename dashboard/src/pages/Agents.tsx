@@ -4,6 +4,14 @@ import type { AgentDefinition, AgentTemplate, EffortLevel, PermissionMode, Skill
 import { EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, initCustomTools } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
+import { getAuthHeaders } from '../utils/client-runtime';
+
+type KnowledgeSource = {
+  id: string;
+  name: string;
+  path: string;
+  enabled: boolean;
+};
 
 function loadSkills(): SkillInfo[] {
   try { const raw = localStorage.getItem('agentma_skills'); if (raw) return JSON.parse(raw); } catch {}
@@ -15,11 +23,28 @@ function loadMcpServers(): { name: string }[] {
   return [];
 }
 
+function normalizeKnowledgeSources(value: unknown): KnowledgeSource[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const raw = item as Record<string, unknown>;
+    const id = typeof raw.id === 'string' ? raw.id : '';
+    const path = typeof raw.path === 'string' ? raw.path : '';
+    if (!id || !path) return [];
+    return [{
+      id,
+      name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : path.split('/').filter(Boolean).pop() || '知识库',
+      path,
+      enabled: raw.enabled !== false,
+    }];
+  });
+}
+
 function newTemplate(): AgentTemplate {
   return {
     id: '', name: '', description: '', systemPrompt: '',
     model: 'deepseek-v4-pro[1m]', tools: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'],
-    mcpServers: [], eventSources: [], skills: [],
+    mcpServers: [], eventSources: [], skills: [], knowledgeSourceIds: [],
     effort: 'high', maxTurns: 50, permissionMode: 'default',
     providerOverrides: {},
     createdAt: Date.now(), updatedAt: Date.now(),
@@ -59,12 +84,21 @@ export default function Agents() {
   // 动态加载技能和 MCP 服务器（非写死）
   const [liveSkills] = useState<SkillInfo[]>(loadSkills);
   const [liveMcp] = useState<{ name: string }[]>(loadMcpServers);
+  const [liveKnowledgeSources, setLiveKnowledgeSources] = useState<KnowledgeSource[]>([]);
   const [liveEventSources, setLiveEventSources] = useState<Array<{ name: string; type: string; url: string; enabled: boolean }>>([]);
 
   useEffect(() => {
     fetch('/api/events/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'list' }) })
       .then(r => r.json()).then(data => { if (Array.isArray(data)) setLiveEventSources(data); }).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!user?.tenantId) return;
+    fetch('/api/knowledge/sources', { headers: getAuthHeaders() })
+      .then(r => r.ok ? r.json() : [])
+      .then(data => setLiveKnowledgeSources(normalizeKnowledgeSources(data)))
+      .catch(() => setLiveKnowledgeSources([]));
+  }, [user?.tenantId]);
   const [liveCustomTools, setLiveCustomTools] = useState<RegisteredTool[]>(() => initCustomTools());
   const subagentEntries = Object.entries(form.subagents || {});
 
@@ -106,7 +140,16 @@ export default function Agents() {
     if (!form.id) return;
     const current = templates.find((template) => template.id === form.id);
     if (current) {
-      setForm(current);
+      const selectedKnowledgeIds = (current.knowledgeSourceIds || []).length
+        ? current.knowledgeSourceIds || []
+        : current.useKnowledge
+          ? liveKnowledgeSources.filter(source => source.enabled).map(source => source.id)
+          : [];
+      setForm({
+        ...current,
+        knowledgeSourceIds: selectedKnowledgeIds,
+        useKnowledge: selectedKnowledgeIds.length > 0 || current.useKnowledge || undefined,
+      });
       setIsEditing(true);
       return;
     }
@@ -114,10 +157,19 @@ export default function Agents() {
       setForm(newTemplate());
       setIsEditing(false);
     }
-  }, [templates, form.id, isEditing]);
+  }, [templates, form.id, isEditing, liveKnowledgeSources]);
 
   const handleSelect = (t: AgentTemplate) => {
-    setForm({ ...t });
+    const selectedKnowledgeIds = (t.knowledgeSourceIds || []).length
+      ? t.knowledgeSourceIds || []
+      : t.useKnowledge
+        ? liveKnowledgeSources.filter(source => source.enabled).map(source => source.id)
+        : [];
+    setForm({
+      ...t,
+      knowledgeSourceIds: selectedKnowledgeIds,
+      useKnowledge: selectedKnowledgeIds.length > 0 || t.useKnowledge || undefined,
+    });
     setIsEditing(true);
   };
 
@@ -129,11 +181,17 @@ export default function Agents() {
   const handleSave = async () => {
     if (!form.name.trim() || !user?.tenantId) return;
     const now = Date.now();
+    const selectedKnowledgeIds = (form.knowledgeSourceIds || []).filter(Boolean);
+    const hasLegacyAllKnowledge = Boolean(form.useKnowledge && selectedKnowledgeIds.length === 0 && liveKnowledgeSources.length === 0);
     const saved: AgentTemplate = {
       ...form,
       id: form.id || `agent-${now}`,
       name: form.name.trim(),
-      tools: form.useKnowledge ? Array.from(new Set([...form.tools, ...KNOWLEDGE_TOOLS])) : form.tools,
+      knowledgeSourceIds: selectedKnowledgeIds,
+      useKnowledge: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge || undefined,
+      tools: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge
+        ? Array.from(new Set([...form.tools, ...KNOWLEDGE_TOOLS]))
+        : form.tools,
       createdAt: form.createdAt || now,
       updatedAt: now,
     };
@@ -180,11 +238,12 @@ export default function Agents() {
     }));
   };
 
-  const toggleKnowledge = (enabled: boolean) => {
+  const toggleKnowledgeSource = (sourceId: string) => {
     setForm(prev => ({
       ...prev,
-      useKnowledge: enabled || undefined,
-      tools: enabled ? Array.from(new Set([...prev.tools, ...KNOWLEDGE_TOOLS])) : prev.tools,
+      knowledgeSourceIds: (prev.knowledgeSourceIds || []).includes(sourceId)
+        ? (prev.knowledgeSourceIds || []).filter(id => id !== sourceId)
+        : [...(prev.knowledgeSourceIds || []), sourceId],
     }));
   };
 
@@ -308,7 +367,11 @@ export default function Agents() {
                   <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
                   <div className="agent-card-tags">
                     <span className="badge badge-muted">{t.model}</span>
-                    {t.useKnowledge && <span className="badge badge-success">知识库</span>}
+                    {((t.knowledgeSourceIds || []).length > 0 || t.useKnowledge) && (
+                      <span className="badge badge-success">
+                        知识库×{(t.knowledgeSourceIds || []).length || liveKnowledgeSources.filter(source => source.enabled).length || '全部'}
+                      </span>
+                    )}
                     {t.tools.slice(0, 3).map(tool => <span key={tool} className="badge badge-info">{tool}</span>)}
                     {t.tools.length > 3 && <span className="badge badge-muted">+{t.tools.length - 3}</span>}
                   </div>
@@ -504,18 +567,59 @@ export default function Agents() {
               </span>
             </label>
 
-            {/* 知识库 */}
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-              <input
-                type="checkbox"
-                checked={Boolean(form.useKnowledge)}
-                onChange={e => toggleKnowledge(e.target.checked)}
-                style={{ width: 'auto' }}
-              />
-              <span style={{ fontSize: '.85em' }}>
-                启用知识库 — agent 可以读取你配置的本地笔记目录
-              </span>
-            </label>
+            {/* 知识库选择 */}
+            <div className="form-group">
+              <label>
+                知识库 (Knowledge) — 已选 {(form.knowledgeSourceIds || []).length} 个 ·{' '}
+                <a href="/knowledge" style={{ color: 'var(--accent)', fontSize: '.85em' }}>管理知识库</a>
+              </label>
+              {liveKnowledgeSources.length === 0 ? (
+                <div style={{ color: 'var(--ink-muted)', fontSize: '.78em', padding: '8px 0' }}>
+                  暂无知识库，请先在知识库页面创建。
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {liveKnowledgeSources.map(source => {
+                    const selected = (form.knowledgeSourceIds || []).includes(source.id);
+                    return (
+                      <label
+                        key={source.id}
+                        title={source.path}
+                        style={{
+                          display: 'inline-grid',
+                          gridTemplateColumns: 'auto minmax(0, 1fr)',
+                          alignItems: 'start',
+                          gap: 6,
+                          padding: '6px 9px',
+                          borderRadius: 4,
+                          fontSize: '.76em',
+                          cursor: source.enabled || selected ? 'pointer' : 'not-allowed',
+                          background: selected ? 'var(--success-bg)' : 'var(--bg-hover)',
+                          color: selected ? 'var(--success)' : 'var(--ink-secondary)',
+                          border: `1px solid ${selected ? 'var(--success)' : 'transparent'}`,
+                          opacity: source.enabled ? 1 : .5,
+                          maxWidth: 340,
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => toggleKnowledgeSource(source.id)}
+                          disabled={!source.enabled && !selected}
+                          style={{ width: 'auto', margin: '2px 0 0' }}
+                        />
+                        <span style={{ minWidth: 0 }}>
+                          <span style={{ display: 'block', fontWeight: 700 }}>{source.name}</span>
+                          <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.8em', color: 'inherit', opacity: .72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {source.path}
+                          </span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
 
             {/* 工具选择 */}
             <div className="form-group">
