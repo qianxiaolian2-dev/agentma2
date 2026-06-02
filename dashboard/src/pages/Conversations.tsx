@@ -144,6 +144,7 @@ export default function Conversations() {
   const [attachmentError, setAttachmentError] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(loadGlobalProvider());
   const currentAgent = templates.find(t => t.id === selectedAgentId);
@@ -584,6 +585,7 @@ export default function Conversations() {
     const draftId = crypto.randomUUID();
     setMessages(appendAssistantDraft(newMsgs, draftId, assistantTimestamp));
     setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setAttachmentError('');
     setIsStreaming(true);
@@ -1019,6 +1021,7 @@ export default function Conversations() {
                   </div>
                 )}
                 <textarea
+                  ref={textareaRef}
                   value={input}
                   onChange={e => { setInput(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; }}
                   onKeyDown={e => {

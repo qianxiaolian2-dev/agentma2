@@ -52,6 +52,7 @@ function CopyButton({ text }: { text: string }) {
 }
 
 export default function ChatMessageBubble({ message }: Props) {
+  const isThinkingActive = message.status === 'streaming' && !!message.thinking;
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const isPending = message.role === 'assistant' && message.status === 'pending' && !message.content && !message.thinking;
   const isError = message.status === 'error';
@@ -82,20 +83,31 @@ export default function ChatMessageBubble({ message }: Props) {
 
       {message.thinking && (
         <div style={{ marginBottom: message.content ? 8 : 0 }}>
-          <button
-            onClick={() => setThinkingExpanded(v => !v)}
-            style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '.75em', color: 'var(--ink-muted)', padding: '0 0 4px', display: 'flex', alignItems: 'center', gap: 4 }}
-          >
-            <span style={{ transform: thinkingExpanded ? 'rotate(90deg)' : 'none', display: 'inline-block', transition: 'transform .15s' }}>▶</span>
-            思考过程
-          </button>
-          {thinkingExpanded && (
+          {isThinkingActive ? (
             <div style={{
               color: 'var(--ink-muted)', fontSize: '.85em', fontStyle: 'italic',
-              borderLeft: '2px solid var(--border)', paddingLeft: 10, marginTop: 2,
+              borderLeft: '2px solid var(--accent)', paddingLeft: 10,
             }}>
               {message.thinking}
             </div>
+          ) : (
+            <>
+              <button
+                onClick={() => setThinkingExpanded(v => !v)}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '.75em', color: 'var(--ink-muted)', padding: '0 0 4px', display: 'flex', alignItems: 'center', gap: 4 }}
+              >
+                <span style={{ transform: thinkingExpanded ? 'rotate(90deg)' : 'none', display: 'inline-block', transition: 'transform .15s' }}>▶</span>
+                思考过程
+              </button>
+              {thinkingExpanded && (
+                <div style={{
+                  color: 'var(--ink-muted)', fontSize: '.85em', fontStyle: 'italic',
+                  borderLeft: '2px solid var(--border)', paddingLeft: 10, marginTop: 2,
+                }}>
+                  {message.thinking}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

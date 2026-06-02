@@ -45,6 +45,7 @@ export default function AgentChat() {
   const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
   const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const provider = useRef<ProviderConfig>(loadProvider());
 
   // 加载模板 + 恢复会话
@@ -156,6 +157,7 @@ export default function AgentChat() {
     const draftId = crypto.randomUUID();
     setMessages(appendAssistantDraft(newMessages, draftId, assistantTimestamp));
     setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setIsStreaming(true);
     setPendingQuestions([]);
@@ -380,6 +382,7 @@ export default function AgentChat() {
             </div>
           )}
           <textarea
+            ref={textareaRef}
             value={input}
             onChange={e => { setInput(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; }}
             onKeyDown={e => {
