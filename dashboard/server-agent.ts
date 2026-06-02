@@ -274,6 +274,8 @@ export interface RunAgentOptions {
   outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
   /** Snapshot files before edits so /rewind can restore them. */
   enableFileCheckpointing?: boolean;
+  /** SDK skills to expose to the main session. */
+  skills?: string[];
   /** Allow the agent to read tenant-configured knowledge source directories. */
   useKnowledge?: boolean;
   knowledgeSourceIds?: string[];
@@ -517,6 +519,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       sdkBuiltinTools.add(toolName);
     }
   }
+  if (opts.skills?.length) {
+    templateToolNames.add('Skill');
+    sdkBuiltinTools.add('Skill');
+  }
 
   // canUseTool: enforce template scope → safe-allow check → defer to user prompt.
   // NOTE: the SDK's runtime schema requires `updatedInput` to be present (a record)
@@ -598,6 +604,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         ...(opts.resumeSdkSessionId ? { resume: opts.resumeSdkSessionId } : {}),
         ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
         ...(opts.enableFileCheckpointing ? { enableFileCheckpointing: true } : {}),
+        ...(opts.skills?.length ? { skills: opts.skills } : {}),
         settingSources: [],
         env,
         ...(hooks ? { hooks, includeHookEvents: true } : {}),

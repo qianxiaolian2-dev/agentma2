@@ -202,6 +202,7 @@ export default function AgentChat() {
           provider: provider.current,
           tools: buildRequestToolsForAgent(template),
           subagents: template.subagents,
+          skills: template.skills || [],
           enableFileCheckpointing: template.enableFileCheckpointing || undefined,
           useKnowledge: template.useKnowledge || undefined,
           knowledgeSourceIds: template.knowledgeSourceIds || [],

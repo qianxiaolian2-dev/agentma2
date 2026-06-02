@@ -182,7 +182,11 @@ export default function Agents() {
     if (!form.name.trim() || !user?.tenantId) return;
     const now = Date.now();
     const selectedKnowledgeIds = (form.knowledgeSourceIds || []).filter(Boolean);
+    const selectedSkills = form.skills || [];
     const hasLegacyAllKnowledge = Boolean(form.useKnowledge && selectedKnowledgeIds.length === 0 && liveKnowledgeSources.length === 0);
+    const effectiveTools = selectedSkills.length > 0
+      ? Array.from(new Set([...form.tools, 'Skill']))
+      : form.tools;
     const saved: AgentTemplate = {
       ...form,
       id: form.id || `agent-${now}`,
@@ -190,8 +194,8 @@ export default function Agents() {
       knowledgeSourceIds: selectedKnowledgeIds,
       useKnowledge: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge || undefined,
       tools: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge
-        ? Array.from(new Set([...form.tools, ...KNOWLEDGE_TOOLS]))
-        : form.tools,
+        ? Array.from(new Set([...effectiveTools, ...KNOWLEDGE_TOOLS]))
+        : effectiveTools,
       createdAt: form.createdAt || now,
       updatedAt: now,
     };
