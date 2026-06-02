@@ -88,6 +88,44 @@ function normalizeStringArray(value: unknown) {
     : undefined;
 }
 
+function findSkillForSlashCommand(commandName: string, skills?: string[]) {
+  const normalizedCommand = commandName.trim().toLowerCase();
+  if (!normalizedCommand || !skills?.length) return '';
+
+  for (const skill of skills) {
+    const name = skill.trim();
+    if (!name) continue;
+
+    const aliases = new Set([
+      name,
+      normalizeSkillName(name),
+      name.includes(':') ? name.split(':').pop() || '' : '',
+    ].filter(Boolean).map((item) => item.toLowerCase()));
+
+    if (aliases.has(normalizedCommand)) return name;
+  }
+  return '';
+}
+
+function rewriteSkillSlashPrompt(input: string, skills?: string[]) {
+  const trimmed = input.trim();
+  const match = trimmed.match(/^\/([a-zA-Z0-9._:-]+)(?:\s+|$)([\s\S]*)$/);
+  if (!match) return input;
+
+  const commandName = match[1];
+  const skillName = findSkillForSlashCommand(commandName, skills);
+  if (!skillName) return input;
+
+  const args = (match[2] || '').trim() || '请按这个技能的默认用途处理当前请求。';
+  return [
+    `这是应用层 /${commandName} skill 快捷命令，不是 CLI 斜杠命令。`,
+    '请调用 Skill 工具处理这个请求。',
+    `Skill 工具的 skill 参数必须是: ${skillName}`,
+    `Skill 工具的 args 参数是: ${args}`,
+    '如果该 skill 无法调用或不可用，请直接说明原因。',
+  ].join('\n');
+}
+
 function rewriteKnowledgeSlashPrompt(input: string) {
   const trimmed = input.trim();
   const match = trimmed.match(/^\/wiki(?:\s+|$)(.*)$/s);
@@ -101,6 +139,12 @@ function rewriteKnowledgeSlashPrompt(input: string) {
     '先使用 Glob、Grep、Read 检索已授权的知识库目录，再综合回答。',
     '如果当前 Agent 没有可访问知识库，或检索不到相关内容，请直接说明，并提示需要先给 Agent 勾选或导入知识库。',
   ].join('\n');
+}
+
+function rewriteSlashPrompt(input: string, skills?: string[]) {
+  const skillPrompt = rewriteSkillSlashPrompt(input, skills);
+  if (skillPrompt !== input) return skillPrompt;
+  return rewriteKnowledgeSlashPrompt(input);
 }
 
 const MAX_SKILL_MD_BYTES = 512 * 1024;
@@ -453,7 +497,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   } else {
     res.status(400).json({ error: 'need prompt or messages' }); return;
   }
-  runPrompt = rewriteKnowledgeSlashPrompt(runPrompt);
+  runPrompt = rewriteSlashPrompt(runPrompt, skills);
 
   const apiKey = provider?.ANTHROPIC_AUTH_TOKEN || '';
   if (!apiKey) { res.status(400).json({ error: 'no ANTHROPIC_AUTH_TOKEN' }); return; }
@@ -957,7 +1001,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   const requestUserQuestion = createAskUserQuestionRequester({ emit, tenantId: req.auth.tenantId });
 
   await runAgent({
-    prompt: rewriteKnowledgeSlashPrompt(prompt),
+    prompt: rewriteSlashPrompt(prompt, skills),
     systemPrompt: typeof tmpl?.systemPrompt === 'string' ? tmpl.systemPrompt : undefined,
     model: tmpl?.providerOverrides?.ANTHROPIC_MODEL || tmpl?.model || provider?.ANTHROPIC_MODEL || 'deepseek-chat',
     baseUrl: provider?.ANTHROPIC_BASE_URL || tmpl?.providerOverrides?.ANTHROPIC_BASE_URL,
