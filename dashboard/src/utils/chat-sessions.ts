@@ -174,21 +174,6 @@ export async function patchChatSession(
   return normalized;
 }
 
-export async function forkChatSession(
-  sessionId: string,
-  patch: Partial<Pick<ChatSession, 'title' | 'templateId' | 'model'>> = {},
-): Promise<ChatSession> {
-  const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}/fork`, {
-    method: 'POST',
-    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify(patch),
-  });
-  const data = await readJson<unknown>(res);
-  const normalized = normalizeSession(data);
-  if (!normalized) throw new Error('会话分叉失败');
-  return normalized;
-}
-
 export async function deleteChatSession(sessionId: string): Promise<void> {
   const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}`, {
     method: 'DELETE',

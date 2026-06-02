@@ -7,7 +7,6 @@
     "dev": "vite",
     "server": "tsx server.ts",
     "smoke:chat-resume": "node scripts/smoke-chat-resume.mjs",
-    "smoke:chat-session-fork": "node scripts/smoke-chat-session-fork.mjs",
     "smoke:chat-ask-user-question": "node scripts/smoke-chat-ask-user-question.mjs",
     "smoke:chat-subagents": "node scripts/smoke-chat-subagents.mjs",
     "smoke:chat-write": "node scripts/smoke-chat-write.mjs",

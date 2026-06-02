@@ -1953,30 +1953,6 @@ export function updateChatSession(
   return next.ok ? next.session : null;
 }
 
-export function forkChatSession(
-  tenantId: string,
-  ownerSub: string,
-  sessionId: string,
-  patch: Partial<Pick<ChatHistorySession, 'title' | 'templateId' | 'model'>>,
-) {
-  const current = getChatSession(tenantId, ownerSub, sessionId);
-  if (!current) return null;
-  const timestamp = now();
-  const next = saveChatSession(tenantId, ownerSub, {
-    id: crypto.randomUUID(),
-    title: String(patch.title || `${current.title || '新对话'} · fork`),
-    templateId: patch.templateId || current.templateId,
-    model: patch.model || current.model,
-    sdkSessionId: undefined,
-    sdkCwd: undefined,
-    pinned: false,
-    messages: current.messages,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  });
-  return next.ok ? next.session : null;
-}
-
 export function deleteChatSession(tenantId: string, ownerSub: string, sessionId: string) {
   const row = getChatSessionRow(tenantId, ownerSub, sessionId);
   if (!row) return false;

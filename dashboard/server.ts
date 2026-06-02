@@ -13,7 +13,6 @@ import {
   createTeam,
   deleteUser,
   deleteChatSession,
-  forkChatSession,
   getMe,
   getQuota,
   getQuotaUsageSummary,
@@ -813,13 +812,6 @@ app.post('/api/chat-sessions', authMiddleware, (req: any, res) => {
 app.patch('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
   const session = updateChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id, req.body || {});
   if (!session) { res.status(404).json({ error: 'not found' }); return; }
-  res.json(session);
-});
-
-app.post('/api/chat-sessions/:id/fork', authMiddleware, (req: any, res) => {
-  const session = forkChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id, req.body || {});
-  if (!session) { res.status(404).json({ error: 'not found' }); return; }
-  audit(req.auth.tenantId, 'fork_chat_session', req.auth.sub, 'user', `chat_session:${req.params.id}`, { forkedId: session.id });
   res.json(session);
 });
 
