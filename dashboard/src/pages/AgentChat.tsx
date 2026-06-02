@@ -45,6 +45,7 @@ export default function AgentChat() {
   const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
   const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const provider = useRef<ProviderConfig>(loadProvider());
 
@@ -138,8 +139,11 @@ export default function AgentChat() {
   }, [template, id, sessionId, sessionMeta]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, agentTasks]);
+    const el = messagesRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    if (nearBottom || isStreaming) el.scrollTop = el.scrollHeight;
+  }, [messages, agentTasks, isStreaming]);
 
   const handleSend = useCallback(async () => {
     const content = input.trim();
@@ -297,7 +301,7 @@ export default function AgentChat() {
       </div>
 
       <div className="chat-container">
-        <div className="chat-messages">
+        <div className="chat-messages" ref={messagesRef}>
           {messages.length === 0 && !isStreaming && (
             <div style={{ textAlign: 'center', color: 'var(--ink-muted)', padding: 40, flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <div>

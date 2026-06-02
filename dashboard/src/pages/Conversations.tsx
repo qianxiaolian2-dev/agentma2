@@ -143,6 +143,7 @@ export default function Conversations() {
   const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
@@ -369,8 +370,11 @@ export default function Conversations() {
   }, [sessions, templates, selectedAgentId]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, agentTasks]);
+    const el = messagesRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    if (nearBottom || isStreaming) el.scrollTop = el.scrollHeight;
+  }, [messages, agentTasks, isStreaming]);
 
   // 保存会话（服务端持久化 + 本地状态同步）
   const persistSession = useCallback(async (msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => {
@@ -423,6 +427,7 @@ export default function Conversations() {
     setPendingQuestions([]);
     setAgentTasks([]);
     setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setAttachmentError('');
     setMobileListOpen(false);
@@ -442,6 +447,7 @@ export default function Conversations() {
     setPendingQuestions([]);
     setAgentTasks([]);
     setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setAttachmentError('');
     if (s.templateId && templates.find(t => t.id === s.templateId)) {
@@ -912,7 +918,7 @@ export default function Conversations() {
             </div>
 
             {/* 消息列表 */}
-            <div className="conversation-messages">
+            <div className="conversation-messages" ref={messagesRef}>
               {/* Bot 实时事件 */}
               {activeSessionId && (
                 <details style={{ fontSize: '.78em' }}>
