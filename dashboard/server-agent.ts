@@ -605,7 +605,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
         ...(opts.enableFileCheckpointing ? { enableFileCheckpointing: true } : {}),
         ...(opts.skills?.length ? { skills: opts.skills } : {}),
-        settingSources: [],
         env,
         ...(hooks ? { hooks, includeHookEvents: true } : {}),
         ...(customMcp ? { mcpServers: { custom: customMcp } } : {}),
