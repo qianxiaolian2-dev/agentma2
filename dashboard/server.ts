@@ -769,33 +769,60 @@ function safeUploadedKnowledgePath(input: string) {
   return normalized;
 }
 
-app.post('/api/knowledge/sources/upload', authMiddleware, requireAdmin, (req: any, res) => {
+const MAX_KNOWLEDGE_UPLOAD_TOTAL_BYTES = 20 * 1024 * 1024;
+
+function formatUploadBytes(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
+  return `${Math.round((bytes / 1024 / 1024) * 10) / 10}MB`;
+}
+
+app.post('/api/knowledge/sources/upload', authMiddleware, (req: any, res) => {
   try {
     const files = Array.isArray(req.body?.files) ? req.body.files : [];
     if (!files.length) { res.status(400).json({ error: '请选择要上传的文件' }); return; }
-    if (files.length > 500) { res.status(400).json({ error: '单次最多上传 500 个文件' }); return; }
+    const quota = getQuota(req.auth.tenantId);
+    const configuredMaxFiles = req.auth.role === 'tenant_admin'
+      ? quota.knowledgeUploadAdminMaxFiles
+      : quota.knowledgeUploadMemberMaxFiles;
+    const maxFiles = Math.max(1, Math.min(500, Number(configuredMaxFiles) || 1));
+    const maxFileBytes = Math.max(1024, Math.min(MAX_KNOWLEDGE_UPLOAD_TOTAL_BYTES, Number(quota.knowledgeUploadMaxFileBytes) || 1024));
+    if (files.length > maxFiles) {
+      res.status(400).json({ error: `当前账号单次最多上传 ${maxFiles} 个文件` });
+      return;
+    }
 
     const timestamp = Date.now();
     const uploadId = crypto.randomUUID();
     const baseName = String(req.body?.name || '').trim() || `uploaded-${timestamp}`;
     const uploadRoot = path.join(getDataLocation().dataDir, 'knowledge-uploads', req.auth.tenantId, uploadId);
+    const resolvedUploadRoot = path.resolve(uploadRoot);
     let totalBytes = 0;
-    fs.mkdirSync(uploadRoot, { recursive: true });
+    const preparedFiles: Array<{ target: string; content: string }> = [];
 
     for (const item of files) {
       const relativePath = safeUploadedKnowledgePath(String(item?.relativePath || item?.name || ''));
       const content = typeof item?.content === 'string' ? item.content : '';
       if (!relativePath) { res.status(400).json({ error: '上传文件路径无效' }); return; }
-      totalBytes += Buffer.byteLength(content, 'utf8');
-      if (totalBytes > 20 * 1024 * 1024) { res.status(400).json({ error: '单次上传总大小不能超过 20MB' }); return; }
+      const contentBytes = Buffer.byteLength(content, 'utf8');
+      if (contentBytes > maxFileBytes) {
+        res.status(400).json({ error: `单个文档不能超过 ${formatUploadBytes(maxFileBytes)}：${relativePath}` });
+        return;
+      }
+      totalBytes += contentBytes;
+      if (totalBytes > MAX_KNOWLEDGE_UPLOAD_TOTAL_BYTES) { res.status(400).json({ error: '单次上传总大小不能超过 20MB' }); return; }
       const target = path.join(uploadRoot, relativePath);
       const resolvedTarget = path.resolve(target);
-      if (!resolvedTarget.startsWith(path.resolve(uploadRoot) + path.sep)) {
+      if (!resolvedTarget.startsWith(resolvedUploadRoot + path.sep)) {
         res.status(400).json({ error: '上传文件路径越界' });
         return;
       }
-      fs.mkdirSync(path.dirname(resolvedTarget), { recursive: true });
-      fs.writeFileSync(resolvedTarget, content, 'utf8');
+      preparedFiles.push({ target: resolvedTarget, content });
+    }
+
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    for (const file of preparedFiles) {
+      fs.mkdirSync(path.dirname(file.target), { recursive: true });
+      fs.writeFileSync(file.target, file.content, 'utf8');
     }
 
     const current = listKnowledgeSources(req.auth.tenantId);

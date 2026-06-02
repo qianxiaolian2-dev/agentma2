@@ -39,6 +39,23 @@ function formatNumber(value: unknown) {
   return Number.isFinite(n) ? n.toLocaleString() : '0';
 }
 
+function formatBytes(value: unknown) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function bytesToMb(value: unknown) {
+  const bytes = Number(value || 0);
+  return Number.isFinite(bytes) ? Math.round((bytes / 1024 / 1024) * 100) / 100 : 0;
+}
+
+function mbToBytes(value: unknown) {
+  const mb = Number(value || 0);
+  return Number.isFinite(mb) ? Math.round(mb * 1024 * 1024) : 0;
+}
+
 function formatDuration(ms: number) {
   if (!Number.isFinite(ms) || ms <= 0) return '0s';
   const totalSeconds = Math.round(ms / 1000);
@@ -289,13 +306,25 @@ function QuotaManager() {
 
   if (!quota) return null;
   const FIELDS = [
-    ['monthlyActiveSecondsLimit', '月活跃秒数上限', '秒'],
-    ['weeklyRunCountLimit', '周运行次数上限', '次'],
-    ['maxConcurrentRuns', '最大并发运行数', '个'],
-    ['perRunMaxActiveHours', '单次最大活跃时长', '小时'],
-    ['perRunMaxWallClockHours', '单次最大墙钟时长', '小时'],
-    ['perRunMaxLlmTokens', '单次最大 LLM Token', 'tokens'],
-    ['perRunMaxToolCalls', '单次最大工具调用', '次'],
+    { key: 'monthlyActiveSecondsLimit', label: '月活跃秒数上限', unit: '秒' },
+    { key: 'weeklyRunCountLimit', label: '周运行次数上限', unit: '次' },
+    { key: 'maxConcurrentRuns', label: '最大并发运行数', unit: '个' },
+    { key: 'perRunMaxActiveHours', label: '单次最大活跃时长', unit: '小时' },
+    { key: 'perRunMaxWallClockHours', label: '单次最大墙钟时长', unit: '小时' },
+    { key: 'perRunMaxLlmTokens', label: '单次最大 LLM Token', unit: 'tokens' },
+    { key: 'perRunMaxToolCalls', label: '单次最大工具调用', unit: '次' },
+    { key: 'knowledgeUploadAdminMaxFiles', label: '管理员上传文档数', unit: '个', hint: '默认 100，最高 500' },
+    { key: 'knowledgeUploadMemberMaxFiles', label: '成员上传文档数', unit: '个', hint: '默认 20，最高 500' },
+    {
+      key: 'knowledgeUploadMaxFileBytes',
+      label: '单文档大小上限',
+      unit: 'MB',
+      hint: '推荐 1MB，最高 20MB',
+      display: formatBytes,
+      inputValue: bytesToMb,
+      toValue: mbToBytes,
+      step: 0.1,
+    },
   ];
 
   return (
@@ -355,14 +384,23 @@ function QuotaManager() {
           <button className="btn btn-sm" onClick={() => setEditing(!editing)}>{editing ? '取消' : '调整配额'}</button>
         </div>
         <div className="grid-2 mt-4">
-          {FIELDS.map(([k, label, unit]) => (
-            <div key={k} className="kpi-card">
-              <div className="kpi-label">{label}</div>
+          {FIELDS.map((field) => (
+            <div key={field.key} className="kpi-card">
+              <div className="kpi-label">{field.label}</div>
               {editing ? (
-                <input type="number" value={form[k] || 0} onChange={e => setForm({ ...form, [k]: Number(e.target.value) })} style={{ fontSize: '1.2em', fontWeight: 700 }} />
+                <input
+                  type="number"
+                  step={field.step || 1}
+                  value={field.inputValue ? field.inputValue(form[field.key]) : form[field.key] || 0}
+                  onChange={e => setForm({ ...form, [field.key]: field.toValue ? field.toValue(e.target.value) : Number(e.target.value) })}
+                  style={{ fontSize: '1.2em', fontWeight: 700 }}
+                />
               ) : (
-                <div className="kpi-value" style={{ fontSize: '1.1em' }}>{quota[k]?.toLocaleString?.() || quota[k]} {unit}</div>
+                <div className="kpi-value" style={{ fontSize: '1.1em' }}>
+                  {field.display ? field.display(quota[field.key]) : `${quota[field.key]?.toLocaleString?.() || quota[field.key]} ${field.unit}`}
+                </div>
               )}
+              {editing && <div className="kpi-sub">{field.unit}{field.hint ? ` · ${field.hint}` : ''}</div>}
             </div>
           ))}
         </div>

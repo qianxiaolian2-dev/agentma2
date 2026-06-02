@@ -43,6 +43,9 @@ export type QuotaRow = {
   perRunMaxWallClockHours: number;
   perRunMaxLlmTokens: number;
   perRunMaxToolCalls: number;
+  knowledgeUploadAdminMaxFiles: number;
+  knowledgeUploadMemberMaxFiles: number;
+  knowledgeUploadMaxFileBytes: number;
 };
 
 export type QuotaUsageRun = {
@@ -226,6 +229,9 @@ const DEFAULT_QUOTA = {
   perRunMaxWallClockHours: 6,
   perRunMaxLlmTokens: 5000000,
   perRunMaxToolCalls: 10000,
+  knowledgeUploadAdminMaxFiles: 100,
+  knowledgeUploadMemberMaxFiles: 20,
+  knowledgeUploadMaxFileBytes: 1024 * 1024,
 };
 
 const DATA_DIR = process.env.AGENTMA_DATA_DIR
@@ -302,7 +308,10 @@ function initSchema() {
       per_run_max_active_hours INTEGER NOT NULL,
       per_run_max_wall_clock_hours INTEGER NOT NULL,
       per_run_max_llm_tokens INTEGER NOT NULL,
-      per_run_max_tool_calls INTEGER NOT NULL
+      per_run_max_tool_calls INTEGER NOT NULL,
+      knowledge_upload_admin_max_files INTEGER NOT NULL,
+      knowledge_upload_member_max_files INTEGER NOT NULL,
+      knowledge_upload_max_file_bytes INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS teams (
@@ -404,6 +413,9 @@ function initSchema() {
   ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
   ensureColumn('chat_sessions', 'forked_from_session_id', 'TEXT');
   ensureColumn('chat_messages', 'attachments_json', 'TEXT');
+  ensureColumn('quotas', 'knowledge_upload_admin_max_files', 'INTEGER NOT NULL DEFAULT 100');
+  ensureColumn('quotas', 'knowledge_upload_member_max_files', 'INTEGER NOT NULL DEFAULT 20');
+  ensureColumn('quotas', 'knowledge_upload_max_file_bytes', 'INTEGER NOT NULL DEFAULT 1048576');
 }
 
 function readOrCreateSecret() {
@@ -481,9 +493,11 @@ function migrateLegacyJson() {
           tenant_id, monthly_active_seconds_limit, monthly_active_seconds_used,
           weekly_run_count_limit, weekly_run_count_used, max_concurrent_runs,
           per_run_max_active_hours, per_run_max_wall_clock_hours,
-          per_run_max_llm_tokens, per_run_max_tool_calls
+          per_run_max_llm_tokens, per_run_max_tool_calls,
+          knowledge_upload_admin_max_files, knowledge_upload_member_max_files,
+          knowledge_upload_max_file_bytes
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         quota.tenantId,
         quota.monthlyActiveSecondsLimit,
@@ -495,6 +509,9 @@ function migrateLegacyJson() {
         quota.perRunMaxWallClockHours,
         quota.perRunMaxLlmTokens,
         quota.perRunMaxToolCalls,
+        quota.knowledgeUploadAdminMaxFiles ?? DEFAULT_QUOTA.knowledgeUploadAdminMaxFiles,
+        quota.knowledgeUploadMemberMaxFiles ?? DEFAULT_QUOTA.knowledgeUploadMemberMaxFiles,
+        quota.knowledgeUploadMaxFileBytes ?? DEFAULT_QUOTA.knowledgeUploadMaxFileBytes,
       );
     }
 
@@ -825,6 +842,9 @@ function mapQuota(row: any): QuotaRow {
     perRunMaxWallClockHours: row.per_run_max_wall_clock_hours,
     perRunMaxLlmTokens: row.per_run_max_llm_tokens,
     perRunMaxToolCalls: row.per_run_max_tool_calls,
+    knowledgeUploadAdminMaxFiles: row.knowledge_upload_admin_max_files,
+    knowledgeUploadMemberMaxFiles: row.knowledge_upload_member_max_files,
+    knowledgeUploadMaxFileBytes: row.knowledge_upload_max_file_bytes,
   };
 }
 
@@ -1037,9 +1057,11 @@ function ensureQuotaForTenant(tenantId: string) {
       tenant_id, monthly_active_seconds_limit, monthly_active_seconds_used,
       weekly_run_count_limit, weekly_run_count_used, max_concurrent_runs,
       per_run_max_active_hours, per_run_max_wall_clock_hours,
-      per_run_max_llm_tokens, per_run_max_tool_calls
+      per_run_max_llm_tokens, per_run_max_tool_calls,
+      knowledge_upload_admin_max_files, knowledge_upload_member_max_files,
+      knowledge_upload_max_file_bytes
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     tenantId,
     DEFAULT_QUOTA.monthlyActiveSecondsLimit,
@@ -1051,6 +1073,9 @@ function ensureQuotaForTenant(tenantId: string) {
     DEFAULT_QUOTA.perRunMaxWallClockHours,
     DEFAULT_QUOTA.perRunMaxLlmTokens,
     DEFAULT_QUOTA.perRunMaxToolCalls,
+    DEFAULT_QUOTA.knowledgeUploadAdminMaxFiles,
+    DEFAULT_QUOTA.knowledgeUploadMemberMaxFiles,
+    DEFAULT_QUOTA.knowledgeUploadMaxFileBytes,
   );
 }
 
@@ -1278,7 +1303,9 @@ export function getQuota(tenantId: string) {
     SELECT tenant_id, monthly_active_seconds_limit, monthly_active_seconds_used,
            weekly_run_count_limit, weekly_run_count_used, max_concurrent_runs,
            per_run_max_active_hours, per_run_max_wall_clock_hours,
-           per_run_max_llm_tokens, per_run_max_tool_calls
+           per_run_max_llm_tokens, per_run_max_tool_calls,
+           knowledge_upload_admin_max_files, knowledge_upload_member_max_files,
+           knowledge_upload_max_file_bytes
     FROM quotas
     WHERE tenant_id = ?
   `).get(tenantId);
@@ -1330,6 +1357,12 @@ export function getQuotaUsageSummary(tenantId: string): QuotaUsageSummary {
 export function updateQuota(tenantId: string, body: Record<string, unknown>) {
   ensureQuotaForTenant(tenantId);
   const current = getQuota(tenantId);
+  const boundedPositiveInt = (value: unknown, fallback: number, min: number, max: number) => {
+    if (value === undefined) return fallback;
+    const n = Math.floor(Number(value));
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+  };
   const next = {
     ...current,
     monthlyActiveSecondsLimit: body.monthlyActiveSecondsLimit !== undefined ? Number(body.monthlyActiveSecondsLimit) : current.monthlyActiveSecondsLimit,
@@ -1339,6 +1372,9 @@ export function updateQuota(tenantId: string, body: Record<string, unknown>) {
     perRunMaxWallClockHours: body.perRunMaxWallClockHours !== undefined ? Number(body.perRunMaxWallClockHours) : current.perRunMaxWallClockHours,
     perRunMaxLlmTokens: body.perRunMaxLlmTokens !== undefined ? Number(body.perRunMaxLlmTokens) : current.perRunMaxLlmTokens,
     perRunMaxToolCalls: body.perRunMaxToolCalls !== undefined ? Number(body.perRunMaxToolCalls) : current.perRunMaxToolCalls,
+    knowledgeUploadAdminMaxFiles: boundedPositiveInt(body.knowledgeUploadAdminMaxFiles, current.knowledgeUploadAdminMaxFiles, 1, 500),
+    knowledgeUploadMemberMaxFiles: boundedPositiveInt(body.knowledgeUploadMemberMaxFiles, current.knowledgeUploadMemberMaxFiles, 1, 500),
+    knowledgeUploadMaxFileBytes: boundedPositiveInt(body.knowledgeUploadMaxFileBytes, current.knowledgeUploadMaxFileBytes, 1024, 20 * 1024 * 1024),
   };
   db.prepare(`
     UPDATE quotas
@@ -1348,7 +1384,10 @@ export function updateQuota(tenantId: string, body: Record<string, unknown>) {
         per_run_max_active_hours = ?,
         per_run_max_wall_clock_hours = ?,
         per_run_max_llm_tokens = ?,
-        per_run_max_tool_calls = ?
+        per_run_max_tool_calls = ?,
+        knowledge_upload_admin_max_files = ?,
+        knowledge_upload_member_max_files = ?,
+        knowledge_upload_max_file_bytes = ?
     WHERE tenant_id = ?
   `).run(
     next.monthlyActiveSecondsLimit,
@@ -1358,6 +1397,9 @@ export function updateQuota(tenantId: string, body: Record<string, unknown>) {
     next.perRunMaxWallClockHours,
     next.perRunMaxLlmTokens,
     next.perRunMaxToolCalls,
+    next.knowledgeUploadAdminMaxFiles,
+    next.knowledgeUploadMemberMaxFiles,
+    next.knowledgeUploadMaxFileBytes,
     tenantId,
   );
   return getQuota(tenantId);

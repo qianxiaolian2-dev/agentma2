@@ -33,8 +33,19 @@ type TestState = {
   result?: KnowledgeTestResult;
 };
 
+type KnowledgeQuota = {
+  knowledgeUploadAdminMaxFiles: number;
+  knowledgeUploadMemberMaxFiles: number;
+  knowledgeUploadMaxFileBytes: number;
+};
+
 const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const DEFAULT_KNOWLEDGE_QUOTA: KnowledgeQuota = {
+  knowledgeUploadAdminMaxFiles: 100,
+  knowledgeUploadMemberMaxFiles: 20,
+  knowledgeUploadMaxFileBytes: 1024 * 1024,
+};
 
 function createSource(): KnowledgeSource {
   return {
@@ -101,11 +112,13 @@ function normalizeSources(value: unknown): KnowledgeSource[] {
 
 export default function Knowledge() {
   const { user } = useAuth();
-  const canSave = user?.role === 'tenant_admin';
+  const canManageSources = user?.role === 'tenant_admin';
+  const canUpload = Boolean(user);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
   const [sources, setSources] = useState<KnowledgeSource[]>([]);
   const [savedSources, setSavedSources] = useState<KnowledgeSource[]>([]);
   const [tests, setTests] = useState<Record<string, TestState>>({});
+  const [quota, setQuota] = useState<KnowledgeQuota>(DEFAULT_KNOWLEDGE_QUOTA);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -117,6 +130,9 @@ export default function Knowledge() {
 
   const changed = useMemo(() => JSON.stringify(sources) !== JSON.stringify(savedSources), [sources, savedSources]);
   const enabledCount = sources.filter((source) => source.enabled && source.path.trim()).length;
+  const uploadFileLimit = user?.role === 'tenant_admin'
+    ? quota.knowledgeUploadAdminMaxFiles
+    : quota.knowledgeUploadMemberMaxFiles;
 
   const loadSources = async () => {
     setLoading(true);
@@ -135,7 +151,24 @@ export default function Knowledge() {
     }
   };
 
-  useEffect(() => { void loadSources(); }, []);
+  const loadQuota = async () => {
+    try {
+      const response = await fetch('/api/quota', { headers: getAuthHeaders() });
+      const data = await readJson<Record<string, unknown>>(response);
+      setQuota({
+        knowledgeUploadAdminMaxFiles: Number(data.knowledgeUploadAdminMaxFiles) || DEFAULT_KNOWLEDGE_QUOTA.knowledgeUploadAdminMaxFiles,
+        knowledgeUploadMemberMaxFiles: Number(data.knowledgeUploadMemberMaxFiles) || DEFAULT_KNOWLEDGE_QUOTA.knowledgeUploadMemberMaxFiles,
+        knowledgeUploadMaxFileBytes: Number(data.knowledgeUploadMaxFileBytes) || DEFAULT_KNOWLEDGE_QUOTA.knowledgeUploadMaxFileBytes,
+      });
+    } catch {
+      setQuota(DEFAULT_KNOWLEDGE_QUOTA);
+    }
+  };
+
+  useEffect(() => {
+    void loadSources();
+    void loadQuota();
+  }, []);
 
   const updateSource = (id: string, patch: Partial<KnowledgeSource>) => {
     setSources((current) => current.map((source) => (source.id === id ? { ...source, ...patch } : source)));
@@ -165,7 +198,13 @@ export default function Knowledge() {
     const firstPath = next[0]?.relativePath || '';
     setFolderName(firstPath.includes('/') ? firstPath.split('/')[0] : defaultSourceNameFromPath(firstPath || '上传知识库'));
     setUploadFiles(next);
-    setScanError(next.length ? '' : '这个文件夹里没有可上传的 markdown 或文本文件');
+    if (!next.length) {
+      setScanError('这个文件夹里没有可上传的 markdown 或文本文件');
+    } else if (next.length > uploadFileLimit) {
+      setScanError(`当前账号单次最多上传 ${uploadFileLimit} 个文件，请取消勾选一部分后再上传`);
+    } else {
+      setScanError('');
+    }
     setStatus('');
     if (folderInputRef.current) folderInputRef.current.value = '';
   };
@@ -180,6 +219,15 @@ export default function Knowledge() {
     const selected = uploadFiles.filter((file) => file.selected);
     if (!selected.length) {
       setScanError('请先勾选要上传的文件');
+      return;
+    }
+    if (selected.length > uploadFileLimit) {
+      setScanError(`当前账号单次最多上传 ${uploadFileLimit} 个文件，当前已选 ${selected.length} 个`);
+      return;
+    }
+    const oversized = selected.find((file) => file.size > quota.knowledgeUploadMaxFileBytes);
+    if (oversized) {
+      setScanError(`单个文档不能超过 ${formatBytes(quota.knowledgeUploadMaxFileBytes)}：${oversized.relativePath}`);
       return;
     }
     const totalBytes = selected.reduce((sum, file) => sum + file.size, 0);
@@ -290,9 +338,9 @@ export default function Knowledge() {
 
       {error && <div className="card mb-4" style={{ borderColor: 'var(--danger)', background: 'var(--danger-bg)', color: 'var(--danger)' }}>{error}</div>}
       {status && <div className="card mb-4" style={{ borderColor: 'var(--success)', background: 'var(--success-bg)', color: 'var(--success)' }}>{status}</div>}
-      {!canSave && (
+      {!canManageSources && (
         <div className="card mb-4" style={{ borderColor: 'var(--warning)', background: 'var(--warning-bg)', color: 'var(--warning)' }}>
-          当前账号不是租户管理员，可以查看和测试知识库路径，但保存需要管理员权限。
+          当前账号可以上传文件夹生成知识库；手工维护服务器路径、启停和删除仍需要租户管理员权限。
         </div>
       )}
 
@@ -301,7 +349,7 @@ export default function Knowledge() {
           <div>
             <div className="card-header" style={{ marginBottom: 4 }}>上传本地文件夹</div>
             <div className="tool-card-desc">
-              打开本地文件夹后勾选要上传的 markdown 或文本文件，上传后会生成一个可绑定到 Agent 的知识库。
+              打开本地文件夹后勾选要上传的 markdown 或文本文件，当前账号单次最多 {uploadFileLimit} 个，单文档最多 {formatBytes(quota.knowledgeUploadMaxFileBytes)}，总量最多 {formatBytes(MAX_UPLOAD_BYTES)}。
             </div>
           </div>
           <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -313,10 +361,10 @@ export default function Knowledge() {
               onChange={e => handleFolderPicked(e.currentTarget.files)}
               style={{ display: 'none' }}
             />
-            <button className="btn btn-sm" onClick={() => folderInputRef.current?.click()} disabled={!canSave || directImportLoading}>
+            <button className="btn btn-sm" onClick={() => folderInputRef.current?.click()} disabled={!canUpload || directImportLoading}>
               打开文件夹
             </button>
-            <button className="btn btn-sm btn-primary" onClick={() => void uploadSelectedFolderFiles()} disabled={!canSave || directImportLoading || uploadFiles.filter(file => file.selected).length === 0}>
+            <button className="btn btn-sm btn-primary" onClick={() => void uploadSelectedFolderFiles()} disabled={!canUpload || directImportLoading || uploadFiles.filter(file => file.selected).length === 0}>
               {directImportLoading ? '上传中...' : '上传选中文件'}
             </button>
           </div>
@@ -387,9 +435,9 @@ export default function Knowledge() {
             <div className="tool-card-desc">已导入 {sources.length} 个知识库，{enabledCount} 个可被 Agent 勾选。保存时会校验目录存在、可读，并且位于服务器允许的根目录内。</div>
           </div>
           <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            <button className="btn btn-sm" onClick={addSource} disabled={saving}>+ 添加</button>
+            <button className="btn btn-sm" onClick={addSource} disabled={saving || !canManageSources}>+ 添加</button>
             <button className="btn btn-sm" onClick={() => void loadSources()} disabled={loading || saving}>刷新</button>
-            <button className="btn btn-sm btn-primary" onClick={() => void saveSources()} disabled={!changed || saving || !canSave}>
+            <button className="btn btn-sm btn-primary" onClick={() => void saveSources()} disabled={!changed || saving || !canManageSources}>
               {saving ? '保存中...' : '保存知识库'}
             </button>
           </div>
@@ -424,6 +472,7 @@ export default function Knowledge() {
                           value={source.name}
                           onChange={e => updateSource(source.id, { name: e.target.value })}
                           placeholder="主 vault"
+                          disabled={!canManageSources}
                         />
                       </td>
                       <td>
@@ -432,6 +481,7 @@ export default function Knowledge() {
                           onChange={e => updateSource(source.id, { path: e.target.value })}
                           placeholder="/Users/xiaoqin/Obsidian/MainVault"
                           style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}
+                          disabled={!canManageSources}
                         />
                       </td>
                       <td>
@@ -440,6 +490,7 @@ export default function Knowledge() {
                             type="checkbox"
                             checked={source.enabled}
                             onChange={e => updateSource(source.id, { enabled: e.target.checked })}
+                            disabled={!canManageSources}
                             style={{ width: 'auto', margin: 0 }}
                           />
                           <span>{source.enabled ? '可选' : '停用'}</span>
@@ -461,7 +512,7 @@ export default function Knowledge() {
                         </div>
                       </td>
                       <td>
-                        <button className="btn btn-sm btn-danger" onClick={() => deleteSource(source.id)} disabled={saving}>删除</button>
+                        <button className="btn btn-sm btn-danger" onClick={() => deleteSource(source.id)} disabled={saving || !canManageSources}>删除</button>
                       </td>
                     </tr>
                   );
