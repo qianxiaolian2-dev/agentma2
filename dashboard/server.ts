@@ -262,6 +262,9 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const resumeSdkSessionId = typeof req.body?.sdkSessionId === 'string' ? req.body.sdkSessionId.trim() : '';
   const sdkCwd = typeof req.body?.sdkCwd === 'string' ? req.body.sdkCwd.trim() : '';
   const enableFileCheckpointing = req.body?.enableFileCheckpointing === true;
+  const outputSchema = req.body?.outputSchema && typeof req.body.outputSchema === 'object' && !Array.isArray(req.body.outputSchema)
+    ? req.body.outputSchema as Record<string, unknown>
+    : undefined;
 
   // Fold multi-turn history into systemPrompt so the model sees prior context.
   // When an SDK transcript id is available, resume that transcript and send
@@ -324,6 +327,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     cwd: sdkCwd || undefined,
     resumeSdkSessionId: resumeSdkSessionId || undefined,
     enableFileCheckpointing: enableFileCheckpointing || undefined,
+    outputFormat: outputSchema ? { type: 'json_schema', schema: outputSchema } : undefined,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
     emit,
