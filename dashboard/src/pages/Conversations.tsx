@@ -146,6 +146,7 @@ export default function Conversations() {
   const messagesRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(loadGlobalProvider());
   const currentAgent = templates.find(t => t.id === selectedAgentId);
@@ -194,9 +195,13 @@ export default function Conversations() {
       if (sid) setActiveSessionId(sid);
     };
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
+        signal: controller.signal,
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           messages: newMsgs.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
@@ -277,8 +282,13 @@ export default function Conversations() {
         await persistFinalMessage(text || '连接失败: 响应提前结束', text ? 'complete' : 'error');
       }
     } catch (error) {
-      await persistFinalMessage(`连接失败: ${(error as Error).message}`, 'error');
+      if ((error as Error).name === 'AbortError') {
+        await persistFinalMessage(text ? `${text}\n\n_（已停止）_` : '_（已停止）_', 'complete');
+      } else {
+        await persistFinalMessage(`连接失败: ${(error as Error).message}`, 'error');
+      }
     }
+    abortRef.current = null;
     setIsStreaming(false);
   }, [currentAgent, isStreaming, activeSessionId, messages, sessions]);
 
@@ -617,9 +627,13 @@ export default function Conversations() {
       if (sid) setActiveSessionId(sid);
     };
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
+        signal: controller.signal,
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           messages: newMsgs.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
@@ -701,10 +715,19 @@ export default function Conversations() {
         await persistFinalMessage(text || '连接失败: 响应提前结束', text ? 'complete' : 'error');
       }
     } catch (e) {
-      await persistFinalMessage(`连接失败: ${(e as Error).message}`, 'error');
+      if ((e as Error).name === 'AbortError') {
+        await persistFinalMessage(text ? `${text}\n\n_（已停止）_` : '_（已停止）_', 'complete');
+      } else {
+        await persistFinalMessage(`连接失败: ${(e as Error).message}`, 'error');
+      }
     }
+    abortRef.current = null;
     setIsStreaming(false);
   }, [input, attachments, isStreaming, currentAgent, messages, activeSessionId, persistSession, sessions]);
+
+  const handleStop = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
 
   return (
     <div className="conversation-shell">
@@ -1038,9 +1061,13 @@ export default function Conversations() {
                   style={{ resize: 'none', overflowY: 'hidden', minHeight: 38, maxHeight: 200 }}
                   disabled={isStreaming}
                 />
-                <button className="btn btn-primary" onClick={handleSend} disabled={isStreaming || (!input.trim() && attachments.length === 0)}>
-                  {isStreaming ? '...' : '发送'}
-                </button>
+                {isStreaming ? (
+                  <button className="btn btn-danger" onClick={handleStop}>停止</button>
+                ) : (
+                  <button className="btn btn-primary" onClick={handleSend} disabled={!input.trim() && attachments.length === 0}>
+                    发送
+                  </button>
+                )}
               </div>
             </div>
           </>
