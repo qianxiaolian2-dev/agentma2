@@ -56,7 +56,7 @@ export default function ChatMessageBubble({ message }: Props) {
   const isError = message.status === 'error';
   const isStreaming = message.status === 'streaming';
   const isComplete = message.role === 'assistant' && message.status === 'complete' && !!message.content;
-  const useMarkdown = message.role === 'assistant' && !!message.content && !isError;
+  const useMarkdown = isComplete;
 
   const htmlContent = useMemo(() => {
     if (!useMarkdown) return '';
