@@ -1,13 +1,57 @@
 <!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AgentMa</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>agentma · console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/console.css" />
+<link rel="stylesheet" href="/screens.css" />
+</head>
+<body>
+<div id="app" class="app">
+  <!-- sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <span class="mark" id="logo-mark"></span>
+      <span>
+        <span class="word">agentma</span>
+        <span class="tag">agent · management</span>
+      </span>
+    </div>
+    <nav class="sidebar-scroll" id="nav"></nav>
+    <div class="sidebar-footer">
+      <span class="avatar" id="user-initial"></span>
+      <span class="who">
+        <span class="name" id="user-name"></span>
+        <span class="mail" id="user-mail"></span>
+      </span>
+      <button class="icon-btn" id="logout" title="登出"></button>
+    </div>
+  </aside>
+
+  <!-- main -->
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn mobile-menu" id="mobile-menu" style="display:none"></button>
+      <div class="titleblock">
+        <div class="eyebrow" id="page-eyebrow"></div>
+        <h1 id="page-title"></h1>
+        <p class="lede" id="page-lede"></p>
+      </div>
+      <div class="topbar-actions" id="page-actions"></div>
+    </header>
+    <div class="content" id="content"></div>
+  </main>
+</div>
+
+<!-- overlay host for drawers / modals -->
+<div id="overlay-host"></div>
+
+<script src="/agentma-paths.js"></script>
+<script src="/icons.js"></script>
+<script src="/data.js"></script>
+<script src="/screens.js"></script>
+<script src="/api-client.js"></script>
+<script src="/app.js"></script>
+</body>
 </html>

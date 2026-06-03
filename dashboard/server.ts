@@ -428,7 +428,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const sdkCwd = typeof req.body?.sdkCwd === 'string' ? req.body.sdkCwd.trim() : '';
   const enableFileCheckpointing = req.body?.enableFileCheckpointing === true;
   const useKnowledge = req.body?.useKnowledge === true;
-  const knowledgeSourceIds = normalizeStringArray(req.body?.knowledgeSourceIds);
+  const knowledgeSourceIds = normalizeStringArray(req.body?.knowledgeSourceIds) || [];
   const skills = normalizeStringArray(req.body?.skills);
   const outputSchema = req.body?.outputSchema && typeof req.body.outputSchema === 'object' && !Array.isArray(req.body.outputSchema)
     ? req.body.outputSchema as Record<string, unknown>
