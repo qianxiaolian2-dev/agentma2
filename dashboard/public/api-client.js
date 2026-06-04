@@ -3,14 +3,10 @@
   const DEFAULT_PROVIDER = {
     ANTHROPIC_AUTH_TOKEN: '',
     ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-v4-flash',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'deepseek-v4-pro[1m]',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-pro[1m]',
-    ANTHROPIC_MODEL: 'deepseek-v4-pro[1m]',
-    ANTHROPIC_REASONING_MODEL: 'deepseek-v4-pro[1m]',
-    CLAUDE_CODE_EFFORT_LEVEL: 'max',
-    CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-v4-flash',
+    ANTHROPIC_MODEL: '',
   };
+  const LS_PROVIDER = 'agentma_provider_config';
+  const LS_PROVIDER_PROFILES = 'agentma_provider_profiles';
 
   function getToken() {
     return localStorage.getItem('agentma_jwt') || localStorage.getItem('agentma_api_key') || '';
@@ -57,7 +53,7 @@
 
   function loadProvider() {
     try {
-      return { ...DEFAULT_PROVIDER, ...JSON.parse(localStorage.getItem('agentma_provider_config') || '{}') };
+      return { ...DEFAULT_PROVIDER, ...JSON.parse(localStorage.getItem(LS_PROVIDER) || '{}') };
     } catch {
       return { ...DEFAULT_PROVIDER };
     }
@@ -65,8 +61,118 @@
 
   function saveProvider(provider) {
     const next = { ...DEFAULT_PROVIDER, ...(provider || {}) };
-    localStorage.setItem('agentma_provider_config', JSON.stringify(next));
+    localStorage.setItem(LS_PROVIDER, JSON.stringify(next));
     return next;
+  }
+
+  function trimString(value) {
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  function splitAvailableModels(value) {
+    return String(value || '')
+      .split(/[\s,，]+/)
+      .map(model => model.trim())
+      .filter(model => model && !model.includes('*'));
+  }
+
+  function normalizeAvailableModels(seed) {
+    const values = [];
+    const addModel = (value) => {
+      const model = trimString(value);
+      if (model && !model.includes('*')) values.push(model);
+    };
+    if (Array.isArray(seed?.availableModels)) {
+      seed.availableModels.forEach(addModel);
+    }
+    if (typeof seed?.modelPatterns === 'string') {
+      values.push(...splitAvailableModels(seed.modelPatterns));
+    }
+    addModel(seed?.ANTHROPIC_MODEL);
+    return Array.from(new Set(values));
+  }
+
+  function createProviderProfile(seed) {
+    const now = Date.now();
+    const source = seed || {};
+    return {
+      ANTHROPIC_AUTH_TOKEN: trimString(source.ANTHROPIC_AUTH_TOKEN) || DEFAULT_PROVIDER.ANTHROPIC_AUTH_TOKEN,
+      ANTHROPIC_BASE_URL: trimString(source.ANTHROPIC_BASE_URL) || DEFAULT_PROVIDER.ANTHROPIC_BASE_URL,
+      id: trimString(source.id) || `provider-${now}`,
+      name: trimString(source.name) || '默认供应商',
+      availableModels: normalizeAvailableModels(source),
+      enabled: source.enabled !== false,
+      isDefault: source.isDefault === true,
+      createdAt: Number(source.createdAt || now),
+      updatedAt: Number(source.updatedAt || now),
+    };
+  }
+
+  function defaultProfileFromLegacy() {
+    const legacy = loadProvider();
+    return createProviderProfile({
+      ANTHROPIC_AUTH_TOKEN: legacy.ANTHROPIC_AUTH_TOKEN,
+      ANTHROPIC_BASE_URL: legacy.ANTHROPIC_BASE_URL,
+      availableModels: legacy.ANTHROPIC_MODEL ? [legacy.ANTHROPIC_MODEL] : [],
+      id: 'provider-default',
+      name: '默认供应商',
+      enabled: true,
+      isDefault: true,
+    });
+  }
+
+  function loadProviderProfiles() {
+    try {
+      const raw = localStorage.getItem(LS_PROVIDER_PROFILES);
+      const parsed = raw ? JSON.parse(raw) : null;
+      if (Array.isArray(parsed)) {
+        const profiles = parsed
+          .filter(item => item && typeof item === 'object')
+          .map(createProviderProfile);
+        if (profiles.length) return profiles;
+      }
+    } catch {}
+    return [defaultProfileFromLegacy()];
+  }
+
+  function providerToEnv(profile, model) {
+    return {
+      ANTHROPIC_AUTH_TOKEN: trimString(profile?.ANTHROPIC_AUTH_TOKEN),
+      ANTHROPIC_BASE_URL: trimString(profile?.ANTHROPIC_BASE_URL) || DEFAULT_PROVIDER.ANTHROPIC_BASE_URL,
+      ANTHROPIC_MODEL: trimString(model),
+    };
+  }
+
+  function providerMatchesModel(profile, model) {
+    if (!trimString(model)) return profile?.isDefault === true;
+    const normalizedModel = trimString(model).toLowerCase();
+    return (profile?.availableModels || [])
+      .map(value => trimString(value).toLowerCase())
+      .filter(Boolean)
+      .some(candidate => candidate === normalizedModel);
+  }
+
+  function resolveProviderForModel(model) {
+    const profiles = loadProviderProfiles();
+    const enabled = profiles.filter(profile => profile.enabled);
+    const usable = enabled.length ? enabled : profiles;
+    const matched = usable.find(profile => providerMatchesModel(profile, model || ''));
+    const selected = matched
+      || usable.find(profile => profile.isDefault)
+      || usable[0]
+      || defaultProfileFromLegacy();
+    return {
+      provider: providerToEnv(selected, model),
+      matched: Boolean(matched || (!trimString(model) && selected?.isDefault)),
+    };
+  }
+
+  function withProviderFallback(primary, fallback) {
+    return {
+      ANTHROPIC_AUTH_TOKEN: trimString(primary?.ANTHROPIC_AUTH_TOKEN) || trimString(fallback?.ANTHROPIC_AUTH_TOKEN),
+      ANTHROPIC_BASE_URL: trimString(primary?.ANTHROPIC_BASE_URL) || trimString(fallback?.ANTHROPIC_BASE_URL) || DEFAULT_PROVIDER.ANTHROPIC_BASE_URL,
+      ANTHROPIC_MODEL: trimString(primary?.ANTHROPIC_MODEL),
+    };
   }
 
   function relativeTime(ts) {
@@ -92,7 +198,7 @@
       id: String(raw.id || `agent-${index}`),
       name: String(raw.name || `Agent ${index + 1}`),
       desc: String(raw.description || raw.systemPrompt || '未填写描述'),
-      model: String(raw.model || 'deepseek-v4-pro[1m]'),
+      model: String(raw.model || ''),
       tools: tools.length ? tools : ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'],
       skills: normalizeArray(raw.skills),
       mcp: normalizeArray(raw.mcpServers),
@@ -312,15 +418,22 @@
 
   async function streamChat({ agent, session, messages, onDelta, onResult, onError }) {
     const template = agent.raw || {};
-    const provider = { ...loadProvider(), ...(template.providerOverrides || {}) };
+    const model = agent.model || template.model || '';
+    const resolved = resolveProviderForModel(model);
+    const provider = resolved.matched
+      ? withProviderFallback(resolved.provider, template.providerOverrides || {})
+      : withProviderFallback(template.providerOverrides || {}, resolved.provider);
+    provider.ANTHROPIC_MODEL = model || provider.ANTHROPIC_MODEL;
     const response = await fetch('/api/chat', {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({
-        messages: messagesForApi(messages),
-        systemPrompt: template.systemPrompt || undefined,
-        provider,
-        tools: (agent.tools || []).map((name) => ({ name })),
+        body: JSON.stringify({
+          messages: messagesForApi(messages),
+          systemPrompt: template.systemPrompt || undefined,
+          model: agent.model || template.model || '',
+          provider,
+          providerProfiles: loadProviderProfiles(),
+          tools: (agent.tools || []).map((name) => ({ name })),
         subagents: template.subagents || {},
         skills: template.skills || agent.skills || [],
         enableFileCheckpointing: template.enableFileCheckpointing || undefined,

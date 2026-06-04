@@ -1,29 +1,45 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import type { ClipboardEvent } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import type { AgentTemplate, ChatMessage, ChatSession, ProviderConfig, ChatImageAttachment } from '../simulator/types';
-import { getDefaultProviderConfig } from '../simulator/mock-data';
+import type { AgentTemplate, ChatAttachment, ChatMessage, ChatSession, ProviderConfig, ChatImageMimeType } from '../simulator/types';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, getCachedAgentTemplateById } from '../utils/agent-templates';
 import { isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
 import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
 import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../components/AskUserQuestionPrompt';
-import { bootstrapChatSessions, createChatSessionTitle, saveChatSession as saveChatSessionApi } from '../utils/chat-sessions';
+import {
+  bootstrapChatSessions,
+  createChatSessionTitle,
+  getChatSession,
+  saveChatSession as saveChatSessionApi,
+  setChatSessionCollaboration,
+  subscribeChatSessionEvents,
+} from '../utils/chat-sessions';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
+import { loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
+import {
+  CHAT_FILE_ACCEPT,
+  CHAT_FILE_MAX_COUNT,
+  CHAT_IMAGE_MAX_COUNT,
+  CHAT_IMAGE_MIME_TYPES,
+  fileToChatAttachment,
+  formatAttachmentBytes,
+  getChatImageSrc,
+} from '../utils/chat-attachments-ui';
 
-function loadProvider(templateOverrides?: Partial<ProviderConfig>): ProviderConfig {
+async function readChatError(response: Response) {
+  const text = await response.text().catch(() => '');
+  if (!text) return `API 错误: ${response.status}`;
   try {
-    const raw = localStorage.getItem('agentma_provider_config');
-    const global: ProviderConfig = raw
-      ? { ...getDefaultProviderConfig(), ...JSON.parse(raw) }
-      : getDefaultProviderConfig();
-    // Agent 模板的覆盖优先
-    return { ...global, ...templateOverrides };
-  } catch {}
-  return getDefaultProviderConfig();
+    const data = JSON.parse(text) as { error?: unknown };
+    return data?.error ? String(data.error) : `API 错误: ${response.status}`;
+  } catch {
+    return text.slice(0, 240) || `API 错误: ${response.status}`;
+  }
 }
 
 export default function AgentChat() {
@@ -43,12 +59,16 @@ export default function AgentChat() {
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
   const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
   const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
-  const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState('');
+  const [collaborationError, setCollaborationError] = useState('');
+  const [copyStatus, setCopyStatus] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const provider = useRef<ProviderConfig>(loadProvider());
+  const provider = useRef<ProviderConfig>(resolveProviderForModel().provider);
 
   // 加载模板 + 恢复会话
   useEffect(() => {
@@ -59,10 +79,7 @@ export default function AgentChat() {
     const cachedTemplate = getCachedAgentTemplateById(tenantId, id);
     if (cachedTemplate) {
       setTemplate(cachedTemplate);
-      provider.current = loadProvider(cachedTemplate.providerOverrides);
-      if (!provider.current.ANTHROPIC_MODEL && cachedTemplate.model) {
-        provider.current.ANTHROPIC_MODEL = cachedTemplate.model;
-      }
+      provider.current = resolveProviderForModel(cachedTemplate.model).provider;
     }
 
     (async () => {
@@ -75,10 +92,7 @@ export default function AgentChat() {
         }
         if (cancelled) return;
         setTemplate(serverTemplate);
-        provider.current = loadProvider(serverTemplate.providerOverrides);
-        if (!provider.current.ANTHROPIC_MODEL && serverTemplate.model) {
-          provider.current.ANTHROPIC_MODEL = serverTemplate.model;
-        }
+        provider.current = resolveProviderForModel(serverTemplate.model).provider;
 
         const sessions = await bootstrapChatSessions(!isUsingApiKeyAuth());
         const existingSession = resumeSessionId
@@ -117,12 +131,16 @@ export default function AgentChat() {
       templateId: id,
       title: createChatSessionTitle(nextMessages, sessionMeta?.title),
       messages: nextMessages,
-      model: template.model || provider.current.ANTHROPIC_MODEL || sessionMeta?.model || '',
+      model: template.model || sessionMeta?.model || '',
       sdkSessionId: sdkSessionId || sessionMeta?.sdkSessionId,
       sdkCwd: sdkCwd || sessionMeta?.sdkCwd,
       forkedFromSessionId: sessionMeta?.forkedFromSessionId,
       forkedFromTitle: sessionMeta?.forkedFromTitle,
       pinned: sessionMeta?.pinned,
+      ownerSub: sessionMeta?.ownerSub,
+      collaborationEnabled: sessionMeta?.collaborationEnabled,
+      collaborationRole: sessionMeta?.collaborationRole,
+      collaborationUpdatedAt: sessionMeta?.collaborationUpdatedAt,
       createdAt: sessionMeta?.createdAt || now,
       updatedAt: now,
     };
@@ -141,6 +159,67 @@ export default function AgentChat() {
     }
   }, [template, id, sessionId, sessionMeta]);
 
+  const refreshSession = useCallback(async (targetSessionId: string) => {
+    const refreshed = await getChatSession(targetSessionId);
+    if (!refreshed) {
+      if (sessionId === targetSessionId) {
+        setSessionId('');
+        setSessionMeta(null);
+        setMessages([]);
+      }
+      return null;
+    }
+    if (sessionId === targetSessionId) {
+      setSessionMeta(refreshed);
+      setMessages(refreshed.messages);
+    }
+    return refreshed;
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || !sessionMeta?.collaborationEnabled) return;
+    return subscribeChatSessionEvents(sessionId, (event) => {
+      if (event.type === 'connected') return;
+      if (event.type === 'session_deleted') {
+        setSessionId('');
+        setSessionMeta(null);
+        setMessages([]);
+        return;
+      }
+      void refreshSession(sessionId).catch((error) => {
+        console.error('failed to refresh collaboration session', error);
+      });
+    }, (error) => {
+      console.error('collaboration stream failed', error);
+    });
+  }, [sessionId, sessionMeta?.collaborationEnabled, refreshSession]);
+
+  const handleToggleCollaboration = async () => {
+    if (!sessionId || sessionMeta?.collaborationRole === 'member') return;
+    setCollaborationError('');
+    setCopyStatus('');
+    try {
+      const saved = await setChatSessionCollaboration(sessionId, !sessionMeta?.collaborationEnabled);
+      setSessionMeta(saved);
+      setMessages(saved.messages);
+    } catch (error) {
+      setCollaborationError((error as Error).message || '协作设置失败');
+    }
+  };
+
+  const handleCopyCollaborationLink = async () => {
+    if (!sessionId) return;
+    const link = `${window.location.origin}/conversations?join=${encodeURIComponent(sessionId)}`;
+    setCollaborationError('');
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopyStatus('已复制');
+      setTimeout(() => setCopyStatus(''), 1800);
+    } catch {
+      window.prompt('复制协作链接', link);
+    }
+  };
+
   useEffect(() => {
     const el = messagesRef.current;
     if (!el) return;
@@ -148,10 +227,75 @@ export default function AgentChat() {
     if (nearBottom || isStreaming) el.scrollTop = el.scrollHeight;
   }, [messages, agentTasks, isStreaming]);
 
+  const handleFilePicked = useCallback(async (fileList: FileList | null) => {
+    const files = Array.from(fileList || []);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (!files.length) return;
+    setAttachmentError('');
+
+    const currentFileCount = attachments.filter((item) => item.type === 'file').length;
+    const remainingFiles = CHAT_FILE_MAX_COUNT - currentFileCount;
+    if (remainingFiles <= 0) {
+      setAttachmentError(`最多一次发送 ${CHAT_FILE_MAX_COUNT} 个文件`);
+      return;
+    }
+
+    const accepted = files.slice(0, remainingFiles);
+    if (files.length > remainingFiles) setAttachmentError(`最多一次发送 ${CHAT_FILE_MAX_COUNT} 个文件`);
+    try {
+      const formData = new FormData();
+      for (const file of accepted) formData.append('files', file, file.name);
+      const response = await fetch('/api/chat/files/upload', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: formData,
+      });
+      const data = await response.json().catch(() => ({})) as { attachments?: ChatAttachment[]; error?: string };
+      if (!response.ok) throw new Error(data.error || `上传失败: ${response.status}`);
+      const nextAttachments = Array.isArray(data.attachments) ? data.attachments : [];
+      setAttachments(prev => [...prev, ...nextAttachments]);
+    } catch (error) {
+      setAttachmentError((error as Error).message || '文件读取失败');
+    }
+  }, [attachments]);
+
+  const handlePaste = useCallback(async (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(event.clipboardData?.items || []);
+    const files = items
+      .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+      .map(item => item.getAsFile())
+      .filter((file): file is File => Boolean(file));
+    if (!files.length) return;
+    event.preventDefault();
+    setAttachmentError('');
+
+    const imageCount = attachments.filter((item) => item.type === 'image').length;
+    const remainingSlots = CHAT_IMAGE_MAX_COUNT - imageCount;
+    if (remainingSlots <= 0) {
+      setAttachmentError(`最多一次发送 ${CHAT_IMAGE_MAX_COUNT} 张图片`);
+      return;
+    }
+    const accepted = files
+      .filter(file => CHAT_IMAGE_MIME_TYPES.has(file.type as ChatImageMimeType))
+      .slice(0, remainingSlots);
+    if (!accepted.length) {
+      setAttachmentError('不支持这种图片格式；普通文件请用 + 上传');
+      return;
+    }
+    if (files.length > remainingSlots) setAttachmentError(`最多一次发送 ${CHAT_IMAGE_MAX_COUNT} 张图片`);
+    try {
+      const nextAttachments = await Promise.all(accepted.map(fileToChatAttachment));
+      setAttachments(prev => [...prev, ...nextAttachments]);
+    } catch (error) {
+      setAttachmentError((error as Error).message || '图片读取失败');
+    }
+  }, [attachments]);
+
   const handleSend = useCallback(async () => {
     const content = input.trim();
     const messageAttachments = attachments;
     if ((!content && messageAttachments.length === 0) || isStreaming || !template) return;
+    provider.current = resolveProviderForModel(template.model).provider;
 
     const userMsg: ChatMessage = {
       role: 'user',
@@ -166,6 +310,7 @@ export default function AgentChat() {
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
+    setAttachmentError('');
     setIsStreaming(true);
     setPendingQuestions([]);
     setAgentTasks([]);
@@ -197,9 +342,15 @@ export default function AgentChat() {
         signal: controller.signal,
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
-          messages: newMessages.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
+          messages: newMessages.map((m, index) => ({
+            role: m.role,
+            content: m.content,
+            attachments: index === newMessages.length - 1 ? m.attachments : undefined,
+          })),
           systemPrompt: template.systemPrompt || undefined,
+          model: template.model,
           provider: provider.current,
+          providerProfiles: loadProviderProfiles(),
           tools: buildRequestToolsForAgent(template),
           subagents: template.subagents,
           skills: template.skills || [],
@@ -213,7 +364,7 @@ export default function AgentChat() {
       });
 
       if (!res.ok) {
-        await persistFinalMessage(`API 错误: ${res.status}`, 'error');
+        await persistFinalMessage(await readChatError(res), 'error');
         setIsStreaming(false);
         return;
       }
@@ -320,6 +471,24 @@ export default function AgentChat() {
           )}
           {template.tools.slice(0, 5).map(t => <span key={t} className="badge badge-info">{t}</span>)}
           {template.tools.length > 5 && <span className="badge badge-muted">+{template.tools.length - 5}</span>}
+          {sessionMeta && (
+            <>
+              <span className={`badge ${sessionMeta.collaborationEnabled ? 'badge-success' : 'badge-muted'}`}>
+                协作{sessionMeta.collaborationEnabled ? `·${sessionMeta.collaborationRole === 'member' ? '成员' : 'Owner'}` : '关闭'}
+              </span>
+              {sessionMeta.collaborationRole !== 'member' && (
+                <button className="btn btn-sm" onClick={handleToggleCollaboration}>
+                  {sessionMeta.collaborationEnabled ? '关闭协作' : '开启协作'}
+                </button>
+              )}
+              {sessionMeta.collaborationEnabled && (
+                <button className="btn btn-sm" onClick={handleCopyCollaborationLink}>
+                  {copyStatus || '复制链接'}
+                </button>
+              )}
+            </>
+          )}
+          {collaborationError && <span style={{ color: 'var(--danger)', fontSize: '.76em' }}>{collaborationError}</span>}
         </div>
       </div>
 
@@ -394,20 +563,53 @@ export default function AgentChat() {
         </div>
 
         <div className="chat-input-area">
-          {attachments.length > 0 && (
-            <div style={{ display: 'flex', gap: 6, padding: '4px 0', flexWrap: 'wrap' }}>
-              {attachments.map(img => (
-                <div key={img.id} style={{ position: 'relative' }}>
-                  <img src={`data:${img.mediaType};base64,${img.data}`} alt={img.name}
-                    style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)' }} />
-                  <button onClick={() => setAttachments(prev => prev.filter(a => a.id !== img.id))}
-                    style={{ position: 'absolute', top: -4, right: -4, width: 16, height: 16, borderRadius: '50%', background: 'var(--danger)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 10, lineHeight: '16px', padding: 0 }}>
-                    ×
-                  </button>
+          {(attachments.length > 0 || attachmentError) && (
+            <div style={{ padding: '4px 0' }}>
+              {attachmentError && <div style={{ color: 'var(--danger)', fontSize: '.75em', marginBottom: 4 }}>{attachmentError}</div>}
+              {attachments.length > 0 && (
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {attachments.map(item => (
+                    <div key={item.id} style={{ position: 'relative' }}>
+                      {item.type === 'image' ? (
+                        <img src={getChatImageSrc(item)} alt={item.name}
+                          style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)' }} />
+                      ) : (
+                        <div
+                          className="badge badge-info"
+                          title={`${item.name} · ${formatAttachmentBytes(item.size)}`}
+                          style={{ maxWidth: 220, height: 28, display: 'flex', alignItems: 'center', paddingRight: 22, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                        >
+                          {item.name} · {formatAttachmentBytes(item.size)}
+                        </div>
+                      )}
+                      <button onClick={() => setAttachments(prev => prev.filter(a => a.id !== item.id))}
+                        style={{ position: 'absolute', top: -4, right: -4, width: 16, height: 16, borderRadius: '50%', background: 'var(--danger)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 10, lineHeight: '16px', padding: 0 }}>
+                        ×
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
             </div>
           )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept={CHAT_FILE_ACCEPT}
+            onChange={e => void handleFilePicked(e.currentTarget.files)}
+            style={{ display: 'none' }}
+          />
+          <button
+            className="btn"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isStreaming}
+            title="上传文件"
+            aria-label="上传文件"
+            style={{ width: 34, height: 34, minWidth: 34, padding: 0, borderRadius: 6, fontSize: 20, lineHeight: '30px' }}
+          >
+            +
+          </button>
           <textarea
             ref={textareaRef}
             value={input}
@@ -418,29 +620,8 @@ export default function AgentChat() {
                 handleSend();
               }
             }}
-            onPaste={e => {
-              const items = Array.from(e.clipboardData?.items || []);
-              const imgItems = items.filter(it => it.type.startsWith('image/'));
-              if (imgItems.length === 0) return;
-              e.preventDefault();
-              imgItems.slice(0, 4).forEach(item => {
-                const file = item.getAsFile();
-                if (!file) return;
-                const reader = new FileReader();
-                reader.onload = () => {
-                  const result = String(reader.result || '');
-                  const data = result.includes(',') ? result.split(',')[1] : result;
-                  if (!data) return;
-                  setAttachments(prev => [...prev, {
-                    id: crypto.randomUUID(), type: 'image',
-                    mediaType: file.type as ChatImageAttachment['mediaType'],
-                    data, name: file.name || 'pasted-image', size: file.size,
-                  }]);
-                };
-                reader.readAsDataURL(file);
-              });
-            }}
-            placeholder="输入消息，Shift+Enter 发送，可粘贴图片"
+            onPaste={e => void handlePaste(e)}
+            placeholder="输入消息，Shift+Enter 发送，可粘贴图片，也可上传文件"
             style={{ resize: 'none', overflowY: 'hidden', minHeight: 38, maxHeight: 200 }}
             disabled={isStreaming}
           />

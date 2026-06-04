@@ -180,6 +180,7 @@ export type ChatHistoryAttachment = {
 
 export type ChatHistorySession = {
   id: string;
+  ownerSub?: string;
   templateId: string;
   title: string;
   messages: ChatHistoryMessage[];
@@ -189,6 +190,9 @@ export type ChatHistorySession = {
   forkedFromSessionId?: string;
   forkedFromTitle?: string;
   pinned?: boolean;
+  collaborationEnabled?: boolean;
+  collaborationRole?: 'owner' | 'member';
+  collaborationUpdatedAt?: number;
   createdAt: number;
   updatedAt: number;
 };
@@ -200,6 +204,10 @@ export type KnowledgeSourceRow = {
   path: string;
   readOnly: boolean;
   enabled: boolean;
+  createdBy: string | null;
+  publishedAt: number | null;
+  archivedAt: number | null;
+  deletedAt: number | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -211,11 +219,47 @@ export type KnowledgeSourceTestResult = {
   sampleFiles?: string[];
 };
 
+export type ProviderProfileRow = {
+  tenantId: string;
+  id: string;
+  name: string;
+  ANTHROPIC_AUTH_TOKEN: string;
+  ANTHROPIC_BASE_URL: string;
+  availableModels: string[];
+  enabled: boolean;
+  isDefault: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type KnowledgeSourceCandidate = {
   name: string;
   path: string;
   fileCount: number;
   sampleFiles: string[];
+};
+
+export type PublicSkillRow = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  authorSub: string;
+  authorTenantId: string;
+  revision: number;
+  bundlePath: string;
+  publishedAt: number;
+  updatedAt: number;
+};
+
+export type LearnedSkillRow = {
+  tenantId: string;
+  ownerSub: string;
+  skillName: string;
+  skillPath: string;
+  publicSkillId: string;
+  publicRevision: number;
+  learnedAt: number;
 };
 
 const LEGACY_PREFIX = 'legacy_sha256$';
@@ -352,10 +396,22 @@ function initSchema() {
       sdk_cwd TEXT,
       forked_from_session_id TEXT,
       pinned INTEGER NOT NULL DEFAULT 0,
+      collaboration_enabled INTEGER NOT NULL DEFAULT 0,
+      collaboration_updated_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_chat_sessions_owner_updated_at ON chat_sessions (tenant_id, owner_sub, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS chat_session_members (
+      session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      member_sub TEXT NOT NULL,
+      role TEXT NOT NULL,
+      joined_at INTEGER NOT NULL,
+      PRIMARY KEY (session_id, member_sub)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_session_members_member ON chat_session_members (tenant_id, member_sub, joined_at DESC);
 
     CREATE TABLE IF NOT EXISTS chat_messages (
       session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
@@ -404,18 +460,82 @@ function initSchema() {
       path TEXT NOT NULL,
       read_only INTEGER NOT NULL DEFAULT 1,
       enabled INTEGER NOT NULL DEFAULT 1,
+      created_by TEXT,
+      published_at INTEGER,
+      archived_at INTEGER,
+      deleted_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_knowledge_sources_tenant ON knowledge_sources (tenant_id);
+
+    CREATE TABLE IF NOT EXISTS provider_profiles (
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      auth_token TEXT NOT NULL DEFAULT '',
+      base_url TEXT NOT NULL,
+      available_models_json TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_provider_profiles_tenant ON provider_profiles (tenant_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS public_skills (
+      id TEXT PRIMARY KEY,
+      slug TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      author_sub TEXT NOT NULL,
+      author_tenant_id TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      bundle_path TEXT NOT NULL,
+      published_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_public_skills_updated_at ON public_skills (updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_public_skills_author_tenant ON public_skills (author_tenant_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS learned_skills (
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      owner_sub TEXT NOT NULL,
+      skill_name TEXT NOT NULL,
+      skill_path TEXT NOT NULL,
+      public_skill_id TEXT NOT NULL,
+      public_revision INTEGER NOT NULL,
+      learned_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, owner_sub, skill_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_learned_skills_owner ON learned_skills (tenant_id, owner_sub, learned_at DESC);
   `);
   ensureColumn('chat_sessions', 'sdk_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
   ensureColumn('chat_sessions', 'forked_from_session_id', 'TEXT');
+  ensureColumn('chat_sessions', 'collaboration_enabled', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('chat_sessions', 'collaboration_updated_at', 'INTEGER');
   ensureColumn('chat_messages', 'attachments_json', 'TEXT');
   ensureColumn('quotas', 'knowledge_upload_admin_max_files', 'INTEGER NOT NULL DEFAULT 100');
   ensureColumn('quotas', 'knowledge_upload_member_max_files', 'INTEGER NOT NULL DEFAULT 20');
   ensureColumn('quotas', 'knowledge_upload_max_file_bytes', 'INTEGER NOT NULL DEFAULT 1048576');
+  ensureColumn('knowledge_sources', 'created_by', 'TEXT');
+  ensureColumn('knowledge_sources', 'published_at', 'INTEGER');
+  ensureColumn('knowledge_sources', 'archived_at', 'INTEGER');
+  ensureColumn('knowledge_sources', 'deleted_at', 'INTEGER');
+  // Legacy knowledge sources predate per-creator ownership. Attribute them to the
+  // tenant admin so the admin's agents retain write access (subject to read_only),
+  // while everyone else stays read-only. Idempotent: only fills NULL rows.
+  db.exec(`
+    UPDATE knowledge_sources
+    SET created_by = (
+      SELECT email FROM users u
+      WHERE u.tenant_id = knowledge_sources.tenant_id AND u.role = 'tenant_admin'
+      ORDER BY u.created_at ASC LIMIT 1
+    )
+    WHERE created_by IS NULL;
+  `);
 }
 
 function readOrCreateSecret() {
@@ -613,17 +733,18 @@ function defaultKnowledgeAllowlist() {
 
 function knowledgeAllowlistRoots() {
   const raw = process.env.AGENTMA_KNOWLEDGE_ROOT_ALLOWLIST;
-  const entries = (raw && raw.trim() ? raw.split(path.delimiter) : defaultKnowledgeAllowlist())
+  const configuredEntries = raw && raw.trim() ? raw.split(path.delimiter) : defaultKnowledgeAllowlist();
+  const entries = [...configuredEntries, path.join(DATA_DIR, 'knowledge-uploads')]
     .map((item) => expandHome(item.trim()))
     .filter(Boolean);
 
-  return entries.flatMap((entry) => {
+  return Array.from(new Set(entries.flatMap((entry) => {
     try {
       return [fs.realpathSync.native(path.resolve(entry))];
     } catch {
       return [];
     }
-  });
+  })));
 }
 
 function isPathWithinRoot(candidate: string, root: string) {
@@ -660,7 +781,13 @@ function resolveKnowledgeDirectory(inputPath: string): { ok: true; path: string 
   return { ok: true, path: realPath };
 }
 
-function collectMarkdownFiles(root: string) {
+const KNOWLEDGE_FILE_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.csv', '.xls', '.xlsx']);
+
+function isKnowledgeFileName(name: string) {
+  return KNOWLEDGE_FILE_EXTENSIONS.has(path.extname(name).toLowerCase());
+}
+
+function collectKnowledgeFiles(root: string) {
   const sampleFiles: string[] = [];
   let fileCount = 0;
   const stack = [root];
@@ -680,7 +807,7 @@ function collectMarkdownFiles(root: string) {
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
         stack.push(fullPath);
-      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+      } else if (entry.isFile() && isKnowledgeFileName(entry.name)) {
         fileCount += 1;
         if (sampleFiles.length < 20) {
           sampleFiles.push(path.relative(root, fullPath).split(path.sep).join('/'));
@@ -692,7 +819,7 @@ function collectMarkdownFiles(root: string) {
   return { fileCount, sampleFiles };
 }
 
-function collectMarkdownFilesBounded(root: string) {
+function collectKnowledgeFilesBounded(root: string) {
   const sampleFiles: string[] = [];
   let fileCount = 0;
   let scannedEntries = 0;
@@ -717,7 +844,7 @@ function collectMarkdownFilesBounded(root: string) {
       const fullPath = path.join(current.dir, entry.name);
       if (entry.isDirectory() && current.depth < maxDepth) {
         stack.push({ dir: fullPath, depth: current.depth + 1 });
-      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+      } else if (entry.isFile() && isKnowledgeFileName(entry.name)) {
         fileCount += 1;
         if (sampleFiles.length < 8) {
           sampleFiles.push(path.relative(root, fullPath).split(path.sep).join('/'));
@@ -729,10 +856,10 @@ function collectMarkdownFilesBounded(root: string) {
   return { fileCount, sampleFiles };
 }
 
-function hasDirectMarkdownFile(dir: string) {
+function hasDirectKnowledgeFile(dir: string) {
   try {
     return fs.readdirSync(dir, { withFileTypes: true })
-      .some((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'));
+      .some((entry) => entry.isFile() && isKnowledgeFileName(entry.name));
   } catch {
     return false;
   }
@@ -747,9 +874,9 @@ function knowledgeCandidateForDirectory(dir: string, opts: { allowRecursiveOnly?
   }
   if (!findAllowedKnowledgeRoot(resolved)) return null;
   const hasObsidian = fs.existsSync(path.join(resolved, '.obsidian'));
-  const hasDirectMarkdown = hasDirectMarkdownFile(resolved);
-  const result = collectMarkdownFilesBounded(resolved);
-  if (!hasObsidian && !hasDirectMarkdown && (!opts.allowRecursiveOnly || result.fileCount === 0)) return null;
+  const hasDirectKnowledgeFileEntry = hasDirectKnowledgeFile(resolved);
+  const result = collectKnowledgeFilesBounded(resolved);
+  if (!hasObsidian && !hasDirectKnowledgeFileEntry && (!opts.allowRecursiveOnly || result.fileCount === 0)) return null;
   return {
     name: path.basename(resolved) || '知识库',
     path: resolved,
@@ -946,8 +1073,39 @@ function mapKnowledgeSource(row: any): KnowledgeSourceRow {
     path: row.path,
     readOnly: Boolean(row.read_only),
     enabled: Boolean(row.enabled),
+    createdBy: row.created_by ?? null,
+    publishedAt: row.published_at ?? null,
+    archivedAt: row.archived_at ?? null,
+    deletedAt: row.deleted_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function mapPublicSkill(row: any): PublicSkillRow {
+  return {
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    description: row.description,
+    authorSub: row.author_sub,
+    authorTenantId: row.author_tenant_id,
+    revision: Number(row.revision || 0),
+    bundlePath: row.bundle_path,
+    publishedAt: row.published_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapLearnedSkill(row: any): LearnedSkillRow {
+  return {
+    tenantId: row.tenant_id,
+    ownerSub: row.owner_sub,
+    skillName: row.skill_name,
+    skillPath: row.skill_path,
+    publicSkillId: row.public_skill_id,
+    publicRevision: Number(row.public_revision || 0),
+    learnedAt: row.learned_at,
   };
 }
 
@@ -1001,9 +1159,13 @@ function normalizeChatMessages(messages: unknown): ChatHistoryMessage[] {
   });
 }
 
-function mapChatSession(row: any, messages: ChatHistoryMessage[]): ChatHistorySession {
+function mapChatSession(row: any, messages: ChatHistoryMessage[], viewerSub?: string): ChatHistorySession {
+  const collaborationRole = viewerSub
+    ? (row.owner_sub === viewerSub ? 'owner' : 'member')
+    : undefined;
   return {
     id: row.id,
+    ownerSub: row.owner_sub,
     templateId: row.template_id,
     title: row.title,
     messages,
@@ -1013,6 +1175,9 @@ function mapChatSession(row: any, messages: ChatHistoryMessage[]): ChatHistorySe
     forkedFromSessionId: row.forked_from_session_id || undefined,
     forkedFromTitle: row.forked_from_title || undefined,
     pinned: Boolean(row.pinned),
+    collaborationEnabled: Boolean(row.collaboration_enabled),
+    collaborationRole,
+    collaborationUpdatedAt: row.collaboration_updated_at || undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1163,6 +1328,33 @@ export function registerUser(name: string, email: string, password: string) {
   audit(tenantId, 'register', email, 'user', `tenant:${tenantId}`);
   const user = getUser(email)!;
   return { ok: true as const, user, tenantId };
+}
+
+export function createTenantUser(tenantId: string, name: string, email: string, password: string, role: Role = 'member') {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  const normalizedName = String(name || '').trim() || normalizedEmail.split('@')[0] || '成员';
+  if (!normalizedEmail || !normalizedEmail.includes('@')) {
+    return { ok: false as const, status: 400, error: '邮箱格式无效' };
+  }
+  if (!password || password.length < 6) {
+    return { ok: false as const, status: 400, error: '密码至少 6 位' };
+  }
+  if (!['tenant_admin', 'team_admin', 'member'].includes(role)) {
+    return { ok: false as const, status: 400, error: 'invalid role' };
+  }
+  if (!getTenant(tenantId)) {
+    return { ok: false as const, status: 404, error: 'tenant not found' };
+  }
+  if (getUser(normalizedEmail)) {
+    return { ok: false as const, status: 409, error: '邮箱已注册' };
+  }
+
+  db.prepare(`
+    INSERT INTO users (email, name, password_hash, tenant_id, role, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(normalizedEmail, normalizedName, bcrypt.hashSync(password, 10), tenantId, role, now());
+
+  return { ok: true as const, user: getUser(normalizedEmail)! };
 }
 
 export function loginUser(email: string, password: string) {
@@ -1723,18 +1915,64 @@ export function evaluateHookRules(tenantId: string, eventName: HookRuleEvent, in
   };
 }
 
-export function listKnowledgeSources(tenantId: string): KnowledgeSourceRow[] {
+const KNOWLEDGE_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+function pruneArchivedKnowledgeSources(tenantId: string, timestamp = now()) {
+  db.prepare(`
+    UPDATE knowledge_sources
+    SET deleted_at = ?, updated_at = ?
+    WHERE tenant_id = ?
+      AND deleted_at IS NULL
+      AND archived_at IS NOT NULL
+      AND archived_at <= ?
+  `).run(timestamp, timestamp, tenantId, timestamp - KNOWLEDGE_ARCHIVE_RETENTION_MS);
+}
+
+export function listKnowledgeSources(tenantId: string, viewerSub?: string | null, viewerRole?: Role | null): KnowledgeSourceRow[] {
+  pruneArchivedKnowledgeSources(tenantId);
+  const canSeeAll = !viewerSub || viewerRole === 'tenant_admin';
   const rows = db.prepare(`
-    SELECT id, tenant_id, name, path, read_only, enabled, created_at, updated_at
+    SELECT id, tenant_id, name, path, read_only, enabled, created_by, published_at, archived_at, deleted_at, created_at, updated_at
     FROM knowledge_sources
     WHERE tenant_id = ?
-    ORDER BY updated_at DESC, name ASC
-  `).all(tenantId);
+      AND deleted_at IS NULL
+      AND (
+        ? = 1
+        OR created_by = ?
+        OR (published_at IS NOT NULL AND archived_at IS NULL)
+      )
+    ORDER BY CASE WHEN archived_at IS NULL THEN 0 ELSE 1 END ASC, updated_at DESC, name ASC
+  `).all(tenantId, canSeeAll ? 1 : 0, viewerSub ?? '');
   return rows.map(mapKnowledgeSource);
 }
 
-export function replaceKnowledgeSources(tenantId: string, sources: Array<Partial<KnowledgeSourceRow> & Record<string, unknown>>): KnowledgeSourceRow[] {
+export function replaceKnowledgeSources(
+  tenantId: string,
+  sources: Array<Partial<KnowledgeSourceRow> & Record<string, unknown>>,
+  actorSub?: string | null,
+  actorRole?: Role | null,
+): KnowledgeSourceRow[] {
   const timestamp = now();
+  const existingRows = new Map<string, {
+    created_by: string | null;
+    created_at: number;
+    published_at: number | null;
+    archived_at: number | null;
+    deleted_at: number | null;
+  }>(
+    (db.prepare(`
+      SELECT id, created_by, created_at, published_at, archived_at, deleted_at
+      FROM knowledge_sources
+      WHERE tenant_id = ?
+    `).all(tenantId) as Array<{
+      id: string;
+      created_by: string | null;
+      created_at: number;
+      published_at: number | null;
+      archived_at: number | null;
+      deleted_at: number | null;
+    }>).map((row) => [row.id, row]),
+  );
   const normalized = sources.flatMap((source): KnowledgeSourceRow[] => {
     const sourcePath = String(source?.path || '').trim();
     const resolved = resolveKnowledgeDirectory(sourcePath);
@@ -1744,26 +1982,71 @@ export function replaceKnowledgeSources(tenantId: string, sources: Array<Partial
 
     const rawName = String(source?.name || '').trim();
     const name = (rawName || path.basename(resolved.path) || '知识库').slice(0, 80);
+    const id = String(source?.id || crypto.randomUUID());
+    const existing = existingRows.get(id);
+    if (existing && actorRole !== 'tenant_admin' && actorSub && existing.created_by !== actorSub) {
+      throw new Error('只能修改自己创建的知识库');
+    }
+    // Existing rows keep their creator; brand-new rows are owned by the actor.
+    const createdBy = existing
+      ? existing.created_by ?? null
+      : (typeof source?.createdBy === 'string' ? source.createdBy : null) ?? actorSub ?? null;
+    const sourcePublishedAt = Number(source?.publishedAt) || null;
+    const sourceArchivedAt = Number(source?.archivedAt) || null;
+    const sourceDeletedAt = Number(source?.deletedAt) || null;
+    const archivedAt = sourceDeletedAt
+      ? (sourceArchivedAt || existing?.archived_at || timestamp)
+      : sourceArchivedAt;
+    const deletedAt = sourceDeletedAt || null;
+    const publishedAt = archivedAt || deletedAt ? null : sourcePublishedAt;
     return [{
-      id: String(source?.id || crypto.randomUUID()),
+      id,
       tenantId,
       name,
       path: resolved.path,
-      readOnly: true,
-      enabled: source?.enabled !== false,
-      createdAt: Number(source?.createdAt) || timestamp,
+      readOnly: source?.readOnly !== false,
+      enabled: !archivedAt && !deletedAt && source?.enabled !== false,
+      createdBy,
+      publishedAt,
+      archivedAt,
+      deletedAt,
+      createdAt: existing?.created_at || Number(source?.createdAt) || timestamp,
       updatedAt: timestamp,
     }];
   });
 
   db.exec('BEGIN');
   try {
-    db.prepare('DELETE FROM knowledge_sources WHERE tenant_id = ?').run(tenantId);
+    const seenIds = new Set(normalized.map((source) => source.id));
+    const existingActiveIds = Array.from(existingRows.entries())
+      .filter(([, row]) => row.deleted_at == null && (actorRole === 'tenant_admin' || row.created_by === actorSub))
+      .map(([id]) => id);
+    for (const id of existingActiveIds) {
+      if (!seenIds.has(id)) {
+        db.prepare(`
+          UPDATE knowledge_sources
+          SET deleted_at = ?, updated_at = ?
+          WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL
+        `).run(timestamp, timestamp, tenantId, id);
+      }
+    }
     const insert = db.prepare(`
       INSERT INTO knowledge_sources (
-        id, tenant_id, name, path, read_only, enabled, created_at, updated_at
+        id, tenant_id, name, path, read_only, enabled, created_by, published_at, archived_at, deleted_at, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        tenant_id = excluded.tenant_id,
+        name = excluded.name,
+        path = excluded.path,
+        read_only = excluded.read_only,
+        enabled = excluded.enabled,
+        created_by = knowledge_sources.created_by,
+        published_at = excluded.published_at,
+        archived_at = excluded.archived_at,
+        deleted_at = excluded.deleted_at,
+        created_at = knowledge_sources.created_at,
+        updated_at = excluded.updated_at
     `);
     for (const source of normalized) {
       insert.run(
@@ -1773,6 +2056,10 @@ export function replaceKnowledgeSources(tenantId: string, sources: Array<Partial
         source.path,
         source.readOnly ? 1 : 0,
         source.enabled ? 1 : 0,
+        source.createdBy,
+        source.publishedAt,
+        source.archivedAt,
+        source.deletedAt,
         source.createdAt,
         source.updatedAt,
       );
@@ -1783,13 +2070,13 @@ export function replaceKnowledgeSources(tenantId: string, sources: Array<Partial
     throw error;
   }
 
-  return listKnowledgeSources(tenantId);
+  return listKnowledgeSources(tenantId, actorSub, actorRole);
 }
 
 export function testKnowledgeSource(sourcePath: string): KnowledgeSourceTestResult {
   const resolved = resolveKnowledgeDirectory(sourcePath);
   if (!resolved.ok) return { ok: false, reason: resolved.reason };
-  const result = collectMarkdownFiles(resolved.path);
+  const result = collectKnowledgeFiles(resolved.path);
   return { ok: true, fileCount: result.fileCount, sampleFiles: result.sampleFiles };
 }
 
@@ -1809,6 +2096,141 @@ export function scanKnowledgeSources(sourcePath?: string): { roots: string[]; ca
   const withExact = exact ? [exact, ...candidates] : candidates;
   const deduped = Array.from(new Map(withExact.map((candidate) => [candidate.path, candidate])).values());
   return { roots, candidates: deduped };
+}
+
+export function listPublicSkills(): PublicSkillRow[] {
+  const rows = db.prepare(`
+    SELECT id, slug, name, description, author_sub, author_tenant_id, revision, bundle_path, published_at, updated_at
+    FROM public_skills
+    ORDER BY updated_at DESC, name ASC
+  `).all();
+  return rows.map(mapPublicSkill);
+}
+
+export function getPublicSkill(idOrSlug: string): PublicSkillRow | null {
+  const key = String(idOrSlug || '').trim();
+  if (!key) return null;
+  const row = db.prepare(`
+    SELECT id, slug, name, description, author_sub, author_tenant_id, revision, bundle_path, published_at, updated_at
+    FROM public_skills
+    WHERE id = ? OR slug = ?
+    LIMIT 1
+  `).get(key, key);
+  return row ? mapPublicSkill(row) : null;
+}
+
+export function createPublicSkill(input: {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  authorSub: string;
+  authorTenantId: string;
+  revision: number;
+  bundlePath: string;
+  publishedAt?: number;
+  updatedAt?: number;
+}): PublicSkillRow {
+  const timestamp = now();
+  const publishedAt = Number(input.publishedAt) || timestamp;
+  const updatedAt = Number(input.updatedAt) || publishedAt;
+  db.prepare(`
+    INSERT INTO public_skills (
+      id, slug, name, description, author_sub, author_tenant_id,
+      revision, bundle_path, published_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.id,
+    input.slug,
+    input.name,
+    input.description,
+    input.authorSub,
+    input.authorTenantId,
+    input.revision,
+    input.bundlePath,
+    publishedAt,
+    updatedAt,
+  );
+  return getPublicSkill(input.id)!;
+}
+
+export function updatePublicSkill(id: string, patch: {
+  slug?: string;
+  name?: string;
+  description?: string;
+  revision?: number;
+  bundlePath?: string;
+}): PublicSkillRow | null {
+  const current = getPublicSkill(id);
+  if (!current) return null;
+  const updatedAt = now();
+  db.prepare(`
+    UPDATE public_skills
+    SET slug = ?,
+        name = ?,
+        description = ?,
+        revision = ?,
+        bundle_path = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).run(
+    patch.slug || current.slug,
+    patch.name || current.name,
+    patch.description || current.description,
+    Number(patch.revision) || current.revision,
+    patch.bundlePath || current.bundlePath,
+    updatedAt,
+    current.id,
+  );
+  return getPublicSkill(current.id);
+}
+
+export function recordLearnedSkill(input: {
+  tenantId: string;
+  ownerSub: string;
+  skillName: string;
+  skillPath: string;
+  publicSkillId: string;
+  publicRevision: number;
+  learnedAt?: number;
+}): LearnedSkillRow {
+  const learnedAt = Number(input.learnedAt) || now();
+  db.prepare(`
+    INSERT INTO learned_skills (
+      tenant_id, owner_sub, skill_name, skill_path, public_skill_id, public_revision, learned_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(tenant_id, owner_sub, skill_name) DO UPDATE SET
+      skill_path = excluded.skill_path,
+      public_skill_id = excluded.public_skill_id,
+      public_revision = excluded.public_revision,
+      learned_at = excluded.learned_at
+  `).run(
+    input.tenantId,
+    input.ownerSub,
+    input.skillName,
+    input.skillPath,
+    input.publicSkillId,
+    input.publicRevision,
+    learnedAt,
+  );
+  const row = db.prepare(`
+    SELECT tenant_id, owner_sub, skill_name, skill_path, public_skill_id, public_revision, learned_at
+    FROM learned_skills
+    WHERE tenant_id = ? AND owner_sub = ? AND skill_name = ?
+  `).get(input.tenantId, input.ownerSub, input.skillName);
+  return mapLearnedSkill(row);
+}
+
+export function listLearnedSkills(tenantId: string, ownerSub: string): LearnedSkillRow[] {
+  const rows = db.prepare(`
+    SELECT tenant_id, owner_sub, skill_name, skill_path, public_skill_id, public_revision, learned_at
+    FROM learned_skills
+    WHERE tenant_id = ? AND owner_sub = ?
+    ORDER BY learned_at DESC
+  `).all(tenantId, ownerSub);
+  return rows.map(mapLearnedSkill);
 }
 
 export function audit(tenantId: string, action: string, actor: string, actorType: string, resource: string, diff?: unknown) {
@@ -1839,10 +2261,29 @@ const CHAT_SESSION_SELECT = `
   s.id, s.tenant_id, s.owner_sub, s.template_id, s.title, s.model,
   s.sdk_session_id, s.sdk_cwd, s.forked_from_session_id,
   parent.title AS forked_from_title,
-  s.pinned, s.created_at, s.updated_at
+  s.pinned, s.collaboration_enabled, s.collaboration_updated_at,
+  s.created_at, s.updated_at
 `;
 
-function getChatSessionRow(tenantId: string, ownerSub: string, sessionId: string) {
+type ChatSessionRow = {
+  id: string;
+  tenant_id: string;
+  owner_sub: string;
+  template_id: string;
+  title: string;
+  model: string;
+  sdk_session_id?: string | null;
+  sdk_cwd?: string | null;
+  forked_from_session_id?: string | null;
+  forked_from_title?: string | null;
+  pinned: number;
+  collaboration_enabled: number;
+  collaboration_updated_at?: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+function getOwnedChatSessionRow(tenantId: string, ownerSub: string, sessionId: string) {
   return db.prepare(`
     SELECT ${CHAT_SESSION_SELECT}
     FROM chat_sessions s
@@ -1851,21 +2292,44 @@ function getChatSessionRow(tenantId: string, ownerSub: string, sessionId: string
       AND parent.tenant_id = s.tenant_id
       AND parent.owner_sub = s.owner_sub
     WHERE s.tenant_id = ? AND s.owner_sub = ? AND s.id = ?
-  `).get(tenantId, ownerSub, sessionId) as {
-    id: string;
-    tenant_id: string;
-    owner_sub: string;
-    template_id: string;
-    title: string;
-    model: string;
-    sdk_session_id?: string | null;
-    sdk_cwd?: string | null;
-    forked_from_session_id?: string | null;
-    forked_from_title?: string | null;
-    pinned: number;
-    created_at: number;
-    updated_at: number;
-  } | undefined;
+  `).get(tenantId, ownerSub, sessionId) as ChatSessionRow | undefined;
+}
+
+function getAccessibleChatSessionRow(tenantId: string, ownerSub: string, sessionId: string) {
+  return db.prepare(`
+    SELECT ${CHAT_SESSION_SELECT}
+    FROM chat_sessions s
+    LEFT JOIN chat_sessions parent
+      ON parent.id = s.forked_from_session_id
+      AND parent.tenant_id = s.tenant_id
+      AND parent.owner_sub = s.owner_sub
+    WHERE s.tenant_id = ?
+      AND s.id = ?
+      AND (
+        s.owner_sub = ?
+        OR (
+          s.collaboration_enabled = 1
+          AND EXISTS (
+            SELECT 1 FROM chat_session_members m
+            WHERE m.session_id = s.id
+              AND m.tenant_id = s.tenant_id
+              AND m.member_sub = ?
+          )
+        )
+      )
+  `).get(tenantId, sessionId, ownerSub, ownerSub) as ChatSessionRow | undefined;
+}
+
+function getEnabledSharedChatSessionRow(tenantId: string, sessionId: string) {
+  return db.prepare(`
+    SELECT ${CHAT_SESSION_SELECT}
+    FROM chat_sessions s
+    LEFT JOIN chat_sessions parent
+      ON parent.id = s.forked_from_session_id
+      AND parent.tenant_id = s.tenant_id
+      AND parent.owner_sub = s.owner_sub
+    WHERE s.tenant_id = ? AND s.id = ? AND s.collaboration_enabled = 1
+  `).get(tenantId, sessionId) as ChatSessionRow | undefined;
 }
 
 function getAnyChatSessionRow(sessionId: string) {
@@ -1908,16 +2372,66 @@ export function listChatSessions(tenantId: string, ownerSub: string) {
       ON parent.id = s.forked_from_session_id
       AND parent.tenant_id = s.tenant_id
       AND parent.owner_sub = s.owner_sub
-    WHERE s.tenant_id = ? AND s.owner_sub = ?
+    WHERE s.tenant_id = ?
+      AND (
+        s.owner_sub = ?
+        OR (
+          s.collaboration_enabled = 1
+          AND EXISTS (
+            SELECT 1 FROM chat_session_members m
+            WHERE m.session_id = s.id
+              AND m.tenant_id = s.tenant_id
+              AND m.member_sub = ?
+          )
+        )
+      )
     ORDER BY s.pinned DESC, s.updated_at DESC
-  `).all(tenantId, ownerSub);
-  return rows.map((row: any) => mapChatSession(row, listMessagesForSession(row.id)));
+  `).all(tenantId, ownerSub, ownerSub);
+  return rows.map((row: any) => mapChatSession(row, listMessagesForSession(row.id), ownerSub));
+}
+
+export function getLatestAgentRuntimeSession(tenantId: string, ownerSub: string, templateId: string) {
+  const row = db.prepare(`
+    SELECT s.id, s.title, s.sdk_cwd, s.updated_at
+    FROM chat_sessions s
+    WHERE s.tenant_id = ?
+      AND s.template_id = ?
+      AND s.sdk_cwd IS NOT NULL
+      AND s.sdk_cwd != ''
+      AND (
+        s.owner_sub = ?
+        OR (
+          s.collaboration_enabled = 1
+          AND EXISTS (
+            SELECT 1 FROM chat_session_members m
+            WHERE m.session_id = s.id
+              AND m.tenant_id = s.tenant_id
+              AND m.member_sub = ?
+          )
+        )
+      )
+    ORDER BY s.updated_at DESC
+    LIMIT 1
+  `).get(tenantId, templateId, ownerSub, ownerSub) as {
+    id: string;
+    title: string;
+    sdk_cwd: string;
+    updated_at: number;
+  } | undefined;
+
+  if (!row) return null;
+  return {
+    id: row.id,
+    title: row.title,
+    sdkCwd: row.sdk_cwd,
+    updatedAt: row.updated_at,
+  };
 }
 
 export function getChatSession(tenantId: string, ownerSub: string, sessionId: string) {
-  const row = getChatSessionRow(tenantId, ownerSub, sessionId);
+  const row = getAccessibleChatSessionRow(tenantId, ownerSub, sessionId);
   if (!row) return null;
-  return mapChatSession(row, listMessagesForSession(sessionId));
+  return mapChatSession(row, listMessagesForSession(sessionId), ownerSub);
 }
 
 export function listProtectedSdkCwds() {
@@ -1942,6 +2456,7 @@ export function saveChatSession(
     return { ok: false as const, status: 404, error: 'not found' };
   }
   const id = String(session.id || crypto.randomUUID());
+  const memberUpdatingSharedSession = existing?.collaborationRole === 'member';
   const messages = normalizeChatMessages(session.messages ?? existing?.messages ?? []);
   if (!session.templateId && !existing?.templateId) {
     return { ok: false as const, status: 400, error: '缺少 templateId' };
@@ -1952,13 +2467,23 @@ export function saveChatSession(
     || existing?.createdAt
     || now();
   const updatedAt = Number(session.updatedAt) || now();
-  const title = String(session.title || existing?.title || firstContent?.slice(0, 40) || '新对话');
-  const model = String(session.model || existing?.model || '');
+  const title = memberUpdatingSharedSession
+    ? existing.title
+    : String(session.title || existing?.title || firstContent?.slice(0, 40) || '新对话');
+  const model = memberUpdatingSharedSession
+    ? existing.model
+    : String(session.model || existing?.model || '');
   const sdkSessionId = String(session.sdkSessionId || existing?.sdkSessionId || '').trim();
   const sdkCwd = String(session.sdkCwd || existing?.sdkCwd || '').trim();
-  const forkedFromSessionId = String(session.forkedFromSessionId || existing?.forkedFromSessionId || '').trim();
-  const pinned = typeof session.pinned === 'boolean' ? session.pinned : Boolean(existing?.pinned);
-  const templateId = String(session.templateId || existing?.templateId);
+  const forkedFromSessionId = memberUpdatingSharedSession
+    ? String(existing.forkedFromSessionId || '').trim()
+    : String(session.forkedFromSessionId || existing?.forkedFromSessionId || '').trim();
+  const pinned = memberUpdatingSharedSession
+    ? Boolean(existing.pinned)
+    : (typeof session.pinned === 'boolean' ? session.pinned : Boolean(existing?.pinned));
+  const templateId = memberUpdatingSharedSession
+    ? existing.templateId
+    : String(session.templateId || existing?.templateId);
 
   db.exec('BEGIN');
   try {
@@ -2005,8 +2530,9 @@ export function updateChatSession(
   sessionId: string,
   patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'forkedFromSessionId'>>,
 ) {
-  const current = getChatSession(tenantId, ownerSub, sessionId);
-  if (!current) return null;
+  const currentRow = getOwnedChatSessionRow(tenantId, ownerSub, sessionId);
+  if (!currentRow) return null;
+  const current = mapChatSession(currentRow, listMessagesForSession(sessionId), ownerSub);
   const next = saveChatSession(tenantId, ownerSub, {
     ...current,
     id: sessionId,
@@ -2043,10 +2569,52 @@ export function forkChatSession(tenantId: string, ownerSub: string, sessionId: s
 }
 
 export function deleteChatSession(tenantId: string, ownerSub: string, sessionId: string) {
-  const row = getChatSessionRow(tenantId, ownerSub, sessionId);
+  const row = getOwnedChatSessionRow(tenantId, ownerSub, sessionId);
   if (!row) return false;
   const result = db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(sessionId);
   return result.changes > 0;
+}
+
+export function updateChatSessionCollaboration(tenantId: string, ownerSub: string, sessionId: string, enabled: boolean) {
+  const row = getOwnedChatSessionRow(tenantId, ownerSub, sessionId);
+  if (!row) return null;
+  const updatedAt = now();
+  db.exec('BEGIN');
+  try {
+    db.prepare(`
+      UPDATE chat_sessions
+      SET collaboration_enabled = ?, collaboration_updated_at = ?, updated_at = ?
+      WHERE tenant_id = ? AND owner_sub = ? AND id = ?
+    `).run(enabled ? 1 : 0, updatedAt, updatedAt, tenantId, ownerSub, sessionId);
+    if (!enabled) {
+      db.prepare('DELETE FROM chat_session_members WHERE session_id = ?').run(sessionId);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  return getChatSession(tenantId, ownerSub, sessionId);
+}
+
+export function joinChatSession(tenantId: string, memberSub: string, sessionId: string) {
+  const row = getEnabledSharedChatSessionRow(tenantId, sessionId);
+  if (!row) return null;
+  if (row.owner_sub === memberSub) {
+    return mapChatSession(row, listMessagesForSession(sessionId), memberSub);
+  }
+  db.prepare(`
+    INSERT INTO chat_session_members (session_id, tenant_id, member_sub, role, joined_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(session_id, member_sub) DO UPDATE SET
+      role = excluded.role,
+      joined_at = excluded.joined_at
+  `).run(sessionId, tenantId, memberSub, 'member', now());
+  return getChatSession(tenantId, memberSub, sessionId);
+}
+
+export function canAccessChatSession(tenantId: string, ownerSub: string, sessionId: string) {
+  return Boolean(getAccessibleChatSessionRow(tenantId, ownerSub, sessionId));
 }
 
 export function getTenantById(tenantId: string) {
@@ -2055,6 +2623,139 @@ export function getTenantById(tenantId: string) {
 
 export function getDataLocation() {
   return { dataDir: DATA_DIR, dbPath: DB_PATH };
+}
+
+// ═══ Provider Profiles (tenant-shared) ═══
+function parseProviderModelsJson(value: unknown): string[] {
+  if (typeof value !== 'string' || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return Array.from(new Set(parsed.flatMap((item) => {
+      if (typeof item !== 'string') return [];
+      const model = item.trim();
+      return model && !model.includes('*') ? [model] : [];
+    })));
+  } catch {
+    return [];
+  }
+}
+
+function splitProviderModels(value: string): string[] {
+  return Array.from(new Set(value
+    .split(/[\s,，]+/)
+    .map(model => model.trim())
+    .filter(model => model && !model.includes('*'))));
+}
+
+function normalizeProviderProfileInput(tenantId: string, input: Record<string, unknown>, fallbackIndex: number): ProviderProfileRow {
+  const timestamp = now();
+  const id = String(input.id || `provider-${timestamp}-${fallbackIndex}`).trim().slice(0, 96);
+  const availableModels = [
+    ...(Array.isArray(input.availableModels) ? input.availableModels : []),
+    ...(typeof input.modelPatterns === 'string' ? splitProviderModels(input.modelPatterns) : []),
+    ...(typeof input.ANTHROPIC_MODEL === 'string' ? [input.ANTHROPIC_MODEL] : []),
+  ].flatMap((item) => {
+    if (typeof item !== 'string') return [];
+    const model = item.trim();
+    return model && !model.includes('*') ? [model] : [];
+  });
+
+  return {
+    tenantId,
+    id: id || `provider-${timestamp}-${fallbackIndex}`,
+    name: String(input.name || `供应商 ${fallbackIndex + 1}`).trim().slice(0, 80) || `供应商 ${fallbackIndex + 1}`,
+    ANTHROPIC_AUTH_TOKEN: String(input.ANTHROPIC_AUTH_TOKEN || '').trim(),
+    ANTHROPIC_BASE_URL: String(input.ANTHROPIC_BASE_URL || '').trim(),
+    availableModels: Array.from(new Set(availableModels)),
+    enabled: input.enabled !== false,
+    isDefault: input.isDefault === true,
+    createdAt: Number(input.createdAt) || timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function mapProviderProfile(row: any): ProviderProfileRow {
+  return {
+    tenantId: row.tenant_id,
+    id: row.id,
+    name: row.name,
+    ANTHROPIC_AUTH_TOKEN: row.auth_token || '',
+    ANTHROPIC_BASE_URL: row.base_url || '',
+    availableModels: parseProviderModelsJson(row.available_models_json),
+    enabled: Boolean(row.enabled),
+    isDefault: Boolean(row.is_default),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function listProviderProfiles(tenantId: string): ProviderProfileRow[] {
+  const rows = db.prepare(`
+    SELECT tenant_id, id, name, auth_token, base_url, available_models_json, enabled, is_default, created_at, updated_at
+    FROM provider_profiles
+    WHERE tenant_id = ?
+    ORDER BY is_default DESC, updated_at DESC, name ASC
+  `).all(tenantId);
+  return rows.map(mapProviderProfile);
+}
+
+export function replaceProviderProfiles(tenantId: string, profiles: Array<Record<string, unknown>>): ProviderProfileRow[] {
+  const normalized = profiles.flatMap((profile, index) => {
+    if (!profile || typeof profile !== 'object' || Array.isArray(profile)) return [];
+    const next = normalizeProviderProfileInput(tenantId, profile, index);
+    return next.id && next.ANTHROPIC_BASE_URL ? [next] : [];
+  });
+  const defaultId = normalized.find(profile => profile.isDefault)?.id || normalized[0]?.id || '';
+  const nextProfiles = normalized.map(profile => ({
+    ...profile,
+    isDefault: profile.id === defaultId,
+  }));
+
+  db.exec('BEGIN');
+  try {
+    db.prepare('DELETE FROM provider_profiles WHERE tenant_id = ?').run(tenantId);
+    const insert = db.prepare(`
+      INSERT INTO provider_profiles (
+        tenant_id, id, name, auth_token, base_url, available_models_json, enabled, is_default, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const profile of nextProfiles) {
+      insert.run(
+        tenantId,
+        profile.id,
+        profile.name,
+        profile.ANTHROPIC_AUTH_TOKEN,
+        profile.ANTHROPIC_BASE_URL,
+        JSON.stringify(profile.availableModels),
+        profile.enabled ? 1 : 0,
+        profile.isDefault ? 1 : 0,
+        profile.createdAt,
+        profile.updatedAt,
+      );
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+
+  return listProviderProfiles(tenantId);
+}
+
+export function resolveProviderProfileForModel(tenantId: string, model: string): ProviderProfileRow | null {
+  const profiles = listProviderProfiles(tenantId);
+  if (!profiles.length) return null;
+  const enabled = profiles.filter(profile => profile.enabled);
+  const usable = enabled.length ? enabled : profiles;
+  const normalizedModel = model.trim().toLowerCase();
+  if (normalizedModel) {
+    return usable.find(profile => (
+      profile.availableModels.some(candidate => candidate.trim().toLowerCase() === normalizedModel)
+    )) || null;
+  }
+  return usable.find(profile => profile.isDefault) || usable[0] || null;
 }
 
 // ═══ Agent Templates (tenant-shared) ═══

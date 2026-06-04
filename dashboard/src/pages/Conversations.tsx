@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { ClipboardEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
-import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig, ChatImageAttachment, ChatImageMimeType } from '../simulator/types';
-import { getDefaultProviderConfig, initCustomTools } from '../simulator/mock-data';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig, ChatAttachment, ChatImageMimeType } from '../simulator/types';
+import { initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
 import { getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
 import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
@@ -12,49 +12,32 @@ import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agen
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
+import { loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
+import {
+  CHAT_FILE_ACCEPT,
+  CHAT_FILE_MAX_COUNT,
+  CHAT_IMAGE_MAX_BYTES,
+  CHAT_IMAGE_MAX_COUNT,
+  CHAT_IMAGE_MIME_TYPES,
+  fileToChatAttachment,
+  formatAttachmentBytes,
+  getChatImageSrc,
+} from '../utils/chat-attachments-ui';
 import {
   bootstrapChatSessions,
   createChatSessionTitle,
   deleteChatSession as deleteChatSessionApi,
   forkChatSession as forkChatSessionApi,
+  getChatSession,
   getChatSessionDisplayTitle,
+  joinChatSession as joinChatSessionApi,
   patchChatSession,
   saveChatSession as saveChatSessionApi,
+  setChatSessionCollaboration,
+  subscribeChatSessionEvents,
 } from '../utils/chat-sessions';
-
-const CHAT_IMAGE_MIME_TYPES = new Set<ChatImageMimeType>(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
-const CHAT_IMAGE_MAX_COUNT = 4;
-const CHAT_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
-
-function getImageSrc(image: ChatImageAttachment): string {
-  return `data:${image.mediaType};base64,${image.data}`;
-}
-
-function fileToImageAttachment(file: File): Promise<ChatImageAttachment> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('图片读取失败'));
-    reader.onload = () => {
-      const dataUrl = String(reader.result || '');
-      const data = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-      if (!data) {
-        reject(new Error('图片数据为空'));
-        return;
-      }
-      resolve({
-        id: crypto.randomUUID(),
-        type: 'image',
-        mediaType: file.type as ChatImageMimeType,
-        data,
-        name: file.name || 'pasted-image',
-        size: file.size,
-      });
-    };
-    reader.readAsDataURL(file);
-  });
-}
 
 // MCP 服务状态指示灯（自动 ping 端点）
 function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }) {
@@ -108,14 +91,6 @@ function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }
   );
 }
 
-function loadGlobalProvider(): ProviderConfig {
-  try {
-    const raw = localStorage.getItem('agentma_provider_config');
-    if (raw) return { ...getDefaultProviderConfig(), ...JSON.parse(raw) };
-  } catch {}
-  return getDefaultProviderConfig();
-}
-
 function formatEvent(ev: { type: string; source?: string; username?: string; message?: string; health?: number }): string {
   if (ev.type === 'chat') return `[${ev.source || 'bot'}] ${ev.username || '?'}: ${ev.message || ''}`;
   if (ev.type === 'health') return `[${ev.source || 'bot'}] 血量: ${ev.health}`;
@@ -124,8 +99,47 @@ function formatEvent(ev: { type: string; source?: string; username?: string; mes
   return `[${ev.source || 'bot'}] ${ev.type}`;
 }
 
+async function readChatError(response: Response) {
+  const text = await response.text().catch(() => '');
+  if (!text) return `API 错误: ${response.status}`;
+  try {
+    const data = JSON.parse(text) as { error?: unknown };
+    return data?.error ? String(data.error) : `API 错误: ${response.status}`;
+  } catch {
+    return text.slice(0, 240) || `API 错误: ${response.status}`;
+  }
+}
+
+function formatShortId(value?: string | null) {
+  return value ? value.slice(0, 5) : '-';
+}
+
+function compareChatSessions(a: ChatSession, b: ChatSession) {
+  if (a.pinned && !b.pinned) return -1;
+  if (!a.pinned && b.pinned) return 1;
+  return b.updatedAt - a.updatedAt;
+}
+
+function getSessionsForAgent(sessions: ChatSession[], agentId: string) {
+  return sessions
+    .filter(session => session.templateId === agentId)
+    .sort(compareChatSessions);
+}
+
+function canResumeSessionForAgent(session: ChatSession | null | undefined, agent: AgentTemplate | null | undefined) {
+  if (!session?.sdkSessionId || !agent) return false;
+  return session.templateId === agent.id && (!session.model || session.model === agent.model);
+}
+
+type ConversationUrlState = Pick<ChatSession, 'id' | 'sdkSessionId'> | null;
+
 export default function Conversations() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedAgentId = searchParams.get('agent') || '';
+  const joinSessionId = searchParams.get('join') || '';
+  const requestedConversationId = searchParams.get('conversationId') || '';
+  const requestedSessionId = searchParams.get('sdkSessionId') || searchParams.get('sessionId') || '';
   const { user } = useAuth();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
@@ -142,23 +156,49 @@ export default function Conversations() {
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
   const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
   const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
-  const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const activeItemRef = useRef<HTMLDivElement>(null);
-  const provider = useRef<ProviderConfig>(loadGlobalProvider());
+  const provider = useRef<ProviderConfig>(resolveProviderForModel().provider);
   const currentAgent = templates.find(t => t.id === selectedAgentId);
+  const activeSession = activeSessionId ? sessions.find(s => s.id === activeSessionId) || null : null;
 
   const [botEvents, setBotEvents] = useState<Array<{ type: string; source?: string; username?: string; message?: string; health?: number; timestamp: number }>>([]);
   const [eventSources, setEventSources] = useState<EventSourceConfig[]>([]);
   const [subbedSources, setSubbedSources] = useState<string[]>([]);
   const [showEventToggles, setShowEventToggles] = useState(false);
   const [sessionSearch, setSessionSearch] = useState('');
+  const [collaborationError, setCollaborationError] = useState('');
+  const [copyStatus, setCopyStatus] = useState('');
+  const selectedAgentSessions = selectedAgentId ? getSessionsForAgent(sessions, selectedAgentId) : [];
+  const visibleSessions = selectedAgentSessions
+    .filter(session => !sessionSearch || getChatSessionDisplayTitle(session).toLowerCase().includes(sessionSearch.toLowerCase()));
   const persistRef = useRef<((msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => Promise<string>) | null>(null);
+
+  const syncConversationUrl = useCallback((session: ConversationUrlState) => {
+    const next = new URLSearchParams(searchParams);
+    next.delete('join');
+    if (session?.id) next.set('conversationId', session.id);
+    else next.delete('conversationId');
+    next.delete('sessionId');
+    if (session?.sdkSessionId) next.set('sdkSessionId', session.sdkSessionId);
+    else next.delete('sdkSessionId');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+
+  const upsertSession = useCallback((session: ChatSession) => {
+    setSessions(prev => {
+      const exists = prev.some((item) => item.id === session.id);
+      if (!exists) return [session, ...prev];
+      return prev.map((item) => item.id === session.id ? session : item);
+    });
+  }, []);
 
   // 自动回复
   const doAutoReply = useCallback(async (eventText: string) => {
@@ -166,8 +206,7 @@ export default function Conversations() {
 
     const agent = currentAgent;
     const currentMsgs = messages;
-    const prov = { ...loadGlobalProvider() };
-    if (agent.providerOverrides) Object.assign(prov, agent.providerOverrides);
+    const prov = resolveProviderForModel(agent.model).provider;
 
     setIsStreaming(true);
     const eventMsg: ChatMessage = { role: 'user', content: eventText, timestamp: Date.now() };
@@ -201,14 +240,22 @@ export default function Conversations() {
     abortRef.current = controller;
 
     try {
+      const active = sessions.find((session) => session.id === activeSessionId);
+      const shouldResume = canResumeSessionForAgent(active, agent);
       const res = await fetch('/api/chat', {
         method: 'POST',
         signal: controller.signal,
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
-          messages: newMsgs.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
+          messages: newMsgs.map((m, index) => ({
+            role: m.role,
+            content: m.content,
+            attachments: index === newMsgs.length - 1 ? m.attachments : undefined,
+          })),
           systemPrompt: agent.systemPrompt || undefined,
+          model: agent.model,
           provider: prov,
+          providerProfiles: loadProviderProfiles(),
           tools: buildRequestToolsForAgent(agent),
           subagents: agent.subagents,
           skills: agent.skills || [],
@@ -216,13 +263,13 @@ export default function Conversations() {
           useKnowledge: agent.useKnowledge || undefined,
           knowledgeSourceIds: agent.knowledgeSourceIds || [],
           outputSchema: agent.outputSchema || undefined,
-          sdkSessionId: sessions.find((session) => session.id === activeSessionId)?.sdkSessionId,
-          sdkCwd: sessions.find((session) => session.id === activeSessionId)?.sdkCwd,
+          sdkSessionId: shouldResume ? active?.sdkSessionId : undefined,
+          sdkCwd: shouldResume ? active?.sdkCwd : undefined,
         }),
       });
 
       if (!res.ok) {
-        await persistFinalMessage(`API 错误: ${res.status}`, 'error');
+        await persistFinalMessage(await readChatError(res), 'error');
         setIsStreaming(false);
         return;
       }
@@ -379,11 +426,43 @@ export default function Conversations() {
 
   useEffect(() => {
     if (selectedAgentId) return;
+    if (requestedAgentId) {
+      if (templates.some((template) => template.id === requestedAgentId)) {
+        setSelectedAgentId(requestedAgentId);
+        return;
+      }
+      if (templates.length === 0) return;
+    }
     const lastId = sessions.length > 0
       ? [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)[0].templateId
       : templates[0]?.id || '';
     if (lastId) setSelectedAgentId(lastId);
-  }, [sessions, templates, selectedAgentId]);
+  }, [requestedAgentId, sessions, templates, selectedAgentId]);
+
+  useEffect(() => {
+    if (joinSessionId) return;
+    if (!requestedConversationId && !requestedSessionId) return;
+    const requestedSession = (requestedConversationId
+      ? sessions.find((session) => session.id === requestedConversationId)
+      : null)
+      || (requestedSessionId
+        ? sessions.find((session) => session.sdkSessionId === requestedSessionId)
+        : null);
+    if (!requestedSession || activeSessionId === requestedSession.id) return;
+
+    setActiveSessionId(requestedSession.id);
+    setMessages(requestedSession.messages);
+    setPendingQuestions([]);
+    setAgentTasks([]);
+    setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    setAttachments([]);
+    setAttachmentError('');
+    if (requestedSession.templateId && templates.find(t => t.id === requestedSession.templateId)) {
+      setSelectedAgentId(requestedSession.templateId);
+    }
+    setMobileListOpen(false);
+  }, [joinSessionId, requestedConversationId, requestedSessionId, sessions, activeSessionId, templates]);
 
   useEffect(() => {
     const el = messagesRef.current;
@@ -398,14 +477,16 @@ export default function Conversations() {
     const now = Date.now();
     const id = sid || `chat-${Date.now()}`;
     const existing = sid ? sessions.find((session) => session.id === sid) : undefined;
+    const currentModel = currentAgent?.model || existing?.model || '';
+    const keepsSameAgent = Boolean(existing && existing.templateId === selectedAgentId && (!existing.model || existing.model === currentModel));
     const draft: ChatSession = {
       id,
       templateId: selectedAgentId,
       title: createChatSessionTitle(msgs, existing?.title),
       messages: msgs,
-      model: currentAgent?.model || provider.current.ANTHROPIC_MODEL || existing?.model || '',
-      sdkSessionId: sdkSessionId || existing?.sdkSessionId,
-      sdkCwd: sdkCwd || existing?.sdkCwd,
+      model: currentModel,
+      sdkSessionId: sdkSessionId || (keepsSameAgent ? existing?.sdkSessionId : undefined),
+      sdkCwd: sdkCwd || (keepsSameAgent ? existing?.sdkCwd : undefined),
       forkedFromSessionId: existing?.forkedFromSessionId,
       forkedFromTitle: existing?.forkedFromTitle,
       pinned: existing?.pinned,
@@ -427,12 +508,14 @@ export default function Conversations() {
         if (!exists) return [saved, ...prev];
         return prev.map((session) => session.id === saved.id ? saved : session);
       });
+      syncConversationUrl(saved);
       return saved.id;
     } catch (error) {
       console.error('failed to persist chat session', error);
+      syncConversationUrl(draft);
       return id;
     }
-  }, [selectedAgentId, currentAgent, sessions]);
+  }, [selectedAgentId, currentAgent, sessions, syncConversationUrl]);
 
   // 把 persistSession 存到 ref 供 doAutoReply 使用
   persistRef.current = persistSession;
@@ -449,6 +532,7 @@ export default function Conversations() {
     setAttachments([]);
     setAttachmentError('');
     setMobileListOpen(false);
+    syncConversationUrl(null);
   };
 
   // 选中会话时滚动到可见位置
@@ -472,7 +556,103 @@ export default function Conversations() {
       setSelectedAgentId(s.templateId);
     }
     setMobileListOpen(false);
-  }, [templates]);
+    syncConversationUrl(s);
+  }, [templates, syncConversationUrl]);
+
+  const handleAgentChange = useCallback((agentId: string) => {
+    setSelectedAgentId(agentId);
+    setSessionSearch('');
+    setPendingQuestions([]);
+    setPendingPermissions([]);
+    setAgentTasks([]);
+    setStructuredOutput(null);
+    setRunStats(null);
+    setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    setAttachments([]);
+    setAttachmentError('');
+    setMobileListOpen(false);
+
+    const nextSession = getSessionsForAgent(sessions, agentId)[0];
+    if (nextSession) {
+      setActiveSessionId(nextSession.id);
+      setMessages(nextSession.messages);
+      syncConversationUrl(nextSession);
+      return;
+    }
+
+    setActiveSessionId(null);
+    setMessages([]);
+    syncConversationUrl(null);
+  }, [sessions, syncConversationUrl]);
+
+  const refreshSession = useCallback(async (sessionId: string) => {
+    const refreshed = await getChatSession(sessionId);
+    if (!refreshed) {
+      setSessions(prev => prev.filter(session => session.id !== sessionId));
+      if (activeSessionId === sessionId) {
+        setActiveSessionId(null);
+        setMessages([]);
+        syncConversationUrl(null);
+      }
+      return null;
+    }
+    upsertSession(refreshed);
+    if (activeSessionId === sessionId) {
+      setMessages(refreshed.messages);
+      if (refreshed.templateId) setSelectedAgentId(refreshed.templateId);
+      syncConversationUrl(refreshed);
+    }
+    return refreshed;
+  }, [activeSessionId, upsertSession, syncConversationUrl]);
+
+  useEffect(() => {
+    if (!joinSessionId) return;
+    let cancelled = false;
+    const clearJoinParam = () => {
+      const next = new URLSearchParams(searchParams);
+      next.delete('join');
+      setSearchParams(next, { replace: true });
+    };
+
+    (async () => {
+      setCollaborationError('');
+      try {
+        const joined = await joinChatSessionApi(joinSessionId);
+        if (cancelled) return;
+        upsertSession(joined);
+        setActiveSessionId(joined.id);
+        setMessages(joined.messages);
+        if (joined.templateId) setSelectedAgentId(joined.templateId);
+        syncConversationUrl(joined);
+      } catch (error) {
+        if (!cancelled) {
+          setCollaborationError((error as Error).message || '加入协作会话失败');
+          clearJoinParam();
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [joinSessionId, searchParams, setSearchParams, upsertSession, syncConversationUrl]);
+
+  useEffect(() => {
+    if (!activeSession?.id || !activeSession.collaborationEnabled) return;
+    return subscribeChatSessionEvents(activeSession.id, (event) => {
+      if (event.type === 'connected') return;
+      if (event.type === 'session_deleted') {
+        setSessions(prev => prev.filter(session => session.id !== activeSession.id));
+        setActiveSessionId(null);
+        setMessages([]);
+        return;
+      }
+      void refreshSession(activeSession.id).catch((error) => {
+        console.error('failed to refresh collaboration session', error);
+      });
+    }, (error) => {
+      console.error('collaboration stream failed', error);
+    });
+  }, [activeSession?.id, activeSession?.collaborationEnabled, refreshSession]);
 
   // 编辑标题
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -531,12 +711,39 @@ export default function Conversations() {
       setMessages([]);
       setAttachments([]);
       setAttachmentError('');
+      syncConversationUrl(null);
     }
     try {
       await deleteChatSessionApi(id);
     } catch (error) {
       console.error('failed to delete chat session', error);
       setSessions(sessions);
+    }
+  };
+
+  const handleToggleCollaboration = async () => {
+    if (!activeSession || activeSession.collaborationRole === 'member') return;
+    setCollaborationError('');
+    setCopyStatus('');
+    try {
+      const saved = await setChatSessionCollaboration(activeSession.id, !activeSession.collaborationEnabled);
+      upsertSession(saved);
+      setMessages(saved.messages);
+    } catch (error) {
+      setCollaborationError((error as Error).message || '协作设置失败');
+    }
+  };
+
+  const handleCopyCollaborationLink = async () => {
+    if (!activeSession) return;
+    const link = `${window.location.origin}/conversations?join=${encodeURIComponent(activeSession.id)}`;
+    setCollaborationError('');
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopyStatus('已复制');
+      setTimeout(() => setCopyStatus(''), 1800);
+    } catch {
+      window.prompt('复制协作链接', link);
     }
   };
 
@@ -554,7 +761,8 @@ export default function Conversations() {
     event.preventDefault();
     setAttachmentError('');
 
-    const remainingSlots = CHAT_IMAGE_MAX_COUNT - attachments.length;
+    const imageCount = attachments.filter((item) => item.type === 'image').length;
+    const remainingSlots = CHAT_IMAGE_MAX_COUNT - imageCount;
     if (remainingSlots <= 0) {
       setAttachmentError(`最多一次发送 ${CHAT_IMAGE_MAX_COUNT} 张图片`);
       return;
@@ -563,7 +771,7 @@ export default function Conversations() {
     const accepted: File[] = [];
     for (const file of files) {
       if (!CHAT_IMAGE_MIME_TYPES.has(file.type as ChatImageMimeType)) {
-        setAttachmentError('仅支持 PNG、JPEG、GIF、WebP 图片');
+        setAttachmentError('不支持这种图片格式；普通文件请用 + 上传');
         continue;
       }
       if (file.size > CHAT_IMAGE_MAX_BYTES) {
@@ -579,12 +787,44 @@ export default function Conversations() {
     if (!accepted.length) return;
 
     try {
-      const nextAttachments = await Promise.all(accepted.map(fileToImageAttachment));
+      const nextAttachments = await Promise.all(accepted.map(fileToChatAttachment));
       setAttachments(prev => [...prev, ...nextAttachments]);
     } catch (error) {
       setAttachmentError((error as Error).message || '图片读取失败');
     }
-  }, [attachments.length]);
+  }, [attachments]);
+
+  const handleFilePicked = useCallback(async (fileList: FileList | null) => {
+    const files = Array.from(fileList || []);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (!files.length) return;
+    setAttachmentError('');
+
+    const currentFileCount = attachments.filter((item) => item.type === 'file').length;
+    const remainingFiles = CHAT_FILE_MAX_COUNT - currentFileCount;
+    if (remainingFiles <= 0) {
+      setAttachmentError(`最多一次发送 ${CHAT_FILE_MAX_COUNT} 个文件`);
+      return;
+    }
+
+    const accepted = files.slice(0, remainingFiles);
+    if (files.length > remainingFiles) setAttachmentError(`最多一次发送 ${CHAT_FILE_MAX_COUNT} 个文件`);
+    try {
+      const formData = new FormData();
+      for (const file of accepted) formData.append('files', file, file.name);
+      const response = await fetch('/api/chat/files/upload', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: formData,
+      });
+      const data = await response.json().catch(() => ({})) as { attachments?: ChatAttachment[]; error?: string };
+      if (!response.ok) throw new Error(data.error || `上传失败: ${response.status}`);
+      const nextAttachments = Array.isArray(data.attachments) ? data.attachments : [];
+      setAttachments(prev => [...prev, ...nextAttachments]);
+    } catch (error) {
+      setAttachmentError((error as Error).message || '文件读取失败');
+    }
+  }, [attachments]);
 
   // 发送消息
   const handleSend = useCallback(async () => {
@@ -592,11 +832,7 @@ export default function Conversations() {
     const messageAttachments = attachments;
     if ((!content && messageAttachments.length === 0) || isStreaming || !currentAgent) return;
 
-    // 合并 provider 配置
-    provider.current = loadGlobalProvider();
-    if (currentAgent.providerOverrides) {
-      provider.current = { ...provider.current, ...currentAgent.providerOverrides };
-    }
+    provider.current = resolveProviderForModel(currentAgent.model).provider;
 
     const userMsg: ChatMessage = {
       role: 'user',
@@ -639,14 +875,22 @@ export default function Conversations() {
     abortRef.current = controller;
 
     try {
+      const active = activeSessionId ? sessions.find((session) => session.id === activeSessionId) : null;
+      const shouldResume = canResumeSessionForAgent(active, currentAgent);
       const res = await fetch('/api/chat', {
         method: 'POST',
         signal: controller.signal,
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
-          messages: newMsgs.map(m => ({ role: m.role, content: m.content, attachments: m.attachments })),
+          messages: newMsgs.map((m, index) => ({
+            role: m.role,
+            content: m.content,
+            attachments: index === newMsgs.length - 1 ? m.attachments : undefined,
+          })),
           systemPrompt: currentAgent.systemPrompt || undefined,
+          model: currentAgent.model,
           provider: provider.current,
+          providerProfiles: loadProviderProfiles(),
           tools: buildRequestToolsForAgent(currentAgent),
           subagents: currentAgent.subagents,
           skills: currentAgent.skills || [],
@@ -654,13 +898,13 @@ export default function Conversations() {
           useKnowledge: currentAgent.useKnowledge || undefined,
           knowledgeSourceIds: currentAgent.knowledgeSourceIds || [],
           outputSchema: currentAgent.outputSchema || undefined,
-          sdkSessionId: activeSessionId ? sessions.find((session) => session.id === activeSessionId)?.sdkSessionId : undefined,
-          sdkCwd: activeSessionId ? sessions.find((session) => session.id === activeSessionId)?.sdkCwd : undefined,
+          sdkSessionId: shouldResume ? active?.sdkSessionId : undefined,
+          sdkCwd: shouldResume ? active?.sdkCwd : undefined,
         }),
       });
 
       if (!res.ok) {
-        await persistFinalMessage(`API 错误: ${res.status}`, 'error');
+        await persistFinalMessage(await readChatError(res), 'error');
         setIsStreaming(false);
         return;
       }
@@ -754,7 +998,7 @@ export default function Conversations() {
           <div className="form-group" style={{ marginBottom: 8 }}>
             <select
               value={selectedAgentId}
-              onChange={e => setSelectedAgentId(e.target.value)}
+              onChange={e => handleAgentChange(e.target.value)}
               style={{ fontSize: '.82em' }}
             >
               {templates.length === 0 && <option value="">暂无 Agent</option>}
@@ -772,7 +1016,7 @@ export default function Conversations() {
         </div>
 
         {/* 会话搜索 */}
-        {sessions.length > 5 && (
+        {selectedAgentSessions.length > 5 && (
           <div style={{ padding: '6px 8px', borderBottom: '1px solid var(--border)' }}>
             <input
               value={sessionSearch}
@@ -785,13 +1029,7 @@ export default function Conversations() {
 
         {/* 会话列表 */}
         <div ref={sidebarRef} style={{ flex: 1, overflowY: 'auto', padding: '8px 8px' }}>
-          {[...sessions]
-            .filter(s => !sessionSearch || getChatSessionDisplayTitle(s).toLowerCase().includes(sessionSearch.toLowerCase()))
-            .sort((a, b) => {
-              if (a.pinned && !b.pinned) return -1;
-              if (!a.pinned && b.pinned) return 1;
-              return b.updatedAt - a.updatedAt;
-            })
+          {visibleSessions
             .map(s => (
               <div
                 key={s.id}
@@ -837,7 +1075,10 @@ export default function Conversations() {
                 </div>
                 <div className="flex-between" style={{ fontSize: '.72em', color: 'var(--ink-muted)' }}>
                   <span>{templates.find(t => t.id === s.templateId)?.name || 'Agent'}</span>
-                  <span style={{ marginLeft: 8, whiteSpace: 'nowrap' }}>{s.messages.length} 条</span>
+                  <span style={{ marginLeft: 8, whiteSpace: 'nowrap' }}>
+                    {s.collaborationEnabled && <span title={s.collaborationRole === 'member' ? '我加入的协作会话' : '我开启的协作会话'}>协作 · </span>}
+                    {s.messages.length} 条
+                  </span>
                 </div>
                 {s.forkedFromTitle && (
                   <div style={{ fontSize: '.68em', color: 'var(--ink-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -894,6 +1135,18 @@ export default function Conversations() {
               </button>
               <div style={{ fontWeight: 700, fontSize: '.95em' }}>{currentAgent?.name}</div>
               <div className="flex gap-2" style={{ flexWrap: 'wrap', flex: 1 }}>
+                <span
+                  className="conversation-id-badge"
+                  title={activeSession?.id ? `对话id: ${activeSession.id}` : '对话id 暂无'}
+                >
+                  对话id {formatShortId(activeSession?.id)}
+                </span>
+                <span
+                  className="conversation-id-badge"
+                  title={activeSession?.sdkSessionId ? `会话id: ${activeSession.sdkSessionId}` : '会话id 暂无'}
+                >
+                  会话id {formatShortId(activeSession?.sdkSessionId)}
+                </span>
                 {currentAgent?.model && <span className="badge badge-muted">{currentAgent.model}</span>}
                 {((currentAgent?.knowledgeSourceIds || []).length > 0 || currentAgent?.useKnowledge) && (
                   <span className="badge badge-success">知识库×{(currentAgent?.knowledgeSourceIds || []).length || '全部'}</span>
@@ -952,6 +1205,26 @@ export default function Conversations() {
                           </label>
                         ))}
                       </div>
+                    )}
+                  </span>
+                )}
+                {activeSession && (
+                  <span className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+                    <span className={`badge ${activeSession.collaborationEnabled ? 'badge-success' : 'badge-muted'}`}>
+                      协作{activeSession.collaborationEnabled ? `·${activeSession.collaborationRole === 'member' ? '成员' : 'Owner'}` : '关闭'}
+                    </span>
+                    {activeSession.collaborationRole !== 'member' && (
+                      <button className="btn btn-sm" onClick={handleToggleCollaboration}>
+                        {activeSession.collaborationEnabled ? '关闭协作' : '开启协作'}
+                      </button>
+                    )}
+                    {activeSession.collaborationEnabled && (
+                      <button className="btn btn-sm" onClick={handleCopyCollaborationLink}>
+                        {copyStatus || '复制链接'}
+                      </button>
+                    )}
+                    {collaborationError && (
+                      <span style={{ color: 'var(--danger)', fontSize: '.76em' }}>{collaborationError}</span>
                     )}
                   </span>
                 )}
@@ -1054,11 +1327,21 @@ export default function Conversations() {
                     {attachmentError && <div style={{ color: 'var(--danger)', fontSize: '.75em', marginBottom: 4 }}>{attachmentError}</div>}
                     {attachments.length > 0 && (
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                        {attachments.map(img => (
-                          <div key={img.id} style={{ position: 'relative' }}>
-                            <img src={getImageSrc(img)} alt={img.name}
-                              style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)' }} />
-                            <button onClick={() => setAttachments(prev => prev.filter(a => a.id !== img.id))}
+                        {attachments.map(item => (
+                          <div key={item.id} style={{ position: 'relative' }}>
+                            {item.type === 'image' ? (
+                              <img src={getChatImageSrc(item)} alt={item.name}
+                                style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)' }} />
+                            ) : (
+                              <div
+                                className="badge badge-info"
+                                title={`${item.name} · ${formatAttachmentBytes(item.size)}`}
+                                style={{ maxWidth: 220, height: 28, display: 'flex', alignItems: 'center', paddingRight: 22, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                              >
+                                {item.name} · {formatAttachmentBytes(item.size)}
+                              </div>
+                            )}
+                            <button onClick={() => setAttachments(prev => prev.filter(a => a.id !== item.id))}
                               style={{ position: 'absolute', top: -4, right: -4, width: 16, height: 16, borderRadius: '50%', background: 'var(--danger)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 10, lineHeight: '16px', padding: 0 }}>
                               ×
                             </button>
@@ -1068,6 +1351,24 @@ export default function Conversations() {
                     )}
                   </div>
                 )}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept={CHAT_FILE_ACCEPT}
+                  onChange={e => void handleFilePicked(e.currentTarget.files)}
+                  style={{ display: 'none' }}
+                />
+                <button
+                  className="btn"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isStreaming}
+                  title="上传文件"
+                  aria-label="上传文件"
+                  style={{ width: 34, height: 34, minWidth: 34, padding: 0, borderRadius: 6, fontSize: 20, lineHeight: '30px' }}
+                >
+                  +
+                </button>
                 <textarea
                   ref={textareaRef}
                   value={input}
@@ -1076,7 +1377,7 @@ export default function Conversations() {
                     if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); handleSend(); }
                   }}
                   onPaste={handlePaste}
-                  placeholder="输入消息，Shift+Enter 发送，可粘贴图片"
+                  placeholder="输入消息，Shift+Enter 发送，可粘贴图片，也可上传文件"
                   style={{ resize: 'none', overflowY: 'hidden', minHeight: 38, maxHeight: 200 }}
                   disabled={isStreaming}
                 />

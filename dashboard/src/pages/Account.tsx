@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { getAuthHeaders } from '../utils/client-runtime';
+import type { ProviderProfile } from '../simulator/types';
+import { createProviderProfile, loadProviderProfiles, mergeProviderProfiles, saveProviderProfiles, splitAvailableModels } from '../utils/providers';
 
 const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
 
@@ -79,18 +81,18 @@ function usageColor(percent: number) {
 }
 
 export default function Account() {
-  const [tab, setTab] = useState<'info' | 'apikeys' | 'teams' | 'users' | 'quota' | 'audit'>('info');
+  const [tab, setTab] = useState<'info' | 'providers' | 'apikeys' | 'teams' | 'users' | 'quota' | 'audit'>('info');
 
   return (
     <div>
       <div className="page-header">
         <h1>⚙ 账户管理</h1>
-        <p>租户信息 · 用户管理 · API 密钥 · 团队 · 配额 · 审计日志</p>
+        <p>租户信息 · 供应商 · 用户管理 · API 密钥 · 团队 · 配额 · 审计日志</p>
       </div>
 
       <div className="flex gap-2 mb-4" style={{ flexWrap: 'wrap' }}>
         {[
-          ['info', '租户信息'], ['users', '用户管理'], ['apikeys', 'API 密钥'],
+          ['info', '租户信息'], ['providers', '供应商'], ['users', '用户管理'], ['apikeys', 'API 密钥'],
           ['teams', '团队'], ['quota', '配额管理'], ['audit', '审计日志'],
         ].map(([k, v]) => (
           <button key={k} className={`btn btn-sm ${tab === k ? 'btn-primary' : ''}`} onClick={() => setTab(k as any)}>{v}</button>
@@ -98,11 +100,245 @@ export default function Account() {
       </div>
 
       {tab === 'info' && <TenantInfo />}
+      {tab === 'providers' && <ProviderManager />}
       {tab === 'users' && <UserManager />}
       {tab === 'apikeys' && <ApiKeyManager />}
       {tab === 'teams' && <TeamManager />}
       {tab === 'quota' && <QuotaManager />}
       {tab === 'audit' && <AuditLogs />}
+    </div>
+  );
+}
+
+function ProviderManager() {
+  const [providers, setProviders] = useState<ProviderProfile[]>(loadProviderProfiles);
+  const [draftProvider, setDraftProvider] = useState<ProviderProfile | null>(null);
+  const [saved, setSaved] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const activeProvider = draftProvider;
+
+  const persist = (next: ProviderProfile[]) => {
+    const savedProviders = saveProviderProfiles(next);
+    setProviders(savedProviders);
+    void fetch('/api/providers', {
+      method: 'PUT',
+      headers: jsonAuthHeaders(),
+      body: JSON.stringify(savedProviders),
+    })
+      .then(async response => {
+        if (!response.ok) throw new Error(await response.text());
+        return response.json();
+      })
+      .then(serverProviders => {
+        if (Array.isArray(serverProviders)) {
+          setProviders(saveProviderProfiles(mergeProviderProfiles(savedProviders, serverProviders)));
+        }
+      })
+      .catch(error => {
+        console.error('failed to sync provider profiles', error);
+      });
+    setSaved(true);
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => setSaved(false), 1400);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch('/api/providers', { headers: getAuthHeaders() });
+        if (!response.ok) return;
+        const serverProviders = await response.json();
+        if (!Array.isArray(serverProviders)) return;
+        const localProviders = loadProviderProfiles();
+        if (serverProviders.length) {
+          const normalized = saveProviderProfiles(mergeProviderProfiles(localProviders, serverProviders));
+          if (!cancelled) setProviders(normalized);
+          void fetch('/api/providers', {
+            method: 'PUT',
+            headers: jsonAuthHeaders(),
+            body: JSON.stringify(normalized),
+          }).catch(error => {
+            console.error('failed to sync merged provider profiles', error);
+          });
+          return;
+        }
+
+        if (!localProviders.length) return;
+        const saveResponse = await fetch('/api/providers', {
+          method: 'PUT',
+          headers: jsonAuthHeaders(),
+          body: JSON.stringify(localProviders),
+        });
+        if (!saveResponse.ok) return;
+        const savedProviders = await saveResponse.json();
+        if (!cancelled && Array.isArray(savedProviders)) setProviders(saveProviderProfiles(savedProviders));
+      } catch (error) {
+        console.error('failed to load provider profiles', error);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const updateDraftProvider = <K extends keyof ProviderProfile>(key: K, value: ProviderProfile[K]) => {
+    setDraftProvider(provider => (
+      provider ? { ...provider, [key]: value, updatedAt: Date.now() } : provider
+    ));
+  };
+
+  const addProvider = () => {
+    setDraftProvider(createProviderProfile({
+      id: `provider-${Date.now()}`,
+      name: `供应商 ${providers.length + 1}`,
+      availableModels: [],
+      enabled: true,
+    }));
+  };
+
+  const removeProvider = (id: string) => {
+    if (providers.length <= 1) return;
+    persist(providers.filter(provider => provider.id !== id));
+    if (draftProvider?.id === id) setDraftProvider(null);
+  };
+
+  const saveDraftProvider = () => {
+    if (!draftProvider) return;
+    const exists = providers.some(provider => provider.id === draftProvider.id);
+    let next = exists
+      ? providers.map(provider => provider.id === draftProvider.id ? draftProvider : provider)
+      : [...providers, draftProvider];
+    if (draftProvider.isDefault) {
+      next = next.map(provider => ({ ...provider, isDefault: provider.id === draftProvider.id }));
+    }
+    persist(next);
+    setDraftProvider(null);
+  };
+
+  return (
+    <div>
+      <div className="spread mb-4" style={{ alignItems: 'center' }}>
+        <div>
+          <div className="section-title" style={{ marginBottom: 4 }}>模型供应商</div>
+          <p style={{ color: 'var(--ink-secondary)', margin: 0 }}>
+            在这里维护每个供应商的 API 凭据和可用模型，Agent 模板只能从这些模型里选择。
+          </p>
+        </div>
+        <div className="flex gap-2" style={{ alignItems: 'center' }}>
+          {saved && <span className="badge badge-success">已保存</span>}
+          <button className="btn btn-primary" onClick={addProvider}>添加供应商</button>
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gap: 10 }}>
+        {providers.map((provider) => (
+          <button
+            type="button"
+            className="card"
+            key={provider.id}
+            onClick={() => setDraftProvider({ ...provider })}
+            style={{
+              width: '100%',
+              textAlign: 'left',
+              cursor: 'pointer',
+              font: 'inherit',
+              color: 'inherit',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              opacity: provider.enabled ? 1 : .62,
+            }}
+          >
+            <span style={{ fontWeight: 700 }}>{provider.name}</span>
+            <span style={{ color: 'var(--ink-muted)', fontSize: '.82em' }}>配置</span>
+          </button>
+        ))}
+      </div>
+
+      {activeProvider && (
+        <div
+          onClick={() => setDraftProvider(null)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 80,
+            background: 'rgba(0, 0, 0, .28)',
+            display: 'grid',
+            placeItems: 'center',
+            padding: 20,
+          }}
+        >
+          <div
+            className="card"
+            onClick={event => event.stopPropagation()}
+            style={{
+              position: 'relative',
+              width: 'min(920px, 100%)',
+              maxHeight: 'min(760px, calc(100vh - 40px))',
+              overflow: 'auto',
+              boxShadow: '0 24px 80px rgba(0, 0, 0, .28)',
+            }}
+          >
+            <div className="mb-4" style={{ paddingRight: 430 }}>
+              <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+                <input
+                  value={activeProvider.name}
+                  onChange={e => updateDraftProvider('name', e.target.value)}
+                  style={{ maxWidth: 260, fontWeight: 700 }}
+                />
+                <span className="badge badge-muted">可用模型 {activeProvider.availableModels.length}</span>
+                {activeProvider.isDefault && <span className="badge badge-success">默认</span>}
+                {!activeProvider.enabled && <span className="badge badge-warning">停用</span>}
+              </div>
+            </div>
+
+            <div className="flex gap-2" style={{ position: 'absolute', top: 18, right: 18, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+              <button className="btn btn-sm" onClick={() => updateDraftProvider('enabled', !activeProvider.enabled)}>
+                {activeProvider.enabled ? '停用' : '启用'}
+              </button>
+              <button className="btn btn-sm" onClick={() => updateDraftProvider('isDefault', true)} disabled={activeProvider.isDefault}>设为默认</button>
+              <button className="btn btn-sm btn-danger" onClick={() => removeProvider(activeProvider.id)} disabled={providers.length <= 1}>删除</button>
+              <button className="btn btn-sm btn-primary" onClick={saveDraftProvider}>保存</button>
+              <button className="btn btn-sm" onClick={() => setDraftProvider(null)}>关闭</button>
+            </div>
+
+            <div className="grid-2">
+              <div className="form-group">
+                <label>ANTHROPIC_BASE_URL</label>
+                <input
+                  value={activeProvider.ANTHROPIC_BASE_URL}
+                  onChange={e => updateDraftProvider('ANTHROPIC_BASE_URL', e.target.value)}
+                  placeholder="https://api.example.com/anthropic"
+                  style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}
+                />
+              </div>
+              <div className="form-group">
+                <label>ANTHROPIC_AUTH_TOKEN</label>
+                <input
+                  type="password"
+                  value={activeProvider.ANTHROPIC_AUTH_TOKEN}
+                  onChange={e => updateDraftProvider('ANTHROPIC_AUTH_TOKEN', e.target.value)}
+                  placeholder="sk-..."
+                  style={{ fontFamily: 'var(--font-mono)' }}
+                />
+              </div>
+              <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                <label>可用模型</label>
+                <textarea
+                  value={activeProvider.availableModels.join('\n')}
+                  onChange={e => updateDraftProvider('availableModels', splitAvailableModels(e.target.value))}
+                  rows={4}
+                  placeholder={'每行一个精确模型 ID\ndeepseek-v4-flash\nclaude-sonnet-4-6'}
+                  style={{ fontFamily: 'var(--font-mono)', resize: 'vertical' }}
+                />
+                <div style={{ color: 'var(--ink-muted)', fontSize: '.72em', marginTop: 5 }}>
+                  不支持通配符；Agent 模板只能选择这里列出的精确模型。
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -137,7 +373,20 @@ function TenantInfo() {
 
 function UserManager() {
   const [users, setUsers] = useState<any[]>([]);
+  const [newUser, setNewUser] = useState({ name: '', email: '', password: '', role: 'member' });
+  const [createError, setCreateError] = useState('');
   useEffect(() => { fetch('/api/users', { headers: getAuthHeaders() }).then(r => r.json()).then(setUsers); }, []);
+  const create = async () => {
+    setCreateError('');
+    const r = await fetch('/api/users', { method: 'POST', headers: jsonAuthHeaders(), body: JSON.stringify(newUser) });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      setCreateError(body.error || '创建用户失败');
+      return;
+    }
+    setUsers([...users, body]);
+    setNewUser({ name: '', email: '', password: '', role: 'member' });
+  };
   const changeRole = async (email: string, role: string) => {
     await fetch(`/api/users/${encodeURIComponent(email)}`, { method: 'PATCH', headers: jsonAuthHeaders(), body: JSON.stringify({ role }) });
     setUsers(users.map((u: any) => u.email === email ? { ...u, role } : u));
@@ -150,6 +399,33 @@ function UserManager() {
   return (
     <div className="card">
       <div className="card-header">用户管理 ({users.length})</div>
+      <div className="grid-4 mb-3">
+        <input
+          value={newUser.name}
+          onChange={e => setNewUser({ ...newUser, name: e.target.value })}
+          placeholder="名称"
+        />
+        <input
+          value={newUser.email}
+          onChange={e => setNewUser({ ...newUser, email: e.target.value })}
+          placeholder="邮箱"
+        />
+        <input
+          type="password"
+          value={newUser.password}
+          onChange={e => setNewUser({ ...newUser, password: e.target.value })}
+          placeholder="初始密码"
+        />
+        <div className="flex gap-2">
+          <select value={newUser.role} onChange={e => setNewUser({ ...newUser, role: e.target.value })}>
+            <option value="member">成员</option>
+            <option value="team_admin">团队管理</option>
+            <option value="tenant_admin">管理员</option>
+          </select>
+          <button className="btn btn-primary" onClick={create}>创建</button>
+        </div>
+      </div>
+      {createError && <div style={{ color: 'var(--danger)', fontSize: '.82em', marginBottom: 10 }}>{createError}</div>}
       <div className="table-wrap">
         <table>
           <thead><tr><th>邮箱</th><th>名称</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>

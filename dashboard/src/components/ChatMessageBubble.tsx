@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { marked } from 'marked';
-import type { ChatMessage, ChatImageAttachment } from '../simulator/types';
+import type { ChatAttachment, ChatMessage, ChatImageAttachment } from '../simulator/types';
 
 // Configure marked for safe rendering
 marked.setOptions({ gfm: true, breaks: true });
@@ -20,6 +20,36 @@ function ImageGrid({ attachments }: { attachments: ChatImageAttachment[] }) {
           style={{ maxWidth: 200, maxHeight: 200, borderRadius: 6, objectFit: 'cover', border: '1px solid var(--border)' }}
         />
       ))}
+    </div>
+  );
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function AttachmentGrid({ attachments }: { attachments: ChatAttachment[] }) {
+  const images = attachments.filter((item): item is ChatImageAttachment => item.type === 'image');
+  const files = attachments.filter((item) => item.type === 'file');
+  return (
+    <div style={{ display: 'grid', gap: 6, marginBottom: 6 }}>
+      {images.length > 0 && <ImageGrid attachments={images} />}
+      {files.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          {files.map(file => (
+            <span
+              key={file.id}
+              className="badge badge-info"
+              title={`${file.name} · ${formatBytes(file.size)}`}
+              style={{ maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+            >
+              {file.name} · {formatBytes(file.size)}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -78,7 +108,7 @@ export default function ChatMessageBubble({ message }: Props) {
       }}
     >
       {message.attachments && message.attachments.length > 0 && (
-        <ImageGrid attachments={message.attachments} />
+        <AttachmentGrid attachments={message.attachments} />
       )}
 
       {message.thinking && (

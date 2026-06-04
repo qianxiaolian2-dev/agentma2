@@ -1,31 +1,35 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import type { SDKMessage, ProviderConfig } from '../simulator/types';
-import { getDefaultProviderConfig } from '../simulator/mock-data';
 import StreamDisplay from '../components/common/StreamDisplay';
 import JsonViewer from '../components/common/JsonViewer';
 import { getAuthHeaders } from '../utils/client-runtime';
 import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
 import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../components/AskUserQuestionPrompt';
-
-function loadProvider(): ProviderConfig {
-  try {
-    const raw = localStorage.getItem('agentma_provider_config');
-    if (raw) return { ...getDefaultProviderConfig(), ...JSON.parse(raw) };
-  } catch {}
-  return getDefaultProviderConfig();
-}
+import { listProviderModels, loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
 
 export default function Playground() {
   const [prompt, setPrompt] = useState('');
   const [messages, setMessages] = useState<SDKMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [provider] = useState<ProviderConfig>(loadProvider);
+  const modelOptions = listProviderModels();
+  const [model, setModel] = useState(() => modelOptions[0] || '');
+  const provider: ProviderConfig = resolveProviderForModel(model).provider;
   const [showOptions, setShowOptions] = useState(false);
   const [resultSummary, setResultSummary] = useState<Record<string, unknown> | null>(null);
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const abortRef = useRef<AbortController | null>(null);
+  const modelOptionsKey = modelOptions.join('\n');
+
+  useEffect(() => {
+    const options = modelOptionsKey ? modelOptionsKey.split('\n') : [];
+    if (!model && options.length) {
+      setModel(options[0]);
+    } else if (model && options.length && !options.includes(model)) {
+      setModel(options[0]);
+    }
+  }, [model, modelOptionsKey]);
 
   // 检测后端状态
   useEffect(() => {
@@ -57,12 +61,14 @@ export default function Playground() {
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           prompt,
+          model,
           template: {
             tools: ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'AskUserQuestion'],
-            model: provider.ANTHROPIC_MODEL,
+            model,
             maxTurns: 20,
           },
           provider,
+          providerProfiles: loadProviderProfiles(),
         }),
         signal: controller.signal,
       });
@@ -111,7 +117,7 @@ export default function Playground() {
                   type: 'assistant',
                   subtype: isThinking ? 'thinking' : 'text',
                   uuid: `msg-${Date.now()}`,
-                  model: provider.ANTHROPIC_MODEL,
+                  model,
                   result: data.text || '',
                 }];
               });
@@ -162,7 +168,7 @@ export default function Playground() {
     }
     setIsStreaming(false);
     abortRef.current = null;
-  }, [prompt, provider, isStreaming]);
+  }, [prompt, provider, model, isStreaming]);
 
   // interrupt()
   const handleInterrupt = useCallback(() => {
@@ -171,6 +177,7 @@ export default function Playground() {
   }, []);
 
   const needsKey = !provider.ANTHROPIC_AUTH_TOKEN;
+  const needsModel = !model || !modelOptions.includes(model);
 
   return (
     <div>
@@ -185,7 +192,17 @@ export default function Playground() {
           <div className="flex gap-3" style={{ alignItems: 'center' }}>
             <span>⚠️</span>
             <span style={{ fontSize: '.84em' }}>
-              尚未配置 API Key，请先到 <a href="/settings" style={{ color: 'var(--accent)' }}>Settings → 供应商配置</a> 填写 ANTHROPIC_AUTH_TOKEN
+              尚未配置 API Key，请先到 <a href="/account" style={{ color: 'var(--accent)' }}>账户管理 → 供应商</a> 填写 ANTHROPIC_AUTH_TOKEN
+            </span>
+          </div>
+        </div>
+      )}
+
+      {!needsKey && needsModel && (
+        <div className="card mb-4" style={{ background: 'var(--warning-bg)', borderColor: 'var(--warning)' }}>
+          <div className="flex gap-3" style={{ alignItems: 'center' }}>
+            <span style={{ fontSize: '.84em' }}>
+              尚未配置可用模型，请先到 <a href="/account" style={{ color: 'var(--accent)' }}>账户管理 → 供应商</a> 添加可用模型
             </span>
           </div>
         </div>
@@ -196,7 +213,7 @@ export default function Playground() {
           <div className="flex gap-3" style={{ alignItems: 'center' }}>
             <span style={{ fontSize: '.84em' }}>
               后端 {serverStatus === 'checking' ? '检测中...' : serverStatus === 'online' ? '✓ 在线' : '✗ 离线'}
-              {serverStatus === 'online' && ` — 模型: ${provider.ANTHROPIC_MODEL}`}
+              {serverStatus === 'online' && model && ` — 模型: ${model}`}
               {serverStatus === 'offline' && ' — 请运行 npm run server 启动后端'}
             </span>
           </div>
@@ -225,11 +242,18 @@ export default function Playground() {
             disabled={needsKey}
           />
         </div>
+        <div className="form-group">
+          <label>模型</label>
+          <select value={model} onChange={e => setModel(e.target.value)} disabled={!modelOptions.length || isStreaming}>
+            {modelOptions.length === 0 && <option value="">未配置可用模型</option>}
+            {modelOptions.map(option => <option key={option} value={option}>{option}</option>)}
+          </select>
+        </div>
         <div className="flex gap-3" style={{ alignItems: 'center' }}>
           <button
             className="btn btn-primary"
             onClick={handleQuery}
-            disabled={isStreaming || !prompt.trim() || needsKey || serverStatus !== 'online'}
+            disabled={isStreaming || !prompt.trim() || needsKey || needsModel || serverStatus !== 'online'}
           >
             {isStreaming ? 'Streaming...' : '发送 query()'}
           </button>
@@ -251,8 +275,8 @@ export default function Playground() {
           <div className="grid-3">
             <div className="form-group">
               <label>model</label>
-              <input value={provider.ANTHROPIC_MODEL} disabled style={{ fontFamily: 'var(--font-mono)' }} />
-              <div style={{ fontSize: '.7em', color: 'var(--ink-muted)', marginTop: 2 }}>由供应商配置决定</div>
+              <input value={model} disabled style={{ fontFamily: 'var(--font-mono)' }} />
+              <div style={{ fontSize: '.7em', color: 'var(--ink-muted)', marginTop: 2 }}>从供应商可用模型中选择</div>
             </div>
             <div className="form-group">
               <label>base_url</label>

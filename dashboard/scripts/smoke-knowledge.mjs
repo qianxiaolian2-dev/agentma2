@@ -3,6 +3,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { strToU8, zipSync } from 'fflate';
 
 let baseUrl = process.env.AGENTMA_SMOKE_BASE_URL || 'http://127.0.0.1:3001';
 const envFile = process.env.AGENTMA_SMOKE_ENV || path.resolve(process.cwd(), '../spike-sdk/.env');
@@ -42,6 +43,45 @@ async function requireOk(label, request) {
     throw new Error(`${label} failed ${result.response.status}: ${JSON.stringify(result.body)}`);
   }
   return result.body;
+}
+
+function xmlEscape(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function excelColumnName(index) {
+  let n = index + 1;
+  let name = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    name = String.fromCharCode(65 + rem) + name;
+    n = Math.floor((n - 1) / 26);
+  }
+  return name;
+}
+
+function makeWorkbookBuffer(rows) {
+  const sheetRows = rows.map((row, rowIndex) => {
+    const rowNumber = rowIndex + 1;
+    const cells = row.map((cell, columnIndex) => {
+      const ref = `${excelColumnName(columnIndex)}${rowNumber}`;
+      if (typeof cell === 'number') return `<c r="${ref}"><v>${cell}</v></c>`;
+      return `<c r="${ref}" t="inlineStr"><is><t>${xmlEscape(cell)}</t></is></c>`;
+    }).join('');
+    return `<row r="${rowNumber}">${cells}</row>`;
+  }).join('');
+  const files = {
+    '[Content_Types].xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'),
+    '_rels/.rels': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'),
+    'xl/workbook.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'),
+    'xl/_rels/workbook.xml.rels': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'),
+    'xl/worksheets/sheet1.xml': strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sheetRows}</sheetData></worksheet>`),
+  };
+  return Buffer.from(zipSync(files, { level: 0 }));
 }
 
 function delay(ms) {
@@ -272,6 +312,31 @@ async function main() {
       body: JSON.stringify([{ name: 'smoke', path: vaultPath, enabled: true }]),
     }));
 
+    const uploadForm = new FormData();
+    uploadForm.set('name', 'upload-smoke');
+    uploadForm.append('files', new Blob([`metric,value\nsecret,${secret}\n`], { type: 'text/csv' }), 'facts.csv');
+    uploadForm.append('relativePaths', 'facts.csv');
+    uploadForm.append('files', new Blob([
+      makeWorkbookBuffer([
+        ['metric', 'value'],
+        ['excel-secret', secret],
+      ]),
+    ], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'facts.xlsx');
+    uploadForm.append('relativePaths', 'sheets/facts.xlsx');
+    const uploadedSources = await requireOk('upload sources', fetchJson(`${baseUrl}/api/knowledge/sources/upload`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: uploadForm,
+    }));
+    const uploadedSource = Array.isArray(uploadedSources) ? uploadedSources.find((source) => source?.name === 'upload-smoke') : null;
+    const uploadedTestResult = uploadedSource
+      ? await requireOk('test uploaded source', fetchJson(`${baseUrl}/api/knowledge/sources/test`, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ path: uploadedSource.path }),
+      }))
+      : { ok: false };
+
     const env = readEnvFile(envFile);
     const apiKey = env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN;
     let stream = { resultSubtype: 'skipped', sawGrep: false, sawRead: false, text: '' };
@@ -307,14 +372,20 @@ async function main() {
       scanFindsVault: Array.isArray(scanResult.candidates) && scanResult.candidates.some((candidate) => candidate.path === expectedVaultPath),
       sourcesSaved: Array.isArray(savedSources) && savedSources.length === 1 && savedSources[0]?.enabled === true,
       testReturnsOk: testResult.ok === true && Number(testResult.fileCount || 0) >= 2,
+      uploadRegistered: Boolean(uploadedSource?.path),
+      uploadCsvWritten: Boolean(uploadedSource?.path && fs.existsSync(path.join(uploadedSource.path, 'facts.csv'))),
+      uploadExcelSidecarWritten: Boolean(uploadedSource?.path && fs.existsSync(path.join(uploadedSource.path, 'sheets', 'facts.xlsx.md'))),
+      uploadedSourceReadable: uploadedTestResult.ok === true && Number(uploadedTestResult.fileCount || 0) >= 3,
       agentCalledGrep: !apiKey || stream.sawGrep,
       agentCalledRead: !apiKey || stream.sawRead,
       agentAnswerHasSecret: !apiKey || stream.text.includes('42'),
     };
 
     console.log(`source ${JSON.stringify(savedSources[0] || {})}`);
+    console.log(`uploaded ${JSON.stringify(uploadedSource || {})}`);
     console.log(`scan ${JSON.stringify(scanResult)}`);
     console.log(`test ${JSON.stringify(testResult)}`);
+    console.log(`upload test ${JSON.stringify(uploadedTestResult)}`);
     console.log(`stream ${JSON.stringify({ resultSubtype: stream.resultSubtype, sawGrep: stream.sawGrep, sawRead: stream.sawRead, text: stream.text.slice(0, 500) })}`);
     console.log(`checks ${JSON.stringify(checks)}`);
 

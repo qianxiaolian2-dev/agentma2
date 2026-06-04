@@ -8,28 +8,23 @@ const SECTIONS = [
   {
     title: '核心',
     items: [
-      { path: '/', label: '总览', icon: 'overview' },
       { path: '/conversations', label: '会话', icon: 'chat' },
       { path: '/agents', label: 'Agent 市场', icon: 'market' },
-      { path: '/playground', label: 'Playground', icon: 'play' },
-      { path: '/account', label: '账户管理', icon: 'user' },
-      { path: '/settings', label: '全局设置', icon: 'gear' },
-    ],
-  },
-  {
-    title: '接口',
-    items: [
-      { path: '/tools', label: '工具背包', icon: 'tools' },
       { path: '/knowledge', label: '知识库', icon: 'book' },
       { path: '/skills', label: '技能背包', icon: 'spark' },
-      { path: '/hooks', label: 'Hook 系统', icon: 'hook' },
-      { path: '/subagents', label: '子代理管理', icon: 'agents' },
-      { path: '/permissions', label: '权限系统', icon: 'shield' },
+      { path: '/account', label: '账户管理', icon: 'user' },
     ],
   },
   {
     title: '运维',
     items: [
+      { path: '/', label: '总览', icon: 'overview' },
+      { path: '/playground', label: 'Playground', icon: 'play' },
+      { path: '/settings', label: '全局设置', icon: 'gear' },
+      { path: '/tools', label: '工具背包', icon: 'tools' },
+      { path: '/hooks', label: 'Hook 系统', icon: 'hook' },
+      { path: '/subagents', label: '子代理管理', icon: 'agents' },
+      { path: '/permissions', label: '权限系统', icon: 'shield' },
       { path: '/observability', label: '可观测性', icon: 'chart' },
     ],
   },

@@ -37,13 +37,7 @@ const API_ENV_VARS = [
 const PROVIDER_ENV_VARS = [
   { key: 'ANTHROPIC_AUTH_TOKEN', value: '<请填写>', description: 'API 认证 Token' },
   { key: 'ANTHROPIC_BASE_URL', value: 'https://api.deepseek.com/anthropic', description: 'Anthropic 兼容 API 端点' },
-  { key: 'ANTHROPIC_MODEL', value: 'deepseek-v4-pro[1m]', description: '默认模型' },
-  { key: 'ANTHROPIC_DEFAULT_OPUS_MODEL', value: 'deepseek-v4-pro[1m]', description: 'Opus 级模型映射' },
-  { key: 'ANTHROPIC_DEFAULT_SONNET_MODEL', value: 'deepseek-v4-pro[1m]', description: 'Sonnet 级模型映射' },
-  { key: 'ANTHROPIC_DEFAULT_HAIKU_MODEL', value: 'deepseek-v4-flash', description: 'Haiku 级模型映射' },
-  { key: 'ANTHROPIC_REASONING_MODEL', value: 'deepseek-v4-pro[1m]', description: '推理模型' },
-  { key: 'CLAUDE_CODE_EFFORT_LEVEL', value: 'max', description: '效能等级 (low/medium/high/xhigh/max)' },
-  { key: 'CLAUDE_CODE_SUBAGENT_MODEL', value: 'deepseek-v4-flash', description: '子代理默认模型' },
+  { key: 'ANTHROPIC_MODEL', value: '<本次运行模型>', description: '由 Agent 模板或 Playground 选择的可用模型决定' },
 ];
 
 type StreamEv = {

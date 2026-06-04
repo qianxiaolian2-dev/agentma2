@@ -706,11 +706,9 @@
     <div class="cfg-main wide">
       <div class="cfg-group">
         <div class="cfg-group-head"><span class="hand" style="font-size:24px;color:var(--ink)">供应商配置</span><span class="divider" style="flex:1"></span></div>
-        <div class="row" style="gap:14px;align-items:flex-start">
-          <label class="field" style="flex:1"><span class="field-label">ANTHROPIC_BASE_URL</span><input class="input mono" id="set-base-url" value="${esc(provider.ANTHROPIC_BASE_URL || '')}" /></label>
-          <label class="field" style="flex:1"><span class="field-label">ANTHROPIC_MODEL</span><input class="input mono" id="set-model" value="${esc(provider.ANTHROPIC_MODEL || '')}" /></label>
-        </div>
+        <label class="field"><span class="field-label">ANTHROPIC_BASE_URL</span><input class="input mono" id="set-base-url" value="${esc(provider.ANTHROPIC_BASE_URL || '')}" /></label>
         <label class="field"><span class="field-label">ANTHROPIC_AUTH_TOKEN</span><input class="input mono" id="set-token" type="password" value="${esc(provider.ANTHROPIC_AUTH_TOKEN || '')}" /></label>
+        <p class="muted" style="font-size:13px;margin:0 0 12px">模型由 Agent 模板选择，不在供应商配置里设置默认模型。</p>
         <div class="row" style="gap:10px">
           <button class="btn btn-primary btn-squiggle" id="set-save">${icon('check')} 保存配置</button>
           <span class="muted" id="set-status" style="font-size:13px"></span>
@@ -722,7 +720,6 @@
     document.getElementById('set-save')?.addEventListener('click', () => {
       window.AgentMaApi.saveProvider({
         ANTHROPIC_BASE_URL: document.getElementById('set-base-url').value.trim(),
-        ANTHROPIC_MODEL: document.getElementById('set-model').value.trim(),
         ANTHROPIC_AUTH_TOKEN: document.getElementById('set-token').value.trim(),
       });
       document.getElementById('set-status').textContent = '已保存';

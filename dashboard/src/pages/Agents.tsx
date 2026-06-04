@@ -5,12 +5,39 @@ import { EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, initCustomTools } from
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
 import { getAuthHeaders } from '../utils/client-runtime';
+import { listProviderModels, resolveProviderForModel } from '../utils/providers';
 
 type KnowledgeSource = {
   id: string;
   name: string;
   path: string;
   enabled: boolean;
+};
+
+type ClaudeMdPreviewFile = {
+  source: 'user' | 'project' | 'local';
+  label: string;
+  path: string;
+  exists: boolean;
+  bytes?: number;
+  mtimeMs?: number;
+  content?: string;
+  error?: string;
+};
+
+type ClaudeMdPreview = {
+  agentId: string;
+  agentName: string;
+  cwd: string;
+  cwdExists: boolean;
+  cwdSource: 'latest_session' | 'new_session';
+  latestSession: { id: string; title: string; updatedAt: number } | null;
+  settingSources: Array<'user' | 'project' | 'local'>;
+  files: ClaudeMdPreviewFile[];
+  loadedFiles: string[];
+  effectiveContent: string;
+  generatedAt: number;
+  notes: string[];
 };
 
 function loadSkills(): SkillInfo[] {
@@ -30,7 +57,7 @@ function normalizeKnowledgeSources(value: unknown): KnowledgeSource[] {
     const raw = item as Record<string, unknown>;
     const id = typeof raw.id === 'string' ? raw.id : '';
     const path = typeof raw.path === 'string' ? raw.path : '';
-    if (!id || !path) return [];
+    if (!id || !path || Number(raw.archivedAt) || Number(raw.deletedAt)) return [];
     return [{
       id,
       name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : path.split('/').filter(Boolean).pop() || '知识库',
@@ -43,10 +70,9 @@ function normalizeKnowledgeSources(value: unknown): KnowledgeSource[] {
 function newTemplate(): AgentTemplate {
   return {
     id: '', name: '', description: '', systemPrompt: '',
-    model: 'deepseek-v4-pro[1m]', tools: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'],
+    model: '', tools: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'],
     mcpServers: [], eventSources: [], skills: [], knowledgeSourceIds: [],
     effort: 'high', maxTurns: 50, permissionMode: 'default',
-    providerOverrides: {},
     createdAt: Date.now(), updatedAt: Date.now(),
   };
 }
@@ -72,20 +98,157 @@ const TOOL_CATEGORIES = [
 ];
 const KNOWLEDGE_TOOLS = ['Read', 'Grep', 'Glob'];
 
+type ModelPickerProps = {
+  value: string;
+  models: string[];
+  onChange: (value: string) => void;
+  allowEmpty?: boolean;
+  placeholder?: string;
+};
+
+function ModelPicker({ value, models, onChange, allowEmpty = false, placeholder = '选择模型' }: ModelPickerProps) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredModels = models.filter(model => model.toLowerCase().includes(normalizedQuery));
+  const displayValue = open ? query : value;
+  const disabled = models.length === 0 && !allowEmpty;
+
+  const choose = (model: string) => {
+    onChange(model);
+    setQuery('');
+    setOpen(false);
+  };
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <input
+        value={displayValue}
+        onFocus={() => {
+          setOpen(true);
+          setQuery('');
+        }}
+        onChange={event => {
+          setQuery(event.target.value);
+          setOpen(true);
+        }}
+        onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+        onKeyDown={event => {
+          if (event.key === 'Enter' && open) {
+            event.preventDefault();
+            const first = filteredModels[0] || (allowEmpty && !query.trim() ? '' : undefined);
+            if (first !== undefined) choose(first);
+          }
+          if (event.key === 'Escape') setOpen(false);
+        }}
+        placeholder={models.length ? placeholder : '先到账户管理配置可用模型'}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        disabled={disabled}
+        style={{ fontFamily: 'var(--font-mono)', paddingRight: 34 }}
+      />
+      <button
+        type="button"
+        className="btn btn-sm"
+        onMouseDown={event => event.preventDefault()}
+        onClick={() => {
+          if (!disabled) {
+            setOpen(current => !current);
+            setQuery('');
+          }
+        }}
+        disabled={disabled}
+        aria-label="展开模型列表"
+        style={{ position: 'absolute', right: 5, top: 5, width: 26, height: 26, padding: 0 }}
+      >
+        ▾
+      </button>
+      {open && !disabled && (
+        <div
+          role="listbox"
+          style={{
+            position: 'absolute',
+            zIndex: 120,
+            top: 'calc(100% + 4px)',
+            left: 0,
+            right: 0,
+            maxHeight: 220,
+            overflowY: 'auto',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            background: 'var(--bg-card)',
+            boxShadow: '0 12px 32px rgba(0, 0, 0, .18)',
+          }}
+        >
+          {allowEmpty && !normalizedQuery && (
+            <button
+              type="button"
+              role="option"
+              className="btn btn-sm"
+              onMouseDown={event => event.preventDefault()}
+              onClick={() => choose('')}
+              style={{ width: '100%', justifyContent: 'flex-start', border: 0, borderRadius: 0 }}
+            >
+              继承主模型
+            </button>
+          )}
+          {filteredModels.map(model => (
+            <button
+              type="button"
+              role="option"
+              aria-selected={model === value}
+              key={model}
+              className="btn btn-sm"
+              onMouseDown={event => event.preventDefault()}
+              onClick={() => choose(model)}
+              style={{
+                width: '100%',
+                justifyContent: 'flex-start',
+                border: 0,
+                borderRadius: 0,
+                fontFamily: 'var(--font-mono)',
+                background: model === value ? 'var(--accent-bg)' : 'transparent',
+              }}
+            >
+              {model}
+            </button>
+          ))}
+          {filteredModels.length === 0 && (
+            <div style={{ padding: '8px 10px', color: 'var(--ink-muted)', fontSize: '.78em' }}>
+              没有匹配的可用模型
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Agents() {
   const navigate = useNavigate();
   const { user } = useAuth();
   const [templates, setTemplates] = useState<AgentTemplate[]>([]);
   const [form, setForm] = useState<AgentTemplate>(newTemplate());
   const [isEditing, setIsEditing] = useState(false);
+  const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
+  const [previewAgent, setPreviewAgent] = useState<AgentTemplate | null>(null);
+  const [claudeMdPreview, setClaudeMdPreview] = useState<ClaudeMdPreview | null>(null);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState('');
   // 动态加载技能和 MCP 服务器（非写死）
   const [liveSkills] = useState<SkillInfo[]>(loadSkills);
   const [liveMcp] = useState<{ name: string }[]>(loadMcpServers);
   const [liveKnowledgeSources, setLiveKnowledgeSources] = useState<KnowledgeSource[]>([]);
   const [liveEventSources, setLiveEventSources] = useState<Array<{ name: string; type: string; url: string; enabled: boolean }>>([]);
+  const modelSuggestions = listProviderModels();
+  const availableModelSet = new Set(modelSuggestions);
+  const selectedModel = form.model.trim();
+  const selectedModelAvailable = selectedModel ? availableModelSet.has(selectedModel) : false;
+  const providerMatch = selectedModelAvailable ? resolveProviderForModel(selectedModel) : null;
 
   useEffect(() => {
     fetch('/api/events/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'list' }) })
@@ -101,6 +264,24 @@ export default function Agents() {
   }, [user?.tenantId]);
   const [liveCustomTools, setLiveCustomTools] = useState<RegisteredTool[]>(() => initCustomTools());
   const subagentEntries = Object.entries(form.subagents || {});
+
+  useEffect(() => {
+    if (!isEditorOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsEditorOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isEditorOpen]);
+
+  useEffect(() => {
+    if (!isPreviewOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsPreviewOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isPreviewOpen]);
 
   // 每次页面可见时刷新自定义工具
   useEffect(() => {
@@ -171,15 +352,40 @@ export default function Agents() {
       useKnowledge: selectedKnowledgeIds.length > 0 || t.useKnowledge || undefined,
     });
     setIsEditing(true);
+    setIsEditorOpen(true);
   };
 
   const handleNew = () => {
     setForm(newTemplate());
     setIsEditing(false);
+    setIsEditorOpen(true);
   };
 
   const handleSave = async () => {
     if (!form.name.trim() || !user?.tenantId) return;
+    if (!modelSuggestions.length) {
+      setError('请先到账户管理 -> 供应商配置至少一个可用模型');
+      return;
+    }
+    if (!selectedModel || !availableModelSet.has(selectedModel)) {
+      setError('请选择供应商中已配置的可用模型');
+      return;
+    }
+    const invalidSubagent = Object.entries(form.subagents || {}).find(([, agent]) => (
+      agent.model && !availableModelSet.has(agent.model)
+    ));
+    if (invalidSubagent) {
+      setError(`子代理 ${invalidSubagent[0]} 的模型不在供应商可用模型中`);
+      return;
+    }
+    const selectedProviderId = providerMatch?.profile.id || resolveProviderForModel(selectedModel).profile.id;
+    const crossProviderSubagent = Object.entries(form.subagents || {}).find(([, agent]) => (
+      agent.model && resolveProviderForModel(agent.model).profile.id !== selectedProviderId
+    ));
+    if (crossProviderSubagent) {
+      setError(`子代理 ${crossProviderSubagent[0]} 的模型属于另一个供应商；同一次 SDK 运行只能使用一个供应商`);
+      return;
+    }
     const now = Date.now();
     const selectedKnowledgeIds = (form.knowledgeSourceIds || []).filter(Boolean);
     const selectedSkills = form.skills || [];
@@ -191,8 +397,10 @@ export default function Agents() {
       ...form,
       id: form.id || `agent-${now}`,
       name: form.name.trim(),
+      model: selectedModel,
       knowledgeSourceIds: selectedKnowledgeIds,
       useKnowledge: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge || undefined,
+      providerOverrides: undefined,
       tools: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge
         ? Array.from(new Set([...effectiveTools, ...KNOWLEDGE_TOOLS]))
         : effectiveTools,
@@ -225,7 +433,11 @@ export default function Agents() {
       const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
       setTemplates(persisted);
       setError('');
-      if (form.id === id) { setForm(newTemplate()); setIsEditing(false); }
+      if (form.id === id) {
+        setForm(newTemplate());
+        setIsEditing(false);
+        setIsEditorOpen(false);
+      }
     } catch (saveError) {
       setError((saveError as Error).message || '删除 Agent 失败');
     } finally {
@@ -322,8 +534,40 @@ export default function Agents() {
     }));
   };
 
-  const startChat = () => {
-    navigate('/conversations');
+  const openClaudeMdPreview = async (agent: AgentTemplate) => {
+    setPreviewAgent(agent);
+    setClaudeMdPreview(null);
+    setPreviewError('');
+    setIsPreviewOpen(true);
+    setIsPreviewLoading(true);
+    try {
+      const response = await fetch(`/api/agents/${encodeURIComponent(agent.id)}/claude-md`, {
+        headers: getAuthHeaders(),
+      });
+      const text = await response.text();
+      const data = text ? JSON.parse(text) : null;
+      if (!response.ok) {
+        const message = data && typeof data === 'object' && 'error' in data
+          ? String((data as { error?: unknown }).error || '读取 CLAUDE.md 失败')
+          : `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+      setClaudeMdPreview(data as ClaudeMdPreview);
+    } catch (previewLoadError) {
+      setPreviewError((previewLoadError as Error).message || '读取 CLAUDE.md 失败');
+    } finally {
+      setIsPreviewLoading(false);
+    }
+  };
+
+  const startChat = (agentId: string) => {
+    navigate(`/conversations?agent=${encodeURIComponent(agentId)}`);
+  };
+
+  const formatBytes = (bytes?: number) => {
+    if (!Number.isFinite(bytes)) return '';
+    if ((bytes || 0) < 1024) return `${bytes} B`;
+    return `${Math.round((bytes || 0) / 1024)} KB`;
   };
 
   return (
@@ -339,10 +583,10 @@ export default function Agents() {
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: 20 }}>
+      <div className="agents-page-shell">
         {/* 模板列表 */}
-        <div>
-          <button className="btn btn-primary mb-4" onClick={handleNew} style={{ width: '100%' }} disabled={isSaving}>
+        <div className="agents-list-panel">
+          <button className="btn btn-primary mb-4" onClick={handleNew} style={{ width: 'min(360px, 100%)' }} disabled={isSaving}>
             + 新建 Agent
           </button>
 
@@ -355,18 +599,44 @@ export default function Agents() {
               暂无 Agent，点击上方按钮创建
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div className="agents-list-grid">
               {templates.map(t => (
                 <div
                   key={t.id}
                   className={`agent-card ${form.id === t.id ? 'selected' : ''}`}
                   onClick={() => handleSelect(t)}
                 >
-                  <div className="flex-between">
+                  <div className="agent-card-head">
                     <div className="agent-card-name">{t.name}</div>
-                    <span style={{ fontSize: '.7em', color: 'var(--ink-muted)' }}>
-                      {new Date(t.updatedAt).toLocaleDateString()}
-                    </span>
+                    <div className="agent-card-actions">
+                      <span className="agent-card-date">
+                        {new Date(t.updatedAt).toLocaleDateString()}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn btn-sm agent-card-preview-btn"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void openClaudeMdPreview(t);
+                        }}
+                        disabled={isSaving || !t.id}
+                        title={`预览 ${t.name} 运行时生效的 CLAUDE.md`}
+                      >
+                        CLAUDE.md
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-primary agent-card-chat-btn"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          startChat(t.id);
+                        }}
+                        disabled={isSaving || !t.id}
+                        title={`和 ${t.name} 开始对话`}
+                      >
+                        开始对话
+                      </button>
+                    </div>
                   </div>
                   <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
                   <div className="agent-card-tags">
@@ -384,23 +654,125 @@ export default function Agents() {
             </div>
           )}
         </div>
+      </div>
 
-        {/* 编辑表单 */}
-        <div>
-          <div className="card">
-            <div className="flex-between mb-4">
+      {isPreviewOpen && (
+        <div className="agents-preview-backdrop" onClick={() => setIsPreviewOpen(false)}>
+          <section
+            className="agents-preview-panel card"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`预览 ${previewAgent?.name || 'Agent'} 的 CLAUDE.md`}
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex-between agents-preview-head">
+              <div>
+                <div className="card-header" style={{ marginBottom: 2 }}>
+                  {previewAgent?.name || claudeMdPreview?.agentName || 'Agent'} · CLAUDE.md
+                </div>
+                <div className="agents-preview-subtitle">
+                  真实运行时文件系统说明预览
+                </div>
+              </div>
+              <button type="button" className="btn btn-sm btn-ghost" onClick={() => setIsPreviewOpen(false)}>
+                关闭
+              </button>
+            </div>
+
+            {isPreviewLoading ? (
+              <div className="agents-preview-empty">读取运行时 CLAUDE.md...</div>
+            ) : previewError ? (
+              <div className="agents-preview-error">{previewError}</div>
+            ) : claudeMdPreview && (
+              <div className="agents-preview-body">
+                <div className="agents-preview-meta">
+                  <div>
+                    <span className="agents-preview-meta-label">cwd</span>
+                    <code>{claudeMdPreview.cwd}</code>
+                  </div>
+                  <div>
+                    <span className="agents-preview-meta-label">来源</span>
+                    <span>
+                      {claudeMdPreview.cwdSource === 'latest_session' ? '最近运行会话' : '新会话默认临时目录'}
+                      {claudeMdPreview.cwdExists ? '' : ' · 当前不存在'}
+                    </span>
+                  </div>
+                  {claudeMdPreview.latestSession && (
+                    <div>
+                      <span className="agents-preview-meta-label">会话</span>
+                      <span>
+                        {claudeMdPreview.latestSession.title} · {new Date(claudeMdPreview.latestSession.updatedAt).toLocaleString()}
+                      </span>
+                    </div>
+                  )}
+                  <div>
+                    <span className="agents-preview-meta-label">settingSources</span>
+                    <span>{claudeMdPreview.settingSources.join(', ')}</span>
+                  </div>
+                </div>
+
+                <div className="agents-preview-files">
+                  {claudeMdPreview.files.map(file => (
+                    <div key={file.path} className={`agents-preview-file ${file.exists ? 'loaded' : 'missing'}`}>
+                      <div className="agents-preview-file-main">
+                        <span className={`badge ${file.exists ? 'badge-success' : 'badge-muted'}`}>
+                          {file.exists ? '已命中' : '缺失'}
+                        </span>
+                        <span className="agents-preview-file-label">{file.label}</span>
+                        {file.bytes !== undefined && <span className="agents-preview-file-size">{formatBytes(file.bytes)}</span>}
+                        {file.error && <span className="badge badge-warning">{file.error}</span>}
+                      </div>
+                      <code>{file.path}</code>
+                    </div>
+                  ))}
+                </div>
+
+                {claudeMdPreview.notes.length > 0 && (
+                  <div className="agents-preview-notes">
+                    {claudeMdPreview.notes.map(note => <div key={note}>{note}</div>)}
+                  </div>
+                )}
+
+                <div>
+                  <div className="agents-preview-section-title">
+                    合并预览 · {claudeMdPreview.loadedFiles.length} 个文件
+                  </div>
+                  {claudeMdPreview.effectiveContent ? (
+                    <pre className="agents-preview-content">{claudeMdPreview.effectiveContent}</pre>
+                  ) : (
+                    <div className="agents-preview-empty">
+                      没有找到会被加载的 CLAUDE.md 文件。
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {isEditorOpen && (
+        <div className="agents-editor-backdrop" onClick={() => setIsEditorOpen(false)}>
+          <aside
+            className="agents-editor-panel card"
+            role="dialog"
+            aria-modal="true"
+            aria-label={isEditing ? `编辑 Agent ${form.name}` : '新建 Agent'}
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex-between mb-4 agents-editor-head">
               <div className="card-header" style={{ marginBottom: 0 }}>
                 {isEditing ? `编辑: ${form.name}` : '新建 Agent'}
               </div>
               <div className="flex gap-2">
                 {isEditing && (
-                  <>
-                    <button className="btn btn-sm btn-primary" onClick={startChat} disabled={isSaving}>💬 开始对话</button>
-                    <button className="btn btn-sm btn-danger" onClick={() => { void handleDelete(form.id); }} disabled={isSaving}>删除</button>
-                  </>
+                  <button className="btn btn-sm btn-danger" onClick={() => { void handleDelete(form.id); }} disabled={isSaving}>删除</button>
                 )}
                 <button className="btn btn-sm btn-primary" onClick={() => { void handleSave(); }} disabled={isSaving}>
-                  {isSaving ? '保存中...' : '收养'}
+                  {isSaving ? '保存中...' : '保存'}
+                </button>
+                <button type="button" className="btn btn-sm btn-ghost" onClick={() => setIsEditorOpen(false)} disabled={isSaving}>
+                  关闭
                 </button>
               </div>
             </div>
@@ -421,7 +793,7 @@ export default function Agents() {
               <textarea
                 value={form.systemPrompt}
                 onChange={e => setForm({ ...form, systemPrompt: e.target.value })}
-                rows={3}
+                rows={8}
                 placeholder="你是一位资深的...&#10;&#10;请遵循以下规则：&#10;1. ..."
                 style={{ resize: 'vertical' }}
               />
@@ -429,20 +801,18 @@ export default function Agents() {
 
             <div className="grid-2">
               <div className="form-group">
-                <label>模型</label>
-                <input
+                <label className="flex gap-2" style={{ alignItems: 'center' }}>
+                  模型
+                  {selectedModelAvailable && providerMatch
+                    ? <span className="badge badge-muted">{providerMatch.profile.name}</span>
+                    : <span className="badge badge-warning">{selectedModel ? '不可用' : '必选'}</span>}
+                </label>
+                <ModelPicker
                   value={form.model}
-                  onChange={e => setForm({ ...form, model: e.target.value })}
-                  placeholder="deepseek-v4-pro[1m]"
-                  list="model-suggestions"
-                  style={{ fontFamily: 'var(--font-mono)' }}
+                  models={modelSuggestions}
+                  onChange={model => setForm({ ...form, model })}
+                  placeholder="输入或选择模型"
                 />
-              </div>
-              <div className="form-group">
-                <label>效能等级</label>
-                <select value={form.effort} onChange={e => setForm({ ...form, effort: e.target.value as EffortLevel })}>
-                  {EFFORT_LEVELS.map(e => <option key={e.value} value={e.value}>{e.label} ({e.value})</option>)}
-                </select>
               </div>
               <div className="form-group">
                 <label>maxTurns</label>
@@ -455,84 +825,6 @@ export default function Agents() {
                 </select>
               </div>
             </div>
-
-            {/* 供应商配置覆盖 (Agent 级别) */}
-            <details className="provider-overrides-panel">
-              <summary className="provider-overrides-summary">
-                ⚡ 供应商配置覆盖 (可选 — 留空则使用全局配置)
-              </summary>
-              <div className="grid-2 provider-overrides-grid">
-                <div className="form-group">
-                  <label>ANTHROPIC_AUTH_TOKEN</label>
-                  <input
-                    type="password"
-                    value={form.providerOverrides?.ANTHROPIC_AUTH_TOKEN || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_AUTH_TOKEN: e.target.value } })}
-                    placeholder="留空使用全局 Key"
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_BASE_URL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_BASE_URL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_BASE_URL: e.target.value } })}
-                    placeholder="留空使用全局端点"
-                    style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_MODEL (覆盖模板 model)</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_MODEL: e.target.value } })}
-                    placeholder={`当前: ${form.model}`}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>CLAUDE_CODE_SUBAGENT_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.CLAUDE_CODE_SUBAGENT_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, CLAUDE_CODE_SUBAGENT_MODEL: e.target.value } })}
-                    placeholder="子代理模型"
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_DEFAULT_OPUS_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_DEFAULT_OPUS_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_DEFAULT_OPUS_MODEL: e.target.value } })}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_DEFAULT_SONNET_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_DEFAULT_SONNET_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_DEFAULT_SONNET_MODEL: e.target.value } })}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_DEFAULT_HAIKU_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_DEFAULT_HAIKU_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_DEFAULT_HAIKU_MODEL: e.target.value } })}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_REASONING_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_REASONING_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_REASONING_MODEL: e.target.value } })}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-              </div>
-            </details>
 
             {/* 结构化输出 */}
             <details>
@@ -577,6 +869,11 @@ export default function Agents() {
                 知识库 (Knowledge) — 已选 {(form.knowledgeSourceIds || []).length} 个 ·{' '}
                 <a href="/knowledge" style={{ color: 'var(--accent)', fontSize: '.85em' }}>管理知识库</a>
               </label>
+              {liveKnowledgeSources.length > 0 && (
+                <div style={{ color: 'var(--ink-muted)', fontSize: '.74em', margin: '2px 0 8px' }}>
+                  🔒 默认只读：仅当你是该知识库的创建人、且在知识库页面关闭了「只读」时，你的 Agent 才能写入；其他成员始终只读。
+                </div>
+              )}
               {liveKnowledgeSources.length === 0 ? (
                 <div style={{ color: 'var(--ink-muted)', fontSize: '.78em', padding: '8px 0' }}>
                   暂无知识库，请先在知识库页面创建。
@@ -719,11 +1016,12 @@ export default function Agents() {
                         </div>
                         <div className="form-group" style={{ marginBottom: 8 }}>
                           <label>模型覆盖</label>
-                          <input
+                          <ModelPicker
                             value={agent.model || ''}
-                            onChange={e => updateSubagent(name, { model: e.target.value || undefined })}
+                            models={modelSuggestions}
+                            onChange={model => updateSubagent(name, { model: model || undefined })}
+                            allowEmpty
                             placeholder="留空继承主模型"
-                            style={{ fontFamily: 'var(--font-mono)' }}
                           />
                         </div>
                       </div>
@@ -889,16 +1187,9 @@ export default function Agents() {
                 </div>
               </div>
             )}
-          </div>
+          </aside>
         </div>
-      </div>
-      <datalist id="model-suggestions">
-        <option value="deepseek-v4-pro[1m]" />
-        <option value="deepseek-v4-flash" />
-        <option value="claude-opus-4-7" />
-        <option value="claude-sonnet-4-6" />
-        <option value="claude-haiku-4-5-20251001" />
-      </datalist>
+      )}
     </div>
   );
 }

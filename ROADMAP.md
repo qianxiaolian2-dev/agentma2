@@ -9,13 +9,33 @@
 
 **核心论断**:UI 是模拟器壳 → 现在底层真接了 Agent SDK,**已经是 "真 agent 平台" 的最小可发布版本**。
 
+**知识库方向补充(2026-06-05)**:知识库的本质先收敛为两个入口,后续再支持 wiki 化:
+
+```txt
+对话上传文件        -> 当前对话上下文
+知识库上传/外部路径 -> 同步原始文件 -> agent 通过 Glob/Grep/Read 查询
+```
+
+`upload`、`local_path`、`git` 都只是 knowledge source 的来源类型。Git 不是内部存储方案,也不是主更新机制;它只是用户通过外部路径提供知识的一种同步/导入方式。第一版知识库就是普通知识库:把原始文件安全同步到 AgentMa 可读目录,让 agent 读取最新文件。
+
+wiki 化是后续增强能力,由 wiki skill 约束目录结构和吸收流程:
+
+```txt
+knowledge/
+  data/           # 原始来源文件或快照
+  raw/entries/    # 机械 ingest 后的标准 markdown entry
+  wiki/           # 被 agent 读取、被 Obsidian 打开的个人知识 wiki
+```
+
+第一版不解决大知识库、不做 RAG、不做 embedding、不强制上传产物变成 wiki。后续需要 Obsidian 可视化和语义整理时,再加 `wiki ingest/absorb/query`:把各类来源吸收到 `wiki/` 文章中,再通过 Obsidian 展示和人工编辑。
+
 | 阶段 | 权重 | 进度 | 说明 |
 |---|---|---|---|
 | §2 接 SDK 岔路 | 前置 | ✅ 100% | 选了"接 SDK",spike 通过 |
 | P1 让执行变真 | 25% | ✅ **100%** | runAgent / SDK query() / 配额审计入库 |
 | P2 把配置面接到真能力 | 30% | ✅ **100%** | Permissions ✅ / Hooks ✅ / Sessions ✅ / Subagents ✅ / McpServers ✅ |
 | P3 生产化 / 多租户 | 30% | ❌ **0%** | 沙箱 / OTel / 多租户强隔离 0 启动（需拍板） |
-| P4 差异化 / 丰富度 | 15% | 🟡 **68%** | 结构化输出 ✅(端到端打通 /api/chat→SSE,deepseek probe 实测有效) / AskUserQuestion ✅ / Observability 真数据 ✅ / enableFileCheckpointing 后端 ✅ / 图片粘贴 ✅ / markdown 渲染 ✅ / ChatMessageBubble(thinking 折叠/copy/timestamp) ✅ / 运行统计条 ✅ / 会话搜索 ✅ / textarea 自增高 ✅ / 智能滚动 ✅ / 停止生成 ✅ / 文件回滚 rewind UI ⛔(见下) / Skills 市场 ❌ |
+| P4 差异化 / 丰富度 | 15% | 🟡 **68%** | 结构化输出 ✅(端到端打通 /api/chat→SSE,deepseek probe 实测有效) / AskUserQuestion ✅ / Observability 真数据 ✅ / enableFileCheckpointing 后端 ✅ / 图片粘贴 ✅ / 文件上传 ✅ / 知识库上传 ✅ / wiki 化知识库 ❌(后续由 wiki skill 负责 ingest/absorb/query/Obsidian 可视化) / markdown 渲染 ✅ / ChatMessageBubble(thinking 折叠/copy/timestamp) ✅ / 运行统计条 ✅ / 会话搜索 ✅ / textarea 自增高 ✅ / 智能滚动 ✅ / 停止生成 ✅ / 文件回滚 rewind UI ⛔(见下) / Skills 市场 ❌ |
 | §5 小赢 | 散件 | ✅ **100%** | 全部完成 |
 
 **整体加权进度 ≈ 66%**，**核心功能层(P1+P2)= 100%**。

@@ -318,13 +318,22 @@ export interface BuiltInTool {
 export interface ProviderConfig {
   ANTHROPIC_AUTH_TOKEN: string;
   ANTHROPIC_BASE_URL: string;
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: string;
-  ANTHROPIC_DEFAULT_OPUS_MODEL: string;
-  ANTHROPIC_DEFAULT_SONNET_MODEL: string;
   ANTHROPIC_MODEL: string;
-  ANTHROPIC_REASONING_MODEL: string;
-  CLAUDE_CODE_EFFORT_LEVEL: string;
-  CLAUDE_CODE_SUBAGENT_MODEL: string;
+}
+
+export interface ProviderProfile {
+  ANTHROPIC_AUTH_TOKEN: string;
+  ANTHROPIC_BASE_URL: string;
+  id: string;
+  name: string;
+  availableModels: string[];
+  enabled: boolean;
+  isDefault?: boolean;
+  createdAt?: number;
+  updatedAt?: number;
+  /** Legacy fields kept only for localStorage migration. */
+  ANTHROPIC_MODEL?: string;
+  modelPatterns?: string;
 }
 
 // --- 速率限制 ---
@@ -395,7 +404,7 @@ export interface AgentTemplate {
   effort: EffortLevel;
   maxTurns: number;
   permissionMode: PermissionMode;
-  // 供应商配置覆盖 (可选，留空则使用全局配置)
+  // Legacy: 旧模板可能仍带 Agent 级供应商覆盖；运行时优先使用账户页供应商规则。
   providerOverrides?: Partial<ProviderConfig>;
   // 结构化输出 JSON Schema (可选)
   outputSchema?: Record<string, unknown>;
@@ -435,6 +444,24 @@ export interface SkillInfo {
   location: 'project' | 'user' | 'plugin';
   path: string;
   enabled: boolean;
+  sourcePath?: string;
+  installedPath?: string;
+  installed?: boolean;
+  learnedFromPublicSkillId?: string;
+  learnedFromPublicRevision?: number;
+  learnedAt?: number;
+}
+
+export interface PublicSkillInfo {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  authorSub: string;
+  authorTenantId: string;
+  revision: number;
+  publishedAt: number;
+  updatedAt: number;
 }
 
 // --- 聊天消息 ---
@@ -449,13 +476,24 @@ export interface ChatImageAttachment {
   size: number;
 }
 
+export interface ChatFileAttachment {
+  id: string;
+  type: 'file';
+  mediaType: string;
+  data: string;
+  name: string;
+  size: number;
+}
+
+export type ChatAttachment = ChatImageAttachment | ChatFileAttachment;
+
 export interface ChatMessage {
   id?: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   thinking?: string;
   status?: 'pending' | 'streaming' | 'complete' | 'error';
-  attachments?: ChatImageAttachment[];
+  attachments?: ChatAttachment[];
   timestamp: number;
 }
 
@@ -470,6 +508,7 @@ export interface EventSourceConfig {
 // --- 聊天会话 ---
 export interface ChatSession {
   id: string;
+  ownerSub?: string;
   templateId: string;
   pinned?: boolean;
   title: string;
@@ -479,6 +518,9 @@ export interface ChatSession {
   sdkCwd?: string;
   forkedFromSessionId?: string;
   forkedFromTitle?: string;
+  collaborationEnabled?: boolean;
+  collaborationRole?: 'owner' | 'member';
+  collaborationUpdatedAt?: number;
   createdAt: number;
   updatedAt: number;
 }

@@ -8,22 +8,20 @@ window.DATA = {
 
   nav: [
     { group: '核心', items: [
-      { id: 'overview',      label: '总览',        icon: 'overview' },
       { id: 'conversations', label: '会话',        icon: 'chat', count: '12' },
       { id: 'agents',        label: 'Agent 市场',  icon: 'market', count: '7' },
-      { id: 'playground',    label: 'Playground',  icon: 'play' },
-    ]},
-    { group: '接口', items: [
-      { id: 'tools',       label: '工具背包',   icon: 'tools', count: '24' },
       { id: 'skills',      label: '技能背包',   icon: 'spark', count: '10' },
       { id: 'knowledge',   label: '知识库',     icon: 'book' },
-      { id: 'hooks',       label: 'Hook 系统',  icon: 'hook', count: '6' },
-      { id: 'subagents',   label: '子代理',     icon: 'agents', count: '7' },
-      { id: 'permissions', label: '权限系统',   icon: 'shield' },
     ]},
     { group: '运维', items: [
+      { id: 'overview',      label: '总览',        icon: 'overview' },
+      { id: 'playground',    label: 'Playground',  icon: 'play' },
+      { id: 'settings',      label: '全局设置',    icon: 'gear' },
+      { id: 'tools',         label: '工具背包',    icon: 'tools', count: '24' },
+      { id: 'hooks',         label: 'Hook 系统',   icon: 'hook', count: '6' },
+      { id: 'subagents',     label: '子代理',      icon: 'agents', count: '7' },
+      { id: 'permissions',   label: '权限系统',    icon: 'shield' },
       { id: 'observability', label: '可观测性', icon: 'chart' },
-      { id: 'settings',      label: '设置',     icon: 'gear' },
     ]},
   ],
 

@@ -1,8 +1,9 @@
-import type { ChatImageAttachment, ChatMessage, ChatSession } from '../simulator/types';
+import type { ChatAttachment, ChatImageAttachment, ChatMessage, ChatSession } from '../simulator/types';
 import { getAuthHeaders } from './client-runtime';
 
 const LEGACY_SESSION_KEY = 'agentma_chat_sessions';
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const MAX_STORED_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 const GENERIC_TITLES = new Set(['新对话', '(无标题)', '未命名对话']);
 const MEANINGLESS_TITLE_RE = /^[\d\s,，.。、;；:：|/\\_-]+$/;
 
@@ -21,6 +22,7 @@ export function createChatSessionTitle(messages: ChatMessage[], existingTitle?: 
   const firstUser = messages.find((message) => message.role === 'user') || messages[0];
   const content = compactTitleText(firstUser?.content);
   if (isMeaningfulTitle(content)) return content.slice(0, 40);
+  if (firstUser?.attachments?.some((attachment) => attachment.type === 'file')) return '文件对话';
   if (firstUser?.attachments?.some((attachment) => attachment.type === 'image')) return '图片对话';
   if (content) return '未命名对话';
   return '新对话';
@@ -30,11 +32,25 @@ export function getChatSessionDisplayTitle(session: Pick<ChatSession, 'title' | 
   return createChatSessionTitle(session.messages, session.title);
 }
 
-function normalizeAttachments(value: unknown): ChatImageAttachment[] {
+function normalizeAttachments(value: unknown): ChatAttachment[] {
   if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
+  return value.flatMap((item): ChatAttachment[] => {
     if (!item || typeof item !== 'object') return [];
     const raw = item as Record<string, unknown>;
+    if (raw.type === 'file') {
+      const name = String(raw.name || '').trim();
+      const data = String(raw.data || '');
+      const size = Number(raw.size) || 0;
+      if (!name || !data || size > MAX_STORED_ATTACHMENT_BYTES) return [];
+      return [{
+        id: String(raw.id || crypto.randomUUID()),
+        type: 'file' as const,
+        mediaType: typeof raw.mediaType === 'string' ? raw.mediaType : 'application/octet-stream',
+        data,
+        name,
+        size,
+      }];
+    }
     if (raw.type !== 'image') return [];
     const mediaType = String(raw.mediaType || '');
     const data = String(raw.data || '');
@@ -69,6 +85,7 @@ function normalizeMessage(message: unknown): ChatMessage | null {
 function normalizeSession(session: unknown): ChatSession | null {
   if (!session || typeof session !== 'object') return null;
   const id = String((session as { id?: unknown }).id || '');
+  const ownerSub = String((session as { ownerSub?: unknown }).ownerSub || '');
   const templateId = String((session as { templateId?: unknown }).templateId || '');
   const title = String((session as { title?: unknown }).title || '');
   const model = String((session as { model?: unknown }).model || '');
@@ -76,6 +93,8 @@ function normalizeSession(session: unknown): ChatSession | null {
   const sdkCwd = String((session as { sdkCwd?: unknown }).sdkCwd || '');
   const forkedFromSessionId = String((session as { forkedFromSessionId?: unknown }).forkedFromSessionId || '');
   const forkedFromTitle = String((session as { forkedFromTitle?: unknown }).forkedFromTitle || '');
+  const collaborationRole = String((session as { collaborationRole?: unknown }).collaborationRole || '');
+  const collaborationUpdatedAt = Number((session as { collaborationUpdatedAt?: unknown }).collaborationUpdatedAt);
   const createdAt = Number((session as { createdAt?: unknown }).createdAt);
   const updatedAt = Number((session as { updatedAt?: unknown }).updatedAt);
   if (!id || !templateId) return null;
@@ -88,6 +107,7 @@ function normalizeSession(session: unknown): ChatSession | null {
   });
   return {
     id,
+    ownerSub: ownerSub || undefined,
     templateId,
     title,
     messages,
@@ -97,6 +117,9 @@ function normalizeSession(session: unknown): ChatSession | null {
     forkedFromSessionId: forkedFromSessionId || undefined,
     forkedFromTitle: forkedFromTitle || undefined,
     pinned: Boolean((session as { pinned?: unknown }).pinned),
+    collaborationEnabled: Boolean((session as { collaborationEnabled?: unknown }).collaborationEnabled),
+    collaborationRole: collaborationRole === 'owner' || collaborationRole === 'member' ? collaborationRole : undefined,
+    collaborationUpdatedAt: Number.isFinite(collaborationUpdatedAt) ? collaborationUpdatedAt : undefined,
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
   };
@@ -187,6 +210,80 @@ export async function forkChatSession(sessionId: string): Promise<ChatSession> {
   const normalized = normalizeSession(data);
   if (!normalized) throw new Error('会话复制失败');
   return normalized;
+}
+
+export async function setChatSessionCollaboration(sessionId: string, enabled: boolean): Promise<ChatSession> {
+  const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}/collaboration`, {
+    method: 'PATCH',
+    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ enabled }),
+  });
+  const data = await readJson<unknown>(res);
+  const normalized = normalizeSession(data);
+  if (!normalized) throw new Error('协作设置失败');
+  return normalized;
+}
+
+export async function joinChatSession(sessionId: string): Promise<ChatSession> {
+  const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}/join`, {
+    method: 'POST',
+    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+  });
+  const data = await readJson<unknown>(res);
+  const normalized = normalizeSession(data);
+  if (!normalized) throw new Error('加入协作会话失败');
+  return normalized;
+}
+
+export type ChatSessionEvent = {
+  type: 'connected' | 'session_updated' | 'session_deleted';
+  sessionId: string;
+  updatedAt?: number;
+  deletedAt?: number;
+  collaborationEnabled?: boolean;
+  joinedBy?: string;
+};
+
+export function subscribeChatSessionEvents(
+  sessionId: string,
+  onEvent: (event: ChatSessionEvent) => void,
+  onError?: (error: Error) => void,
+): () => void {
+  const controller = new AbortController();
+  const url = `/api/chat-sessions/${encodeURIComponent(sessionId)}/events`;
+
+  (async () => {
+    try {
+      const res = await fetch(url, {
+        headers: getAuthHeaders(),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`协作连接失败: ${res.status}`);
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error('协作连接无响应体');
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (!controller.signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const part of parts) {
+          const line = part.split('\n').find((item) => item.startsWith('data: '));
+          if (!line) continue;
+          try {
+            const event = JSON.parse(line.slice(6)) as ChatSessionEvent;
+            if (event?.type && event.sessionId) onEvent(event);
+          } catch {}
+        }
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) onError?.(error as Error);
+    }
+  })();
+
+  return () => controller.abort();
 }
 
 export async function deleteChatSession(sessionId: string): Promise<void> {

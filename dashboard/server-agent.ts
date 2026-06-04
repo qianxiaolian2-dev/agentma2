@@ -39,6 +39,47 @@ export const SAFE_AUTO_ALLOW_TOOLS = new Set<string>([
   'ListMcpResources', 'ReadMcpResource',
 ]);
 
+// File-mutating tools mapped to the input field that carries their target path.
+// Used to enforce that knowledge-source directories stay read-only.
+export const WRITE_TOOL_PATH_FIELDS: Record<string, string> = {
+  Write: 'file_path',
+  Edit: 'file_path',
+  MultiEdit: 'file_path',
+  NotebookEdit: 'notebook_path',
+};
+
+// A knowledge source is writable for a given run only when the run's initiator is
+// the source creator AND the creator turned read_only off. Non-creators (and any
+// source still marked read_only) stay locked. Pure + exported for unit testing.
+export function isKnowledgeSourceWritable(
+  source: { createdBy?: string | null; readOnly?: boolean },
+  runnerSub: string | null | undefined,
+): boolean {
+  const isCreator = Boolean(runnerSub && source.createdBy && runnerSub === source.createdBy);
+  return isCreator && source.readOnly === false;
+}
+
+// Decide whether a tool call must be denied because it writes into a read-only
+// knowledge directory. Pure + exported so it can be unit-tested without a model.
+// Returns the offending target path when blocked, otherwise null.
+export function knowledgeWriteBlock(
+  toolName: string,
+  input: unknown,
+  cwd: string,
+  readOnlyDirs: string[],
+): string | null {
+  if (!readOnlyDirs.length) return null;
+  const pathField = WRITE_TOOL_PATH_FIELDS[toolName];
+  if (!pathField) return null;
+  const target = (input as Record<string, unknown> | null | undefined)?.[pathField];
+  if (typeof target !== 'string' || !target.trim()) return null;
+  const resolved = path.resolve(cwd, target);
+  const blocked = readOnlyDirs
+    .map((dir) => path.resolve(dir))
+    .some((dir) => resolved === dir || resolved.startsWith(dir + path.sep));
+  return blocked ? target : null;
+}
+
 // ─── Custom HTTP-endpoint tools → SDK MCP wrapper ───────────────────────────
 // Schemas come from the request body's `tools` array; endpoints come from
 // /tmp/agentma_custom_tools.json.
@@ -284,6 +325,7 @@ export interface RunAgentOptions {
   resumeSdkSessionId?: string;
   tenantId: string;
   sub: string;
+  role?: string | null;
   emit: (e: AgentEvent) => void;
   requestPermission: RequestPermissionFn;
   requestUserQuestion: RequestUserQuestionFn;
@@ -434,7 +476,7 @@ function buildKnowledgeSystemPrompt(sources: Array<{ name: string; path: string 
     '你可以访问以下用户知识来源(只读):',
     ...sources.map((source) => `- "${source.name}": ${source.path}`),
     '回答涉及个人知识、笔记、历史记录或知识库内容时,主动使用 Glob 找文件、Grep 全文搜索、Read 读取内容。',
-    '引用时给出文件路径和 markdown 段落标题。Obsidian 风格的 [[wikilink]] 和 #tag 可以直接 grep。',
+    '引用时给出文件路径；markdown 段落标题、CSV 行列或上传 .xlsx 生成的 .md 表格摘要都可以作为定位信息。Obsidian 风格的 [[wikilink]] 和 #tag 可以直接 grep。',
   ].join('\n');
 }
 
@@ -541,11 +583,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     ? new Set(opts.knowledgeSourceIds)
     : null;
   const knowledgeSources = (opts.useKnowledge || requestedKnowledgeIds)
-    ? listKnowledgeSources(opts.tenantId).filter((source) => (
-      source.enabled && (!requestedKnowledgeIds || requestedKnowledgeIds.has(source.id))
+    ? listKnowledgeSources(opts.tenantId, opts.sub, opts.role === 'tenant_admin' ? 'tenant_admin' : null).filter((source) => (
+      source.enabled && !source.archivedAt && (!requestedKnowledgeIds || requestedKnowledgeIds.has(source.id))
     ))
     : [];
   const additionalDirectories = knowledgeSources.map((source) => source.path);
+  // Knowledge dirs are granted via additionalDirectories (read + write at the SDK level),
+  // so we enforce read-only ourselves in canUseTool. A source is writable for this run
+  // only when the run's initiator is its creator AND the creator turned read_only off;
+  // every other case (non-creator, or read_only on) stays locked.
+  const readOnlyKnowledgeDirs = knowledgeSources
+    .filter((source) => !isKnowledgeSourceWritable(source, opts.sub))
+    .map((source) => path.resolve(source.path));
   const knowledgeSystemPrompt = knowledgeSources.length ? buildKnowledgeSystemPrompt(knowledgeSources) : '';
   const skillsSystemPrompt = opts.skills?.length ? buildSkillsSystemPrompt(opts.skills) : '';
   const askUserQuestionSystemPrompt = opts.tools?.includes('AskUserQuestion') ? buildAskUserQuestionSystemPrompt() : '';
@@ -595,6 +644,19 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     const allowedBySubagentDefinition = Boolean(callOpts.agentID && subagentToolNames.has(toolName));
     if (templateToolNames.size > 0 && !templateToolNames.has(toolName) && !allowedBySubagentDefinition) {
       return { behavior: 'deny', message: `Tool '${toolName}' is not enabled by the agent template.` } as PermissionResult;
+    }
+    // 1b. Knowledge sources are read-only. Block writes that target a knowledge
+    //     directory *before* tenant policy, so this stays a hard, non-overridable
+    //     invariant even if a Permissions rule would otherwise allow the tool.
+    const blockedKnowledgeWrite = knowledgeWriteBlock(toolName, input, cwd, readOnlyKnowledgeDirs);
+    if (blockedKnowledgeWrite) {
+      opts.emit({
+        type: 'permission_resolved',
+        toolName,
+        decision: 'deny',
+        reason: '知识库目录为只读',
+      });
+      return { behavior: 'deny', message: `知识库目录为只读，已阻止写入：${blockedKnowledgeWrite}` } as PermissionResult;
     }
     if (toolName === 'AskUserQuestion') {
       const questions = normalizeAskUserQuestions(input);

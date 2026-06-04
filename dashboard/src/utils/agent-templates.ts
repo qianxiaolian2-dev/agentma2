@@ -3,7 +3,7 @@ import { getAuthHeaders } from './client-runtime';
 
 const LEGACY_CACHE_KEY = 'agentma_templates';
 const CACHE_KEY_PREFIX = 'agentma_templates:';
-const DEFAULT_MODEL = 'deepseek-v4-pro[1m]';
+const DEFAULT_MODEL = '';
 const DEFAULT_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'];
 
 function getCacheKey(tenantId?: string) {

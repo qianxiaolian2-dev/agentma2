@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "server": "tsx server.ts",
+    "smoke:chat-collaboration": "node scripts/smoke-chat-collaboration.mjs",
     "smoke:chat-resume": "node scripts/smoke-chat-resume.mjs",
     "smoke:chat-ask-user-question": "node scripts/smoke-chat-ask-user-question.mjs",
     "smoke:chat-subagents": "node scripts/smoke-chat-subagents.mjs",
@@ -13,7 +14,11 @@
     "smoke:hook-rules": "node scripts/smoke-hook-rules.mjs",
     "smoke:hook-runtime": "AGENTMA_SMOKE_EXPECT_HOOK=1 node scripts/smoke-chat-write.mjs",
     "smoke:knowledge": "node scripts/smoke-knowledge.mjs",
+    "smoke:knowledge-guard": "tsx scripts/smoke-knowledge-guard.mjs",
+    "smoke:agent-claude-md": "node scripts/smoke-agent-claude-md.mjs",
+    "smoke:provider-routing": "tsx scripts/smoke-provider-routing.mjs",
     "smoke:permission-rules": "node scripts/smoke-permission-rules.mjs",
+    "smoke:skills-public": "node scripts/smoke-skills-public.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
@@ -24,14 +29,17 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "marked": "^14.1.4",
+    "multer": "^2.1.1",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "react-router-dom": "^7.15.1",
+    "read-excel-file": "^9.0.10",
     "tsx": "^4.22.3",
     "ws": "^8.21.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/multer": "^2.1.0",
     "@types/node": "^24.12.3",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

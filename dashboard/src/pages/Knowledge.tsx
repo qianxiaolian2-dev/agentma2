@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import type { AgentTemplate } from '../simulator/types';
 import { getAuthHeaders } from '../utils/client-runtime';
 import { useAuth } from '../contexts/AuthContext';
+import { fetchAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
+import { listProviderModels } from '../utils/providers';
 
 type KnowledgeSource = {
   id: string;
@@ -8,6 +12,10 @@ type KnowledgeSource = {
   path: string;
   readOnly: boolean;
   enabled: boolean;
+  createdBy?: string | null;
+  publishedAt?: number | null;
+  archivedAt?: number | null;
+  deletedAt?: number | null;
   createdAt?: number;
   updatedAt?: number;
 };
@@ -39,28 +47,42 @@ type KnowledgeQuota = {
   knowledgeUploadMaxFileBytes: number;
 };
 
+type WorkspaceWikiCandidate = {
+  name: string;
+  path: string;
+  relativePath: string;
+  fileCount: number;
+  markdownCount: number;
+  sampleFiles: string[];
+};
+
 const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+const KNOWLEDGE_UPLOAD_EXTENSIONS = ['.md', '.markdown', '.txt', '.csv', '.xls', '.xlsx'];
+const KNOWLEDGE_UPLOAD_ACCEPT = KNOWLEDGE_UPLOAD_EXTENSIONS.join(',');
+const KNOWLEDGE_UPLOAD_LABEL = KNOWLEDGE_UPLOAD_EXTENSIONS.join(' / ');
 const DEFAULT_KNOWLEDGE_QUOTA: KnowledgeQuota = {
   knowledgeUploadAdminMaxFiles: 100,
   knowledgeUploadMemberMaxFiles: 20,
   knowledgeUploadMaxFileBytes: 1024 * 1024,
 };
 
-function createSource(): KnowledgeSource {
-  return {
-    id: crypto.randomUUID(),
-    name: '',
-    path: '',
-    readOnly: true,
-    enabled: true,
-  };
-}
-
 function defaultSourceNameFromPath(sourcePath: string) {
   const normalized = sourcePath.trim().replace(/[\\/]+$/, '');
   const parts = normalized.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] || '知识库';
+}
+
+function sourceNameForUpload(firstPath: string, fallback: string) {
+  if (!firstPath) return fallback;
+  if (firstPath.includes('/')) return firstPath.split('/')[0] || fallback;
+  const baseName = defaultSourceNameFromPath(firstPath);
+  return baseName.replace(/\.(md|markdown|txt|csv|xls|xlsx)$/i, '') || fallback;
+}
+
+function isSupportedKnowledgeUpload(file: File) {
+  const name = file.name.toLowerCase();
+  return KNOWLEDGE_UPLOAD_EXTENSIONS.some((extension) => name.endsWith(extension));
 }
 
 function formatBytes(bytes: number) {
@@ -104,6 +126,10 @@ function normalizeSources(value: unknown): KnowledgeSource[] {
       path,
       readOnly: raw.readOnly !== false,
       enabled: raw.enabled !== false,
+      createdBy: typeof raw.createdBy === 'string' ? raw.createdBy : null,
+      publishedAt: Number(raw.publishedAt) || null,
+      archivedAt: Number(raw.archivedAt) || null,
+      deletedAt: Number(raw.deletedAt) || null,
       createdAt: Number(raw.createdAt) || undefined,
       updatedAt: Number(raw.updatedAt) || undefined,
     }];
@@ -111,6 +137,7 @@ function normalizeSources(value: unknown): KnowledgeSource[] {
 }
 
 export default function Knowledge() {
+  const navigate = useNavigate();
   const { user } = useAuth();
   const canManageSources = user?.role === 'tenant_admin';
   const canUpload = Boolean(user);
@@ -127,9 +154,32 @@ export default function Knowledge() {
   const [scanError, setScanError] = useState('');
   const [folderName, setFolderName] = useState('');
   const [uploadFiles, setUploadFiles] = useState<UploadSelection[]>([]);
+  const [wikiConversationId, setWikiConversationId] = useState('');
+  const [wikiCandidates, setWikiCandidates] = useState<WorkspaceWikiCandidate[]>([]);
+  const [selectedWikiPaths, setSelectedWikiPaths] = useState<string[]>([]);
+  const [wikiImportName, setWikiImportName] = useState('');
+  const [wikiWorkspaceLoading, setWikiWorkspaceLoading] = useState(false);
+  const [wikiWorkspaceMsg, setWikiWorkspaceMsg] = useState('');
+  const [wikiLaunchLoadingId, setWikiLaunchLoadingId] = useState('');
+  const [graphLoadingId, setGraphLoadingId] = useState('');
+  const [graphMsg, setGraphMsg] = useState('');
 
   const changed = useMemo(() => JSON.stringify(sources) !== JSON.stringify(savedSources), [sources, savedSources]);
-  const enabledCount = sources.filter((source) => source.enabled && source.path.trim()).length;
+  const visibleSources = useMemo(() => sources
+    .filter((source) => !source.deletedAt)
+    .sort((a, b) => {
+      const archived = Number(Boolean(a.archivedAt)) - Number(Boolean(b.archivedAt));
+      if (archived !== 0) return archived;
+      return (b.updatedAt || 0) - (a.updatedAt || 0) || a.name.localeCompare(b.name);
+    }), [sources]);
+  const canManageSource = (source: KnowledgeSource) => canManageSources || Boolean(user?.email && source.createdBy === user.email);
+  const publicSources = useMemo(() => visibleSources.filter((source) => source.publishedAt && !source.archivedAt && source.enabled), [visibleSources]);
+  const mineSources = useMemo(() => visibleSources.filter((source) => (
+    canManageSource(source) || (!source.publishedAt && canManageSources)
+  )), [visibleSources, canManageSources, user?.email]);
+  const canSaveSources = mineSources.some((source) => canManageSource(source));
+  const mineEnabledCount = mineSources.filter((source) => !source.archivedAt && source.enabled && source.path.trim()).length;
+  const archivedCount = mineSources.filter((source) => source.archivedAt).length;
   const uploadFileLimit = user?.role === 'tenant_admin'
     ? quota.knowledgeUploadAdminMaxFiles
     : quota.knowledgeUploadMemberMaxFiles;
@@ -174,17 +224,10 @@ export default function Knowledge() {
     setSources((current) => current.map((source) => (source.id === id ? { ...source, ...patch } : source)));
   };
 
-  const addSource = () => {
-    setSources((current) => [...current, createSource()]);
-  };
-
-  const handleFolderPicked = (fileList: FileList | null) => {
+  const handleFilesPicked = (fileList: FileList | null, source: 'files' | 'folder') => {
     const files = Array.from(fileList || []);
-    const textFiles = files.filter((file) => {
-      const name = file.name.toLowerCase();
-      return name.endsWith('.md') || name.endsWith('.markdown') || name.endsWith('.txt');
-    });
-    const next = textFiles.map((file) => {
+    const supportedFiles = files.filter(isSupportedKnowledgeUpload);
+    const next = supportedFiles.map((file) => {
       const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
       return {
         id: `${relativePath}:${file.size}:${file.lastModified}`,
@@ -196,10 +239,10 @@ export default function Knowledge() {
       };
     });
     const firstPath = next[0]?.relativePath || '';
-    setFolderName(firstPath.includes('/') ? firstPath.split('/')[0] : defaultSourceNameFromPath(firstPath || '上传知识库'));
+    setFolderName(sourceNameForUpload(firstPath, source === 'folder' ? '上传知识库' : '上传文件'));
     setUploadFiles(next);
     if (!next.length) {
-      setScanError('这个文件夹里没有可上传的 markdown 或文本文件');
+      setScanError(`没有可上传的知识文件，支持 ${KNOWLEDGE_UPLOAD_LABEL}`);
     } else if (next.length > uploadFileLimit) {
       setScanError(`当前账号单次最多上传 ${uploadFileLimit} 个文件，请取消勾选一部分后再上传`);
     } else {
@@ -239,17 +282,16 @@ export default function Knowledge() {
     setScanError('');
     setStatus('');
     try {
-      const files = await Promise.all(selected.map(async (item) => ({
-        relativePath: item.relativePath,
-        content: await item.file.text(),
-      })));
+      const formData = new FormData();
+      formData.set('name', folderName.trim() || '上传知识库');
+      for (const item of selected) {
+        formData.append('files', item.file, item.name);
+        formData.append('relativePaths', item.relativePath);
+      }
       const response = await fetch('/api/knowledge/sources/upload', {
         method: 'POST',
-        headers: jsonAuthHeaders(),
-        body: JSON.stringify({
-          name: folderName.trim() || '上传知识库',
-          files,
-        }),
+        headers: getAuthHeaders(),
+        body: formData,
       });
       const data = await readJson<unknown>(response);
       const next = normalizeSources(data);
@@ -270,7 +312,7 @@ export default function Knowledge() {
     setStatus('');
     try {
       const payload = sourceList
-        .filter((source) => source.path.trim())
+        .filter((source) => source.path.trim() && canManageSource(source))
         .map((source) => ({
           ...source,
           name: source.name.trim(),
@@ -295,13 +337,54 @@ export default function Knowledge() {
     }
   };
 
-  const deleteSource = (id: string) => {
-    setSources((current) => current.filter((source) => source.id !== id));
+  const archiveSource = async (id: string) => {
+    const archivedAt = Date.now();
+    const nextSources = sources.map((source) => (
+      source.id === id ? { ...source, publishedAt: null, archivedAt, deletedAt: null, enabled: false } : source
+    ));
     setTests((current) => {
       const next = { ...current };
       delete next[id];
       return next;
     });
+    await saveSourceList(nextSources, '已归档。归档项会沉到底部，30 天后自动软删除。').catch(() => {});
+  };
+
+  const softDeleteSource = async (id: string) => {
+    const deletedAt = Date.now();
+    const nextSources = sources.map((source) => (
+      source.id === id
+        ? { ...source, publishedAt: null, archivedAt: source.archivedAt || deletedAt, deletedAt, enabled: false }
+        : source
+    ));
+    setTests((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+    await saveSourceList(nextSources, '已删除。记录已软删除，不再出现在知识库列表。').catch(() => {});
+  };
+
+  const restoreSource = async (id: string) => {
+    const nextSources = sources.map((source) => (
+      source.id === id ? { ...source, archivedAt: null, deletedAt: null, enabled: true } : source
+    ));
+    await saveSourceList(nextSources, '已恢复。知识库已回到我的知识库列表。').catch(() => {});
+  };
+
+  const publishSource = async (id: string) => {
+    const publishedAt = Date.now();
+    const nextSources = sources.map((source) => (
+      source.id === id ? { ...source, publishedAt, archivedAt: null, deletedAt: null, enabled: true } : source
+    ));
+    await saveSourceList(nextSources, '已发布到公共知识库，其他成员现在可以使用。').catch(() => {});
+  };
+
+  const unpublishSource = async (id: string) => {
+    const nextSources = sources.map((source) => (
+      source.id === id ? { ...source, publishedAt: null } : source
+    ));
+    await saveSourceList(nextSources, '已从公共知识库撤回。').catch(() => {});
   };
 
   const testSource = async (source: KnowledgeSource) => {
@@ -329,18 +412,184 @@ export default function Knowledge() {
     await saveSourceList(sources, '已保存。现在可以在 Agent 创建页按需勾选这些知识库。').catch(() => {});
   };
 
+  const ensureWikiAgentTemplate = async () => {
+    if (!user?.tenantId) throw new Error('请先登录');
+    const models = listProviderModels();
+    const model = models[0] || '';
+    if (!model) throw new Error('请先到账户管理配置至少一个可用模型');
+    const templates = await fetchAgentTemplates(user.tenantId);
+    const existing = templates.find((template) => template.id === 'wiki-agent');
+    if (existing) return existing;
+
+    const now = Date.now();
+    const wikiAgent: AgentTemplate = {
+      id: 'wiki-agent',
+      name: 'Wiki 化助手',
+      description: '把知识库 source 编译为可在 Obsidian 中浏览的个人 wiki。',
+      systemPrompt: [
+        '你是 AgentMa 的知识库 wiki 化助手。',
+        '当用户要求 wiki 化某个知识库 source 时,必须使用 wiki skill 的 ingest/absorb/query 工作流。',
+        '只读取用户指定的知识库 source;不要写入原 source 路径。',
+        '所有生成产物都写入当前会话 workspace 的 data/、raw/entries/、wiki/ 目录。',
+        '完成后明确告诉用户 wiki/ 目录位置,并提示回到知识库页面用“从会话同步 Wiki 知识库”导入。',
+      ].join('\n'),
+      model,
+      tools: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob', 'Skill'],
+      subagents: {},
+      mcpServers: [],
+      eventSources: [],
+      skills: ['wiki'],
+      effort: 'high',
+      maxTurns: 50,
+      permissionMode: 'default',
+      useKnowledge: true,
+      knowledgeSourceIds: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    const saved = await replaceAgentTemplates(user.tenantId, [wikiAgent, ...templates]);
+    return saved.find((template) => template.id === wikiAgent.id) || wikiAgent;
+  };
+
+  const launchWikiSession = async (source: KnowledgeSource) => {
+    setWikiLaunchLoadingId(source.id);
+    setGraphMsg('');
+    setError('');
+    try {
+      const agent = await ensureWikiAgentTemplate();
+      const prompt = [
+        `请把知识库 "${source.name || '未命名知识库'}" wiki 化。`,
+        '',
+        `知识库 source 路径: ${source.path}`,
+        `知识库 source id: ${source.id}`,
+        '',
+        '要求:',
+        '1. 在当前会话 workspace 下创建 data/、raw/entries/、wiki/。',
+        '2. 从上面的 source 读取原始知识文件,不要写入 source 路径。',
+        '3. 调用 wiki skill 完成 ingest,然后 absorb all。',
+        '4. 结束时列出生成的 wiki/ 目录路径,方便我回到知识库页面同步。',
+      ].join('\n');
+      navigate(`/conversations?agent=${encodeURIComponent(agent.id)}&draft=${encodeURIComponent(prompt)}`);
+    } catch (launchError) {
+      setError((launchError as Error).message || '发起 Wiki 化会话失败');
+    } finally {
+      setWikiLaunchLoadingId('');
+    }
+  };
+
+  const scanWorkspaceWikis = async () => {
+    const conversationId = wikiConversationId.trim();
+    if (!conversationId) {
+      setWikiWorkspaceMsg('请先输入对话 ID');
+      return;
+    }
+    setWikiWorkspaceLoading(true);
+    setWikiWorkspaceMsg('');
+    setWikiCandidates([]);
+    setSelectedWikiPaths([]);
+    try {
+      const response = await fetch('/api/knowledge/workspace/scan', {
+        method: 'POST',
+        headers: jsonAuthHeaders(),
+        body: JSON.stringify({ conversationId }),
+      });
+      const data = await readJson<{ wikis?: WorkspaceWikiCandidate[] }>(response);
+      const candidates = Array.isArray(data.wikis) ? data.wikis : [];
+      setWikiCandidates(candidates);
+      setSelectedWikiPaths(candidates.map((candidate) => candidate.path));
+      setWikiImportName(candidates[0]?.name ? `${candidates[0].name.replace(/\/?wiki$/, '') || 'Workspace'} Wiki` : '');
+      setWikiWorkspaceMsg(candidates.length
+        ? `已找到 ${candidates.length} 个 wiki 候选`
+        : '没有找到可同步的 wiki/ 目录');
+    } catch (scanFailure) {
+      setWikiWorkspaceMsg(`扫描失败: ${(scanFailure as Error).message}`);
+    } finally {
+      setWikiWorkspaceLoading(false);
+    }
+  };
+
+  const toggleWikiCandidate = (candidatePath: string) => {
+    setSelectedWikiPaths((current) => (
+      current.includes(candidatePath)
+        ? current.filter((item) => item !== candidatePath)
+        : [...current, candidatePath]
+    ));
+  };
+
+  const importSelectedWorkspaceWikis = async () => {
+    const conversationId = wikiConversationId.trim();
+    if (!conversationId) {
+      setWikiWorkspaceMsg('请先输入对话 ID');
+      return;
+    }
+    const selected = wikiCandidates.filter((candidate) => selectedWikiPaths.includes(candidate.path));
+    if (!selected.length) {
+      setWikiWorkspaceMsg('请先选择要同步的 wiki');
+      return;
+    }
+    setWikiWorkspaceLoading(true);
+    setWikiWorkspaceMsg('');
+    const imported: KnowledgeSource[] = [];
+    const failed: string[] = [];
+    try {
+      for (const candidate of selected) {
+        try {
+          const response = await fetch('/api/knowledge/workspace/import', {
+            method: 'POST',
+            headers: jsonAuthHeaders(),
+            body: JSON.stringify({
+              conversationId,
+              path: candidate.path,
+              name: selected.length === 1 ? wikiImportName.trim() : '',
+            }),
+          });
+          const data = await readJson<{ source?: KnowledgeSource }>(response);
+          if (data.source) imported.push(data.source);
+        } catch (importFailure) {
+          failed.push(`${candidate.relativePath}: ${(importFailure as Error).message}`);
+        }
+      }
+      await loadSources();
+      setSelectedWikiPaths([]);
+      setWikiWorkspaceMsg([
+        imported.length ? `已同步 ${imported.length} 个 wiki 知识库` : '',
+        failed.length ? `失败 ${failed.length} 个：${failed.join('；')}` : '',
+      ].filter(Boolean).join(' ') || '没有同步任何 wiki');
+    } finally {
+      setWikiWorkspaceLoading(false);
+    }
+  };
+
+  const openObsidianGraph = async (source: KnowledgeSource) => {
+    setGraphLoadingId(source.id);
+    setGraphMsg('');
+    try {
+      const response = await fetch(`/api/knowledge/sources/${encodeURIComponent(source.id)}/graph`, {
+        method: 'POST',
+        headers: jsonAuthHeaders(),
+        body: JSON.stringify({}),
+      });
+      await readJson<{ ok: boolean }>(response);
+      setGraphMsg(`已请求 Obsidian 打开 "${source.name || '知识库'}" 图谱`);
+    } catch (graphFailure) {
+      setGraphMsg(`图谱预览失败: ${(graphFailure as Error).message}`);
+    } finally {
+      setGraphLoadingId('');
+    }
+  };
+
   return (
     <div>
       <div className="page-header">
         <h1>📚 知识库</h1>
-        <p>导入可绑定到 Agent 的本地文件夹，每个知识库对应一个只读目录。</p>
+        <p>导入可绑定到 Agent 的本地文件夹。默认只读；仅创建人关闭「只读」后，创建人自己的 Agent 才能写入，其他成员始终只读。</p>
       </div>
 
       {error && <div className="card mb-4" style={{ borderColor: 'var(--danger)', background: 'var(--danger-bg)', color: 'var(--danger)' }}>{error}</div>}
       {status && <div className="card mb-4" style={{ borderColor: 'var(--success)', background: 'var(--success-bg)', color: 'var(--success)' }}>{status}</div>}
       {!canManageSources && (
         <div className="card mb-4" style={{ borderColor: 'var(--warning)', background: 'var(--warning-bg)', color: 'var(--warning)' }}>
-          当前账号可以上传文件夹生成知识库；手工维护服务器路径、启停和删除仍需要租户管理员权限。
+          当前账号可以上传文件夹生成知识库，也可以管理自己创建的知识库；公共知识库由发布者维护。
         </div>
       )}
 
@@ -349,7 +598,7 @@ export default function Knowledge() {
           <div>
             <div className="card-header" style={{ marginBottom: 4 }}>上传本地文件夹</div>
             <div className="tool-card-desc">
-              打开本地文件夹后勾选要上传的 markdown 或文本文件，当前账号单次最多 {uploadFileLimit} 个，单文档最多 {formatBytes(quota.knowledgeUploadMaxFileBytes)}，总量最多 {formatBytes(MAX_UPLOAD_BYTES)}。
+              打开本地文件夹后勾选要上传的知识文件。支持 {KNOWLEDGE_UPLOAD_LABEL}。当前账号单次最多 {uploadFileLimit} 个文件，单文档最多 {formatBytes(quota.knowledgeUploadMaxFileBytes)}，总量最多 {formatBytes(MAX_UPLOAD_BYTES)}。
             </div>
           </div>
           <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -357,8 +606,9 @@ export default function Knowledge() {
               ref={folderInputRef}
               type="file"
               multiple
+              accept={KNOWLEDGE_UPLOAD_ACCEPT}
               {...{ webkitdirectory: '', directory: '' }}
-              onChange={e => handleFolderPicked(e.currentTarget.files)}
+              onChange={e => handleFilesPicked(e.currentTarget.files, 'folder')}
               style={{ display: 'none' }}
             />
             <button className="btn btn-sm" onClick={() => folderInputRef.current?.click()} disabled={!canUpload || directImportLoading}>
@@ -428,75 +678,45 @@ export default function Knowledge() {
         )}
       </div>
 
-      <div className="card">
+      <div className="card" style={{ marginBottom: 16 }}>
         <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
           <div>
-            <div className="card-header" style={{ marginBottom: 4 }}>我的知识库</div>
-            <div className="tool-card-desc">已导入 {sources.length} 个知识库，{enabledCount} 个可被 Agent 勾选。保存时会校验目录存在、可读，并且位于服务器允许的根目录内。</div>
+            <div className="card-header" style={{ marginBottom: 4 }}>公共知识库</div>
+            <div className="tool-card-desc">已发布 {publicSources.length} 个公共知识库，租户内成员都可以在 Agent 创建页勾选使用。</div>
           </div>
-          <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            <button className="btn btn-sm" onClick={addSource} disabled={saving || !canManageSources}>+ 添加</button>
-            <button className="btn btn-sm" onClick={() => void loadSources()} disabled={loading || saving}>刷新</button>
-            <button className="btn btn-sm btn-primary" onClick={() => void saveSources()} disabled={!changed || saving || !canManageSources}>
-              {saving ? '保存中...' : '保存知识库'}
-            </button>
-          </div>
+          <button className="btn btn-sm" onClick={() => void loadSources()} disabled={loading || saving}>刷新</button>
         </div>
 
         {loading ? (
-          <div style={{ color: 'var(--ink-muted)', padding: 24, textAlign: 'center' }}>加载中...</div>
-        ) : sources.length === 0 ? (
-          <div style={{ color: 'var(--ink-muted)', padding: 24, textAlign: 'center' }}>
-            还没有知识库。导入一个 Obsidian vault 或 markdown 笔记目录后，就能在 Agent 创建页勾选它。
+          <div style={{ color: 'var(--ink-muted)', padding: 18, textAlign: 'center' }}>加载中...</div>
+        ) : publicSources.length === 0 ? (
+          <div style={{ color: 'var(--ink-muted)', padding: 18, textAlign: 'center' }}>
+            还没有公共知识库。可以从“我的知识库”发布一个。
           </div>
         ) : (
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th style={{ width: 170 }}>知识库名称</th>
-                  <th>路径</th>
-                  <th style={{ width: 90 }}>可选</th>
-                  <th style={{ width: 110 }}>只读</th>
+                  <th style={{ width: 180 }}>知识库名称</th>
+                  <th style={{ width: 180 }}>创建人</th>
                   <th style={{ width: 220 }}>测试</th>
-                  <th style={{ width: 90 }}>操作</th>
+                  <th style={{ width: 110 }}>操作</th>
                 </tr>
               </thead>
               <tbody>
-                {sources.map((source) => {
+                {publicSources.map((source) => {
                   const test = tests[source.id];
                   return (
                     <tr key={source.id}>
                       <td>
-                        <input
-                          value={source.name}
-                          onChange={e => updateSource(source.id, { name: e.target.value })}
-                          placeholder="主 vault"
-                          disabled={!canManageSources}
-                        />
+                        <div style={{ fontWeight: 700 }}>{source.name || '未命名知识库'}</div>
                       </td>
                       <td>
-                        <input
-                          value={source.path}
-                          onChange={e => updateSource(source.id, { path: e.target.value })}
-                          placeholder="/Users/xiaoqin/Obsidian/MainVault"
-                          style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}
-                          disabled={!canManageSources}
-                        />
+                        <span style={{ fontSize: '.78em', color: 'var(--ink-secondary)' }}>
+                          {source.createdBy === user?.email ? '你' : source.createdBy || '未知'}
+                        </span>
                       </td>
-                      <td>
-                        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, margin: 0 }}>
-                          <input
-                            type="checkbox"
-                            checked={source.enabled}
-                            onChange={e => updateSource(source.id, { enabled: e.target.checked })}
-                            disabled={!canManageSources}
-                            style={{ width: 'auto', margin: 0 }}
-                          />
-                          <span>{source.enabled ? '可选' : '停用'}</span>
-                        </label>
-                      </td>
-                      <td><span className="badge badge-muted">只读</span></td>
                       <td>
                         <div style={{ display: 'grid', gap: 6 }}>
                           <button className="btn btn-sm" onClick={() => void testSource(source)} disabled={test?.loading}>
@@ -505,14 +725,138 @@ export default function Knowledge() {
                           {test?.result && (
                             <div style={{ fontSize: '.74em', color: test.result.ok ? 'var(--success)' : 'var(--danger)' }}>
                               {test.result.ok
-                                ? `可读 · ${test.result.fileCount || 0} 个 .md`
+                                ? `可读 · ${test.result.fileCount || 0} 个知识文件`
                                 : test.result.reason || '不可用'}
                             </div>
                           )}
                         </div>
                       </td>
                       <td>
-                        <button className="btn btn-sm btn-danger" onClick={() => deleteSource(source.id)} disabled={saving || !canManageSources}>删除</button>
+                        {canManageSource(source) ? (
+                          <button className="btn btn-sm" onClick={() => void unpublishSource(source.id)} disabled={saving}>撤回</button>
+                        ) : (
+                          <span className="badge badge-success">公共</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
+          <div>
+            <div className="card-header" style={{ marginBottom: 4 }}>我的知识库</div>
+            <div className="tool-card-desc">
+              已导入 {mineSources.length} 个知识库，{mineEnabledCount} 个可被 Agent 勾选，{archivedCount} 个已归档。可以发布到公共知识库供他人使用；归档项会沉到底部，30 天后自动软删除。
+            </div>
+          </div>
+          <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <button className="btn btn-sm" onClick={() => void loadSources()} disabled={loading || saving}>刷新</button>
+            <button className="btn btn-sm btn-primary" onClick={() => void saveSources()} disabled={!changed || saving || !canSaveSources}>
+              {saving ? '保存中...' : '保存知识库'}
+            </button>
+          </div>
+        </div>
+
+        {loading ? (
+          <div style={{ color: 'var(--ink-muted)', padding: 24, textAlign: 'center' }}>加载中...</div>
+        ) : mineSources.length === 0 ? (
+          <div style={{ color: 'var(--ink-muted)', padding: 24, textAlign: 'center' }}>
+            还没有知识库。导入一个 Obsidian vault 或知识文件目录后，就能在 Agent 创建页勾选它。
+          </div>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: 170 }}>知识库名称</th>
+                  <th style={{ width: 90 }}>启停</th>
+                  <th style={{ width: 160 }}>只读 / 创建人</th>
+                  <th style={{ width: 220 }}>测试</th>
+                  <th style={{ width: 150 }}>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mineSources.map((source) => {
+                  const test = tests[source.id];
+                  const manageable = canManageSource(source);
+                  return (
+                    <tr key={source.id} style={{ opacity: source.archivedAt ? .68 : 1 }}>
+                      <td>
+                        <input
+                          value={source.name}
+                          onChange={e => updateSource(source.id, { name: e.target.value })}
+                          placeholder="主 vault"
+                          disabled={!manageable}
+                        />
+                      </td>
+                      <td>
+                        {source.archivedAt ? (
+                          <span className="badge badge-muted">已归档</span>
+                        ) : (
+                          <button
+                            className={`btn btn-sm ${source.enabled ? '' : 'btn-success'}`}
+                            onClick={() => updateSource(source.id, { enabled: !source.enabled })}
+                            disabled={!manageable}
+                          >
+                            {source.enabled ? '停用' : '启用'}
+                          </button>
+                        )}
+                      </td>
+                      <td>
+                        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, margin: 0 }}>
+                          <input
+                            type="checkbox"
+                            checked={source.readOnly}
+                            onChange={e => updateSource(source.id, { readOnly: e.target.checked })}
+                            disabled={!manageable}
+                            style={{ width: 'auto', margin: 0 }}
+                          />
+                          <span>{source.readOnly ? '只读' : '创建人可写'}</span>
+                        </label>
+                        <div style={{ fontSize: '.7em', color: 'var(--ink-muted)', marginTop: 3 }}>
+                          {source.createdBy
+                            ? (source.createdBy === user?.email ? '创建人：你' : `创建人：${source.createdBy}`)
+                            : '创建人：未知'}
+                        </div>
+                      </td>
+                      <td>
+                        <div style={{ display: 'grid', gap: 6 }}>
+                          <button className="btn btn-sm" onClick={() => void testSource(source)} disabled={test?.loading}>
+                            {test?.loading ? '测试中...' : '测试'}
+                          </button>
+                          {test?.result && (
+                            <div style={{ fontSize: '.74em', color: test.result.ok ? 'var(--success)' : 'var(--danger)' }}>
+                              {test.result.ok
+                                ? `可读 · ${test.result.fileCount || 0} 个知识文件`
+                                : test.result.reason || '不可用'}
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+                          {source.archivedAt ? (
+                            <>
+                              <button className="btn btn-sm btn-success" onClick={() => void restoreSource(source.id)} disabled={saving || !manageable}>恢复</button>
+                              <button className="btn btn-sm btn-danger" onClick={() => void softDeleteSource(source.id)} disabled={saving || !manageable}>删除</button>
+                            </>
+                          ) : (
+                            <>
+                              {source.publishedAt ? (
+                                <button className="btn btn-sm" onClick={() => void unpublishSource(source.id)} disabled={saving || !manageable}>撤回</button>
+                              ) : (
+                                <button className="btn btn-sm btn-primary" onClick={() => void publishSource(source.id)} disabled={saving || !manageable}>发布</button>
+                              )}
+                              <button className="btn btn-sm" onClick={() => void archiveSource(source.id)} disabled={saving || !manageable}>归档</button>
+                            </>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -527,12 +871,12 @@ export default function Knowledge() {
         <div className="card" style={{ marginTop: 16 }}>
           <div className="card-header">测试样例</div>
           <div style={{ display: 'grid', gap: 10 }}>
-            {sources.map((source) => {
+            {visibleSources.map((source) => {
               const result = tests[source.id]?.result;
               if (!result?.ok || !result.sampleFiles?.length) return null;
               return (
                 <div key={source.id} className="tool-card" style={{ padding: 12 }}>
-                  <div className="tool-card-name">{source.name || source.path}</div>
+                  <div className="tool-card-name">{source.name || '未命名知识库'}</div>
                   <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                     {result.sampleFiles.map((file) => <span className="badge badge-info" key={file}>{file}</span>)}
                   </div>
