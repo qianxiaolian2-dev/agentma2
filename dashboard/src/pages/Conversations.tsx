@@ -140,6 +140,7 @@ export default function Conversations() {
   const joinSessionId = searchParams.get('join') || '';
   const requestedConversationId = searchParams.get('conversationId') || '';
   const requestedSessionId = searchParams.get('sdkSessionId') || searchParams.get('sessionId') || '';
+  const requestedDraft = searchParams.get('draft') || '';
   const { user } = useAuth();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
@@ -180,6 +181,7 @@ export default function Conversations() {
   const visibleSessions = selectedAgentSessions
     .filter(session => !sessionSearch || getChatSessionDisplayTitle(session).toLowerCase().includes(sessionSearch.toLowerCase()));
   const persistRef = useRef<((msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => Promise<string>) | null>(null);
+  const appliedDraftRef = useRef('');
 
   const syncConversationUrl = useCallback((session: ConversationUrlState) => {
     const next = new URLSearchParams(searchParams);
@@ -463,6 +465,22 @@ export default function Conversations() {
     }
     setMobileListOpen(false);
   }, [joinSessionId, requestedConversationId, requestedSessionId, sessions, activeSessionId, templates]);
+
+  useEffect(() => {
+    if (!requestedDraft || appliedDraftRef.current === requestedDraft) return;
+    appliedDraftRef.current = requestedDraft;
+    setActiveSessionId(null);
+    setMessages([]);
+    setPendingQuestions([]);
+    setAgentTasks([]);
+    setInput(requestedDraft);
+    setAttachments([]);
+    setAttachmentError('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    const next = new URLSearchParams(searchParams);
+    next.delete('draft');
+    setSearchParams(next, { replace: true });
+  }, [requestedDraft, searchParams, setSearchParams]);
 
   useEffect(() => {
     const el = messagesRef.current;

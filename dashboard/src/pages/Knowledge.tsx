@@ -587,6 +587,7 @@ export default function Knowledge() {
 
       {error && <div className="card mb-4" style={{ borderColor: 'var(--danger)', background: 'var(--danger-bg)', color: 'var(--danger)' }}>{error}</div>}
       {status && <div className="card mb-4" style={{ borderColor: 'var(--success)', background: 'var(--success-bg)', color: 'var(--success)' }}>{status}</div>}
+      {graphMsg && <div className="card mb-4" style={{ borderColor: graphMsg.includes('失败') ? 'var(--danger)' : 'var(--success)', color: graphMsg.includes('失败') ? 'var(--danger)' : 'var(--success)' }}>{graphMsg}</div>}
       {!canManageSources && (
         <div className="card mb-4" style={{ borderColor: 'var(--warning)', background: 'var(--warning-bg)', color: 'var(--warning)' }}>
           当前账号可以上传文件夹生成知识库，也可以管理自己创建的知识库；公共知识库由发布者维护。
@@ -679,6 +680,94 @@ export default function Knowledge() {
       </div>
 
       <div className="card" style={{ marginBottom: 16 }}>
+        <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 12 }}>
+          <div>
+            <div className="card-header" style={{ marginBottom: 4 }}>从会话同步 Wiki 知识库</div>
+            <div className="tool-card-desc">
+              输入 Wiki 化会话 ID，扫描该会话 workspace 里的 wiki/ 产物，并同步为新的知识库 source。
+            </div>
+          </div>
+          <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <input
+              value={wikiConversationId}
+              onChange={e => setWikiConversationId(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') void scanWorkspaceWikis(); }}
+              placeholder="conversationId"
+              style={{ width: 220, fontFamily: 'var(--font-mono)', fontSize: '.8em' }}
+            />
+            <button className="btn btn-sm btn-primary" onClick={() => void scanWorkspaceWikis()} disabled={wikiWorkspaceLoading}>
+              {wikiWorkspaceLoading ? '扫描中...' : '扫描'}
+            </button>
+          </div>
+        </div>
+
+        {wikiCandidates.length > 0 && (
+          <div style={{ border: '1px solid var(--border)', borderRadius: 6, overflow: 'hidden' }}>
+            <div className="flex-between" style={{ padding: '8px 10px', borderBottom: '1px solid var(--border)', background: 'var(--bg-hover)', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '.82em', fontWeight: 700 }}>
+                Wiki 候选 {selectedWikiPaths.length}/{wikiCandidates.length}
+              </span>
+              <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+                <input
+                  value={wikiImportName}
+                  onChange={e => setWikiImportName(e.target.value)}
+                  placeholder="同步后的知识库名称"
+                  disabled={wikiCandidates.length !== 1}
+                  style={{ width: 220, fontSize: '.8em' }}
+                />
+                <button className="btn btn-sm" onClick={() => setSelectedWikiPaths(wikiCandidates.map(candidate => candidate.path))}>全选</button>
+                <button className="btn btn-sm" onClick={() => setSelectedWikiPaths([])}>清空</button>
+                <button className="btn btn-primary btn-sm" onClick={() => void importSelectedWorkspaceWikis()} disabled={wikiWorkspaceLoading || selectedWikiPaths.length === 0}>
+                  {wikiWorkspaceLoading ? '同步中...' : '同步为知识库'}
+                </button>
+              </div>
+            </div>
+            <div style={{ maxHeight: 260, overflowY: 'auto' }}>
+              {wikiCandidates.map(candidate => (
+                <label
+                  key={candidate.path}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'auto minmax(0, 1fr) auto',
+                    gap: 10,
+                    alignItems: 'start',
+                    padding: '10px',
+                    borderBottom: '1px solid var(--border)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedWikiPaths.includes(candidate.path)}
+                    onChange={() => toggleWikiCandidate(candidate.path)}
+                    style={{ width: 'auto', marginTop: 3 }}
+                  />
+                  <span style={{ minWidth: 0 }}>
+                    <span style={{ display: 'block', fontWeight: 700 }}>{candidate.relativePath}</span>
+                    <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.72em', color: 'var(--ink-secondary)', overflowWrap: 'anywhere', marginTop: 2 }}>
+                      {candidate.path}
+                    </span>
+                    {candidate.sampleFiles.length > 0 && (
+                      <span style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
+                        {candidate.sampleFiles.slice(0, 5).map(file => <span className="badge badge-muted" key={file}>{file}</span>)}
+                      </span>
+                    )}
+                  </span>
+                  <span className="badge badge-info">{candidate.markdownCount} md / {candidate.fileCount} 文件</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {wikiWorkspaceMsg && (
+          <div style={{ marginTop: 10, fontSize: '.8em', color: wikiWorkspaceMsg.includes('失败') ? 'var(--danger)' : wikiWorkspaceMsg.startsWith('已') ? 'var(--success)' : 'var(--ink-secondary)' }}>
+            {wikiWorkspaceMsg}
+          </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 16 }}>
         <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 14 }}>
           <div>
             <div className="card-header" style={{ marginBottom: 4 }}>公共知识库</div>
@@ -701,7 +790,7 @@ export default function Knowledge() {
                   <th style={{ width: 180 }}>知识库名称</th>
                   <th style={{ width: 180 }}>创建人</th>
                   <th style={{ width: 220 }}>测试</th>
-                  <th style={{ width: 110 }}>操作</th>
+                  <th style={{ width: 240 }}>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -732,11 +821,19 @@ export default function Knowledge() {
                         </div>
                       </td>
                       <td>
-                        {canManageSource(source) ? (
-                          <button className="btn btn-sm" onClick={() => void unpublishSource(source.id)} disabled={saving}>撤回</button>
-                        ) : (
-                          <span className="badge badge-success">公共</span>
-                        )}
+                        <div className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+                          <button className="btn btn-sm btn-primary" onClick={() => void launchWikiSession(source)} disabled={wikiLaunchLoadingId === source.id}>
+                            {wikiLaunchLoadingId === source.id ? '启动中...' : 'Wiki 化'}
+                          </button>
+                          <button className="btn btn-sm" onClick={() => void openObsidianGraph(source)} disabled={graphLoadingId === source.id}>
+                            {graphLoadingId === source.id ? '打开中...' : '图谱预览'}
+                          </button>
+                          {canManageSource(source) ? (
+                            <button className="btn btn-sm" onClick={() => void unpublishSource(source.id)} disabled={saving}>撤回</button>
+                          ) : (
+                            <span className="badge badge-success">公共</span>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
@@ -778,7 +875,7 @@ export default function Knowledge() {
                   <th style={{ width: 90 }}>启停</th>
                   <th style={{ width: 160 }}>只读 / 创建人</th>
                   <th style={{ width: 220 }}>测试</th>
-                  <th style={{ width: 150 }}>操作</th>
+                  <th style={{ width: 260 }}>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -848,6 +945,12 @@ export default function Knowledge() {
                             </>
                           ) : (
                             <>
+                              <button className="btn btn-sm btn-primary" onClick={() => void launchWikiSession(source)} disabled={wikiLaunchLoadingId === source.id || !source.enabled}>
+                                {wikiLaunchLoadingId === source.id ? '启动中...' : 'Wiki 化'}
+                              </button>
+                              <button className="btn btn-sm" onClick={() => void openObsidianGraph(source)} disabled={graphLoadingId === source.id}>
+                                {graphLoadingId === source.id ? '打开中...' : '图谱预览'}
+                              </button>
                               {source.publishedAt ? (
                                 <button className="btn btn-sm" onClick={() => void unpublishSource(source.id)} disabled={saving || !manageable}>撤回</button>
                               ) : (
