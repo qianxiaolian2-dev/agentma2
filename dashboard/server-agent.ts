@@ -80,6 +80,75 @@ export function knowledgeWriteBlock(
   return blocked ? target : null;
 }
 
+function isPathInsideAny(filePath: string, roots: string[]) {
+  const resolved = path.resolve(filePath);
+  return roots.some((root) => {
+    const resolvedRoot = path.resolve(root);
+    return resolved === resolvedRoot || resolved.startsWith(resolvedRoot + path.sep);
+  });
+}
+
+function readShellPathAt(text: string, start: number) {
+  let value = '';
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '\\' && i + 1 < text.length) {
+      value += text[i + 1];
+      i += 1;
+      continue;
+    }
+    if (/[\s"'`|;&<>(){}[\]]/.test(ch)) break;
+    value += ch;
+  }
+  return value;
+}
+
+function extractHostPathCandidates(text: string) {
+  const roots = [os.homedir(), path.join(os.homedir(), 'Library', 'Application Support', 'agentma2')];
+  const candidates = new Set<string>();
+  for (const root of roots) {
+    const probes = [root, root.replace(/ /g, '\\ ')];
+    for (const probe of probes) {
+      let index = text.indexOf(probe);
+      while (index >= 0) {
+        const candidate = readShellPathAt(text, index);
+        if (candidate) candidates.add(candidate);
+        index = text.indexOf(probe, index + probe.length);
+      }
+    }
+  }
+  return Array.from(candidates);
+}
+
+function collectInputStrings(input: unknown, depth = 0): string[] {
+  if (depth > 3 || input == null) return [];
+  if (typeof input === 'string') return [input];
+  if (typeof input !== 'object') return [];
+  if (Array.isArray(input)) return input.flatMap((item) => collectInputStrings(item, depth + 1));
+  return Object.values(input as Record<string, unknown>).flatMap((value) => collectInputStrings(value, depth + 1));
+}
+
+function hostPathToolBlock(toolName: string, input: unknown, cwd: string, additionalDirectories: string[]) {
+  const guardedTools = new Set(['Bash', 'Read', 'Grep', 'Glob', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+  if (!guardedTools.has(toolName)) return null;
+
+  const texts = collectInputStrings(input);
+  const hostHomeSkillRe = /(^|[\s"'`])~\/(?:\.claude|\.ssh|Library\/Application(?:\\ | )Support\/agentma2)(?:\/|$)/;
+  if (texts.some((text) => hostHomeSkillRe.test(text))) {
+    return '宿主 HOME/skills 路径不可在 agent run 内访问；创建技能请使用 ./.claude/skills/<name>/SKILL.md';
+  }
+
+  const allowedRoots = [cwd, ...additionalDirectories].map((dir) => path.resolve(dir));
+  for (const text of texts) {
+    for (const candidate of extractHostPathCandidates(text)) {
+      if (!isPathInsideAny(candidate, allowedRoots)) {
+        return `宿主路径不在本次 workspace allowlist 内：${candidate}`;
+      }
+    }
+  }
+  return null;
+}
+
 // ─── Custom HTTP-endpoint tools → SDK MCP wrapper ───────────────────────────
 // Schemas come from the request body's `tools` array; endpoints come from
 // /tmp/agentma_custom_tools.json.
@@ -334,6 +403,23 @@ export interface RunAgentOptions {
 const RUN_CWD_PREFIX = 'agentma-run-';
 const RUN_CWD_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RUN_CWD_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+// P1: 给租户 run 的 env 白名单，绝不把宿主全部 process.env 拷进 agent run。
+// 需要额外变量时用 AGENTMA_RUN_ENV_ALLOWLIST 逗号分隔追加，先在 dev 验证不破坏 SDK/MCP。
+const RUN_ENV_DEFAULT_ALLOWLIST = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TMPDIR', 'SHELL'];
+const RUN_ENV_ALLOWLIST = [
+  ...RUN_ENV_DEFAULT_ALLOWLIST,
+  ...(process.env.AGENTMA_RUN_ENV_ALLOWLIST
+    ? process.env.AGENTMA_RUN_ENV_ALLOWLIST.split(',').map((s) => s.trim()).filter(Boolean)
+    : []),
+];
+// P2: 显式收敛 settingSources。绝不含 'user'，避免 SDK 去加载宿主 ~/.claude（即便
+// HOME 已被隔离到 cwd/.agent-home，也按设计在 SDK 层显式排除，不靠隐式默认）。
+// 含 'project'/'local' 让租户 workspace 的 CLAUDE.md / .claude/settings(.local).json 原生加载。
+const RUN_SETTING_SOURCES: ('user' | 'project' | 'local')[] = ['project', 'local'];
+const SANDBOX_ENABLED = process.env.AGENTMA_SANDBOX_ENABLED !== '0';
+const SANDBOX_FAIL_IF_UNAVAILABLE = process.env.AGENTMA_SANDBOX_FAIL_IF_UNAVAILABLE !== '0';
+// 网络收紧默认 OFF: allowManagedDomainsOnly 会影响 WebFetch/远程 MCP/npx，先单独验证再开。
+const SANDBOX_NETWORK_MANAGED_ONLY = process.env.AGENTMA_SANDBOX_NETWORK_MANAGED_ONLY === '1';
 let lastRunCwdCleanupMs = 0;
 
 function realpathIfPossible(filePath: string) {
@@ -498,6 +584,13 @@ function buildAskUserQuestionSystemPrompt() {
   ].join('\n');
 }
 
+function buildRunIsolationSystemPrompt() {
+  return [
+    '当前 run 在隔离 workspace 中执行。创建或修改 workspace skill 时,使用相对路径 ./.claude/skills/<skill-name>/SKILL.md。',
+    '不要检查、读取或写入宿主用户技能背包、~/.claude/skills、~/.ssh 或 /Users/.../Library/Application Support/agentma2；这些路径由 Dashboard 服务端管理。',
+  ].join('\n');
+}
+
 function getSelectedSkillSlashCommand(prompt: string, skills?: string[]) {
   if (!skills?.length) return null;
   const match = prompt.trim().match(/^\/([a-zA-Z0-9._:-]+)(?:\s+|$)([\s\S]*)$/);
@@ -570,12 +663,19 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   fs.mkdirSync(cwd, { recursive: true });
   cleanupExpiredRunCwds(cwd);
 
-  // Per-call env (concurrency-safe — never mutate process.env)
+  // Per-call env: 仅白名单，绝不把宿主全部 process.env 灌进租户 run。
   const env: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) if (v != null) env[k] = String(v);
-  if (opts.baseUrl) env.ANTHROPIC_BASE_URL = opts.baseUrl;
+  for (const key of RUN_ENV_ALLOWLIST) {
+    const v = process.env[key];
+    if (v != null) env[key] = String(v);
+  }
+  // 隔离 HOME 到运行 workspace：让 ~ 解析到受控空目录，读不到宿主 ~/.claude、~/.ssh 等。
+  // 使用 cwd 下的稳定子目录，保证同一对话跨 run resume 时 HOME 保持稳定。
+  const runHome = path.join(cwd, '.agent-home');
+  fs.mkdirSync(runHome, { recursive: true });
+  env.HOME = runHome;
   env.ANTHROPIC_API_KEY = opts.apiKey;
-  delete env.ANTHROPIC_AUTH_TOKEN;
+  if (opts.baseUrl) env.ANTHROPIC_BASE_URL = opts.baseUrl;
 
   const customMcp = buildCustomToolsMcp(opts.requestTools || []);
   const hooks = buildTenantHooks(opts.tenantId, opts.emit);
@@ -598,7 +698,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   const knowledgeSystemPrompt = knowledgeSources.length ? buildKnowledgeSystemPrompt(knowledgeSources) : '';
   const skillsSystemPrompt = opts.skills?.length ? buildSkillsSystemPrompt(opts.skills) : '';
   const askUserQuestionSystemPrompt = opts.tools?.includes('AskUserQuestion') ? buildAskUserQuestionSystemPrompt() : '';
-  const effectiveSystemPrompt = [opts.systemPrompt, knowledgeSystemPrompt, skillsSystemPrompt, askUserQuestionSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
+  const effectiveSystemPrompt = [opts.systemPrompt, buildRunIsolationSystemPrompt(), knowledgeSystemPrompt, skillsSystemPrompt, askUserQuestionSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
   const agentNames = Object.keys(opts.subagents || {});
   const subagentToolNames = new Set<string>();
   for (const agent of Object.values(opts.subagents || {})) {
@@ -644,6 +744,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     const allowedBySubagentDefinition = Boolean(callOpts.agentID && subagentToolNames.has(toolName));
     if (templateToolNames.size > 0 && !templateToolNames.has(toolName) && !allowedBySubagentDefinition) {
       return { behavior: 'deny', message: `Tool '${toolName}' is not enabled by the agent template.` } as PermissionResult;
+    }
+    const blockedHostPath = hostPathToolBlock(toolName, input, cwd, additionalDirectories);
+    if (blockedHostPath) {
+      opts.emit({
+        type: 'permission_resolved',
+        toolName,
+        decision: 'deny',
+        reason: blockedHostPath,
+      });
+      return { behavior: 'deny', message: blockedHostPath } as PermissionResult;
     }
     // 1b. Knowledge sources are read-only. Block writes that target a knowledge
     //     directory *before* tenant policy, so this stays a hard, non-overridable
@@ -738,6 +848,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         maxTurns: Number(opts.maxTurns) || 20,
         thinking: { type: 'adaptive', display: 'summarized' },
         cwd,
+        settingSources: RUN_SETTING_SOURCES,
+        ...(SANDBOX_ENABLED ? {
+          sandbox: {
+            enabled: true,
+            failIfUnavailable: SANDBOX_FAIL_IF_UNAVAILABLE,
+            ...(SANDBOX_NETWORK_MANAGED_ONLY ? { network: { allowManagedDomainsOnly: true } } : {}),
+          },
+        } : {}),
         ...(additionalDirectories.length ? { additionalDirectories } : {}),
         ...(agentNames.length ? { agents: opts.subagents, forwardSubagentText: true, agentProgressSummaries: true } : {}),
         ...(opts.resumeSdkSessionId ? { resume: opts.resumeSdkSessionId } : {}),

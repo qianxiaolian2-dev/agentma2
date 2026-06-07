@@ -937,9 +937,9 @@ function readClaudeMdPreviewFile(source: ClaudeMdPreviewSource, label: string, f
 }
 
 function buildClaudeMdPreviewFiles(cwd: string) {
-  const userClaudeMd = path.join(expandLocalPath('~'), '.claude', 'CLAUDE.md');
+  // 运行时 settingSources=[project,local]（不含 user），且 HOME 被隔离到 cwd/.agent-home，
+  // 宿主 ~/.claude/CLAUDE.md 不会被加载，故预览也不再列出，保持预览与运行时一致。
   return [
-    readClaudeMdPreviewFile('user', '用户 CLAUDE.md', userClaudeMd),
     readClaudeMdPreviewFile('project', '项目根 CLAUDE.md', path.join(cwd, 'CLAUDE.md')),
     readClaudeMdPreviewFile('project', '项目 .claude/CLAUDE.md', path.join(cwd, '.claude', 'CLAUDE.md')),
     readClaudeMdPreviewFile('local', '本地 CLAUDE.local.md', path.join(cwd, 'CLAUDE.local.md')),
@@ -2210,13 +2210,13 @@ app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
       title: latestSession.title,
       updatedAt: latestSession.updatedAt,
     } : null,
-    settingSources: ['user', 'project', 'local'],
+    settingSources: ['project', 'local'],
     files,
     loadedFiles: files.filter((file) => file.exists && typeof file.content === 'string').map((file) => file.path),
     effectiveContent,
     generatedAt: Date.now(),
     notes: [
-      '运行时未显式传 settingSources，SDK 会按默认 user/project/local 加载文件系统说明。',
+      '运行时显式传 settingSources=[project,local]（不含 user），SDK 只从租户 workspace 的项目级/本地级配置加载文件系统说明，不读宿主 ~/.claude。',
       latestSession
         ? '预览使用该 Agent 最近一次可访问会话的 sdkCwd。'
         : '该 Agent 尚无带 sdkCwd 的会话；新会话会创建临时空 cwd，项目级 CLAUDE.md 通常不存在。',
