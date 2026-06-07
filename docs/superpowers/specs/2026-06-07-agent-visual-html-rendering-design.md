@@ -1,135 +1,67 @@
-# Agent 友好的 HTML 可视化渲染基元 — 设计文档
+# AI 原生 ChatBI 地基(一):可视化渲染 + 产物生命周期 — 设计文档
 
 - 日期:2026-06-07
-- 范围:dashboard 前端
+- 范围:dashboard 前端 + 后端 + 一个内置 skill/agent 模版
 - 状态:已确认设计,待写实现计划
 
-## 1. 背景与目标
+## 0. 北极星与本轮边界
 
-当前 agent 的输出在 `dashboard/src/components/ChatMessageBubble.tsx` 中以纯 markdown
-字符串渲染(`marked`),只能表达文本、列表、代码、图片。我们希望**拓展 agent 输出结果的展示能力**,
-让 agent 能产出富可视化内容(思维导图、图表、表格、流程图/时间线,以及任意交互小组件)。
+**北极星**:把 agent 输出展示能力做成 **AI 原生 ChatBI**——对话驱动 → 取数/分析 →
+可交互可视化 → 沉淀为可分享链接。
 
-### 设计取向(经讨论确定)
+**本轮只做地基第一块:可视化「渲染」与产物「生命周期」。**
+- 做:HTML 沙箱渲染基元、独立预览页、已保存产物持久化、生命周期提醒 A/B/C/D、
+  一个 agentma-visual skill、一个 viz-agent 模版、用会话实测。
+- **不做**:数据源接入(知识库/上传/外部 DB 取数)——留作后续迭代。
 
-- **不引入可视化库**(放弃 markmap/recharts/mermaid)。模型最擅长写 HTML/CSS/SVG,
-  让 agent **直接产出 HTML**,浏览器原生渲染,这才是真正的 "agent 友好",且表达力无上限。
-- 核心工程从 "集成多个渲染库 + 设计 JSON 协议" 转为 **"做一个安全的 HTML 渲染宿主(沙箱 iframe)"**。
-- **零新运行时依赖。**
+## 1. 核心取向(经讨论确定)
 
-### 本次范围(明确)
+- **不引入可视化库**。模型最擅长写 HTML/CSS/SVG/JS,让 agent **直接产出 HTML**,浏览器原生渲染。
+  **零新前端运行时依赖**(放弃 markmap/recharts/mermaid)。
+- **不内联进对话、不改 `ChatMessageBubble`**。可视化走**独立预览链接**:agent 在回复里给出一个
+  markdown 链接,现有 markdown 渲染器直接显示;点击打开独立预览页渲染。
+- **两种状态,各归各位**(关键简化,源于"没保存就别久存,代码/技能都在、重跑即可"):
+  - **未保存(临时)= 只活在 workspace 文件里**,随沙箱生命周期自然消失。**不进 DB、无任何平行 TTL 任务**。
+    没了就回对话重跑(便宜、本应如此)。
+  - **已保存 = 落 SQLite `visuals`**,稳定、永久、可分享。**持久库只装用户主动留下的东西**。
 
-只做**渲染基元层**:产出约定 + 解析器 + `VisualFrame` 沙箱宿主 + `ChatMessageBubble` 接入。
-**不**写任何 `SKILL.md`、**不**建可视化 agent 模版(留到以后)。但产出约定要被沉淀成一个可复用常量,
-作为将来做 skill 时直接可用的资产。
-
-### 非目标
-
-- 不做 skill 文件,不做 agent 模版。
-- 不改服务端输出管道(`server-agent.ts`):artifact 走现有文本流,无需新协议字段。
-- 不支持流式中途渲染可视化(见 §6)。
-- 不允许 iframe 联网加载外部资源(CSP 禁外联;若将来需要 CDN 库再单独评估)。
-
-## 2. 总体架构
+## 2. 端到端流程
 
 ```
-agent 文本流 ──► message.content (字符串, 内含 agentma-visual 围栏块)
-                      │  (仅在 message 完成后)
-                      ▼
-              parseSegments(content)
-                      │  有序切段
-        ┌─────────────┴──────────────┐
-        ▼                            ▼
-  {kind:'markdown'}            {kind:'visual', html}
-   marked → HTML                <VisualFrame html=.../>
-                                   sandbox iframe (null origin)
+用户在 /conversations 用 viz-agent(挂 agentma-visual skill)对话
+        │  客户端 body 带上 sessionId=activeSessionId(已在发送前 persist)
+        ▼ 服务端 /api/chat 把"预览基址 /viz?cid=<sessionId>&path=" 注入 agent 上下文
+        ▼ agent 按 skill 约定:
+        │  1) 用 Write 把可视化 HTML 写到  ./viz/<slug>.html
+        │  2) 回复里给链接 [📊 标题(临时预览,未保存重启/换天需回对话重跑)](/viz?cid=<sid>&path=viz/<slug>.html) (提醒A)
+        ▼
+用户点链接 → 独立预览页 /viz(AuthGuard 后)
+   ├─ 临时: ?cid&path → GET /api/visuals/file 解析 cid→sdkCwd 读 workspace 文件 → 渲染 + [保存](提醒B)
+   │        读不到(沙箱已清/重启/会话删) → 失效页"回对话重跑"(提醒C)
+   └─ 已保存: ?id → GET /api/visuals/:id 读 SQLite → 渲染
+[保存] = POST /api/visuals {cid,path} → 服务端读 workspace 文件存为 saved 行 → 跳 /viz?id=<新id>
+"我的可视化" /visuals 列表(提醒D)= 只列已保存,可打开/删除
 ```
 
-## 3. 产出约定(Agent 友好的协议)
+> 关于会话 id:`/api/chat`(`server.ts:1287`)当前不收会话 id,但客户端手里就有
+> `activeSessionId`(`Conversations.tsx:154/317`,发送前已 persist)。body 加一行 + 服务端读一行即可
+> ——非"一堆管道"。sdkCwd 在首次 run 完成后写入 `chat_sessions.sdk_cwd`,用户在消息完成后点链接时可解析。
 
-agent 在正常文本里输出一个带**专用语言标签**的围栏块。用专用标签 `agentma-visual`
-(而非裸 ```` ```html ````)以区分 "渲染这段" 与 "展示 HTML 源码":
+## 3. 渲染基元(前端,零新依赖)
 
-````markdown
-这是对比分析:
-
-```agentma-visual
-<div style="font-family:inherit">
-  <h3>季度营收</h3>
-  <svg width="100%" height="160">…</svg>
-</div>
-```
-
-如上所示……
-````
-
-约定要点:
-
-- 模型只需写**片段**(body 内容,可含 `<style>` / `<script>`),宿主自动包成完整文档并注入主题。
-- 也兼容模型直接写整篇 `<!DOCTYPE html>` / `<html>`(见 §5 检测逻辑)。
-- 一条消息里可有**多个** `agentma-visual` 块,与散文任意穿插,按出现顺序渲染。
-- 标签常量:`VISUAL_FENCE_TAG = 'agentma-visual'`。
-
-### 协议文档资产
-
-导出常量 `VISUAL_PROTOCOL_DOC: string`(协议说明 + 每类用法的简短示例:思维导图用嵌套列表/SVG、
-图表用内联 SVG 或 canvas+JS、表格用 `<table>`、流程图用 SVG)。这是留给**将来做 skill** 的现成资产
-——届时直接把这段塞进 `SKILL.md` 或系统提示即可,本次不创建 skill。
-
-## 4. 解析器 `dashboard/src/utils/visual-artifacts.ts`(纯函数,无 DOM 依赖)
+### 3.1 `dashboard/src/components/artifacts/composeSrcdoc.ts`(纯函数,可无 DOM 断言)
 
 ```ts
-export const VISUAL_FENCE_TAG = 'agentma-visual';
-
-export type Segment =
-  | { kind: 'markdown'; text: string }
-  | { kind: 'visual'; html: string };
-
-/** 把消息正文按出现顺序切成 markdown 段与 visual 段。
- *  仅识别**已闭合**的 ```agentma-visual ... ``` 块;未闭合的尾块留作 markdown。 */
-export function parseSegments(content: string): Segment[];
-
-export const VISUAL_PROTOCOL_DOC: string;
+export type VisualTheme = Record<string, string>; // CSS 变量名 -> 值,含 'font-family'
+export function composeSrcdoc(html: string, theme: VisualTheme): string;
 ```
-
-行为:
-
-- 用全局正则匹配 ```` ```agentma-visual\n …非贪婪… \n``` ````,提取块内 HTML;块之间/前后的文本作为 markdown 段。
-- **只有闭合块**才算 visual 段;尾部未闭合块(流式中常见)整体作为 markdown 段,避免半截 HTML。
-- 连续相邻的 markdown 文本合并为一个段;空 markdown 段丢弃。
-- 已知限制:若模型在 HTML 内写出独立成行的 ```` ``` ````,可能提前截断——在 `VISUAL_PROTOCOL_DOC`
-  中提示模型不要这样写;此为可接受风险。
-
-## 5. 宿主组件 `dashboard/src/components/artifacts/VisualFrame.tsx`(安全是核心)
-
-```ts
-type VisualFrameProps = { html: string };
-```
-
-### 5.1 沙箱与隔离(关键安全约束)
-
-- `<iframe sandbox="allow-scripts" srcdoc={composed} />`
-- **只给 `allow-scripts`,绝不给 `allow-same-origin`** → iframe 处于 null origin,
-  碰不到父页 DOM / cookie / localStorage / 后端会话。
-- 不给 `allow-forms` / `allow-popups` / `allow-top-navigation` / `allow-modals`。
-- `referrerpolicy="no-referrer"`。
-
-### 5.2 srcdoc 组装(`composeSrcdoc(html, theme)`,纯函数)
-
-`VisualFrame` 负责从父页 `document.documentElement` 读取 CSS 变量,组成 `theme` 对象;
-实际拼装由纯函数 `composeSrcdoc(html, theme)` 完成(无 DOM 依赖,便于断言测试)。
-`composed` 按顺序拼:
-
+按顺序拼成完整文档:
 1. `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src data:;">`
-   —— 禁外联(无 CDN/无追踪);允许内联 style/script(模型交互所需);允许 data: 图片/字体。
-   因 iframe 已是 null-origin 沙箱,`'unsafe-inline'` 风险可接受。
-2. **主题基样式**:把 `theme`(由 VisualFrame 从父页读取的 `--bg` / `--ink` / `--accent`
-   / `font-family` 等 dashboard 设计变量)注入为 iframe 内 `:root` 变量 + 基础 reset
-   (`margin:0; color:var(--ink); background:transparent; font-family:…`),使可视化继承深色/浅色主题。
-3. **模型 HTML**:
-   - 若 `html` 去空白后以 `<!doctype` 或含 `<html` 开头 → 视为整篇文档,
-     把主题样式与高度脚本注入到 `</head>`(无则 `<body>` 前)。
-   - 否则 → 作为片段包进 `<!DOCTYPE html><html><head>…</head><body>{html}</body></html>`。
+   —— 禁外联;允许内联 style/script(交互所需)、`data:` 图片/字体。null-origin 沙箱下 `'unsafe-inline'` 风险可接受。
+2. **主题基样式**:把 `theme`(dashboard 设计变量 `--bg/--ink/--ink-secondary/--border/--accent/--bg-hover`
+   及 `font-family`,实现时对 `App.css` 核定)注入 iframe 内 `:root` + 基础 reset
+   (`margin:0; color:var(--ink); background:transparent; font-family:…`)。
+3. **模型 HTML**:以 `<!doctype`/`<html` 开头视为整篇(把样式/高度脚本注入 `</head>`);否则作片段包进 `<body>`。
 4. **自适应高度脚本**(内联):
    ```html
    <script>
@@ -139,69 +71,108 @@ type VisualFrameProps = { html: string };
    </script>
    ```
 
-### 5.3 父页高度联动
+### 3.2 `dashboard/src/components/artifacts/VisualFrame.tsx`
+```ts
+type VisualFrameProps = { html: string };
+```
+- 从 `document.documentElement` 读 CSS 变量组 `theme`,调 `composeSrcdoc`。
+- `<iframe sandbox="allow-scripts" srcdoc={composed} referrerpolicy="no-referrer" />`
+  —— **只给 `allow-scripts`,绝不给 `allow-same-origin`**(null origin,碰不到父页 DOM/cookie/会话);
+  不给 `allow-forms/popups/top-navigation/modals`。
+- `message` 监听:**校验 `e.source === iframeRef.current?.contentWindow` 且 `e.data?.__agentmaVisual`**
+  (source 身份校验,不依赖 origin),取高度 clamp 24–4000px。
+- 失败兜底:错误边界 → 降级显示原始 HTML 源码 `<pre>` + "无法渲染",不崩页面。
 
-- `useEffect` 监听 `window` 的 `message`:
-  - 校验 `e.source === iframeRef.current?.contentWindow` 且 `e.data?.__agentmaVisual`(**用 source 身份校验,不依赖 origin**,因 null-origin 的 `e.origin === 'null'`)。
-  - 取 `e.data.h`,clamp 到合理范围(如 24–4000px),设为 iframe 高度。
-- iframe 初始高度给一个占位(如 120px),收到消息后更新。
+## 4. 后端
 
-### 5.4 状态与降级
+### 4.1 SQLite `visuals` 表(`server-store.ts`,只存已保存)
 
-- 渲染中:占位骨架/loading。
-- 失败兜底:`VisualFrame` 外包一层错误边界;任何异常 → 降级显示原始 HTML 源码于 `<pre>`,
-  并附小字 "无法渲染此可视化"。**绝不拖垮整条消息。**
+| 字段 | 说明 |
+|---|---|
+| `id` TEXT PK | 保存时服务端生成(随机,不可猜) |
+| `tenant_id`/`owner_sub` | 取自 `req.auth`,访问按此隔离 |
+| `title` | 服务端从 HTML `<title>`/首个 `<h1>` 提取,缺省用 slug |
+| `html` | 文档(TEXT) |
+| `size_bytes` | 受 `MAX_VISUAL_BYTES`(~2–4MB,仿 `MAX_SKILL_MD_BYTES` 风格)上限约束 |
+| `created_at` | 创建时间 |
+| `source_slug` | 来源 workspace 文件名(诊断用) |
 
-## 6. 接入 `dashboard/src/components/ChatMessageBubble.tsx`
+函数:`createVisual` / `getVisual` / `listVisuals` / `deleteVisual`。**无 temp 行、无 TTL 清理任务。**
 
-- 现状:`useMarkdown = isComplete` 时对整段 `message.content` 调 `marked` 后
-  `dangerouslySetInnerHTML`。
-- 改为:`isComplete` 时先 `parseSegments(message.content)`,**按段有序渲染**:
-  - `markdown` 段:`marked.parse` → `dangerouslySetInnerHTML`(沿用现有 `chat-markdown` 类)。
-  - `visual` 段:`<VisualFrame html={seg.html} />`。
-- 流式 / 非完成态:维持现有纯文本/流式行为,**不**解析可视化(避免半截 HTML)。
-- 复制按钮(`CopyButton`)仍复制原始 `message.content`(含围栏),不受影响。
+### 4.2 端点(`server.ts`,均 `authMiddleware`,tenant/owner 隔离)
+- `GET /api/visuals/file?cid=&path=` → 解析 cid→session→`sdk_cwd`(tenant/owner 校验),
+  安全读 `<cwd>/<path>`(`path` 限定在 `viz/` 下、`isPathInside` 防越界)→ `{ html, exists, mtimeMs }`。
+  复用 `server.ts:491` 处"由 session 解析 sdkCwd"的既有模式。
+- `POST /api/visuals` body `{cid, path, title?}` → 服务端按上法读 workspace 文件 → `createVisual`(saved)→ `{id}`。
+- `GET /api/visuals/:id` → `{ html, title, createdAt }`;不存在 → 404(失效页据此)。
+- `GET /api/visuals` → 已保存列表(提醒 D)。
+- `DELETE /api/visuals/:id`。
+- **改 `/api/chat`**:读 `req.body.sessionId`;若有,则把一行"可视化预览基址:`/viz?cid=<sessionId>&path=`(把写到 `./viz/<slug>.html` 的文件按此拼成链接给用户)"注入 `effectiveSystemPrompt`。**不做任何 run 后扫描。**
 
-## 7. 组件边界小结
+## 5. 预览页与列表页(前端路由)
 
-| 单元 | 职责 | 依赖 | 可独立测试 |
-|---|---|---|---|
-| `visual-artifacts.ts` | 切段 + 协议文档常量 | 无(纯函数) | 是(node 脚本) |
-| `VisualFrame.tsx` | 安全沙箱渲染 + 主题注入 + 高度联动 | React、父页 CSS 变量 | 是(断言 sandbox/srcdoc) |
-| `ChatMessageBubble.tsx` | 按段编排 markdown 与 visual | 上面两者、marked | 现有渲染路径 |
+### 5.1 `dashboard/src/pages/VizPreview.tsx` — 路由 `/viz`(AuthGuard 后,单页处理两种来源)
+- `?id` → `GET /api/visuals/:id`;`?cid&path` → `GET /api/visuals/file`。→ `<VisualFrame html>` 整页渲染。
+- **状态横幅(提醒 B)**:`临时`/`已保存` 徽章。临时时显示 [保存] 按钮(`POST /api/visuals` → 成功后
+  `replace` 到 `/viz?id=<新id>`,徽章转 `已保存`)。不做精确倒计时(临时寿命=沙箱)。
+- **失效页(提醒 C)**:file 读不到 / :id 404 → 友好说明"此临时可视化已失效(沙箱已清理/重启/会话删除);
+  代码与技能都在,回对话重跑即可"+ 返回对话指引,而非裸 404。
 
-## 8. 测试策略(尊重 "少引入模块")
+### 5.2 `dashboard/src/pages/Visuals.tsx` — 路由 `/visuals`(提醒 D)
+- `GET /api/visuals` 列出**已保存**项:标题、创建时间;行内 [打开]/[删除]。侧栏(`Sidebar.tsx`)加入口"我的可视化"。
 
-当前仓库**无测试框架**,既有模式是 `dashboard/scripts/smoke-*.mjs` 的 node 脚本。
+### 5.3 路由注册:`App.tsx` 加 `/viz`、`/visuals`。**`ChatMessageBubble.tsx` 不改。**
 
-- **解析器**:新增 `dashboard/scripts/smoke-visual-artifacts.mjs`(沿用既有 smoke 风格),
-  覆盖:单块抽取 / 多块穿插 / 流式未闭合尾块作 markdown / 无块 / 块内含特殊字符。
-- **VisualFrame 安全回归**(关键):一个轻量断言——校验生成的 iframe `sandbox` 属性
-  **不含 `allow-same-origin`** 且含 `allow-scripts`;`srcdoc` 含注入主题与模型 HTML、含 CSP meta。
-  可先做成纯函数 `composeSrcdoc(html, theme)` 便于无 DOM 断言;`VisualFrame` 只负责把它塞进 iframe。
-- **手动验证**:在 AgentChat 里贴一条含 `agentma-visual` 块的消息,确认渲染、深色主题继承、
-  自适应高度、源码降级。
-- 可选:若日后引入 vitest + jsdom,可补 `VisualFrame` 组件级测试;本次不引入。
+## 6. Skill 与 Agent 模版
 
-## 9. 文件清单
+### 6.1 skill:`agentma-visual`(`~/.claude/skills/agentma-visual/SKILL.md`,无需脚本)
+- **何时用**:输出图表/对比/层级/流程/统计等结构化信息时,优先产出可视化。
+- **怎么做**:① 选 `slug`(kebab);② `Write` 写 HTML 到 `./viz/<slug>.html`;
+  ③ 回复给链接 `[📊 <标题>(临时预览,未保存重启/换天需回对话重跑;预览页可点「保存」长期保留)](<预览基址>viz/<slug>.html)`(提醒 A)——预览基址由服务端注入。
+- **HTML 编写约定**(即 `VISUAL_PROTOCOL_DOC` 内容,内嵌 SKILL.md):CSP 禁外联 → 只用内联 style/SVG/inline JS、`data:` 图片;
+  用提供的 CSS 变量继承主题;不引 CDN/外链;含 `<title>` 便于服务端提取标题。
 
+### 6.2 viz-agent 模版(仿 `wiki-agent`,见 `Knowledge.tsx:517`)
+- `id:'viz-agent'`,`skills:['agentma-visual']`,systemPrompt 说明"你是可视化助手,善用 agentma-visual skill
+  把内容做成可视化并给出预览链接"。作为**默认模版**种子化(供各租户可见);本轮不建专用触发页,直接在
+  `/conversations` 选它对话。将来任何页面可仿 wiki `navigate('/conversations?agent=viz-agent&draft=…')` 拉起——统一 `AgentTemplate` 接口。
+
+## 7. 文件清单
 新增:
-- `dashboard/src/utils/visual-artifacts.ts`
+- `dashboard/src/components/artifacts/composeSrcdoc.ts`
 - `dashboard/src/components/artifacts/VisualFrame.tsx`
-- `dashboard/src/components/artifacts/composeSrcdoc.ts`(纯函数,被 VisualFrame 调用,便于测试)
-- `dashboard/scripts/smoke-visual-artifacts.mjs`
+- `dashboard/src/pages/VizPreview.tsx`
+- `dashboard/src/pages/Visuals.tsx`
+- `dashboard/scripts/smoke-visuals.mjs`
+- `~/.claude/skills/agentma-visual/SKILL.md`(+ 可选 `dashboard/src/utils/visual-protocol.ts` 共享文案常量)
 
 修改:
-- `dashboard/src/components/ChatMessageBubble.tsx`
+- `dashboard/server-store.ts`(visuals 表 + 函数)
+- `dashboard/server.ts`(端点 + `/api/chat` 注入预览基址)
+- `dashboard/src/pages/Conversations.tsx`(body 加 `sessionId: activeSessionId`)
+- `dashboard/src/App.tsx`(路由)、`dashboard/src/components/Sidebar.tsx`(入口)
+- viz-agent 默认模版种子(位置实现时定)
 
-依赖变更:**无。**
+依赖变更:**无前端运行时新依赖。**
 
-## 10. 风险与缓解
+## 8. 测试与验证(沿用 `scripts/smoke-*.mjs`,不引测试框架)
+- `smoke-visuals.mjs`:`composeSrcdoc` 含 CSP/主题/高度脚本、片段与整篇两种输入;visuals 表 CRUD。
+- **安全回归(关键)**:断言 `VisualFrame` iframe `sandbox` **含 `allow-scripts` 且不含 `allow-same-origin`**;
+  `composeSrcdoc` 输出含 CSP meta。
+- **手动端到端**:viz-agent 开会话 → 让它做一张图 → 点临时链接看预览/主题/高度自适应 → [保存] →
+  `/visuals` 列表查到 → 用 `/viz?id=` 打开 → 删除 → 验证失效页(关掉会话/改 cwd 后点临时链接)。
 
+## 9. 风险与缓解
 | 风险 | 缓解 |
 |---|---|
-| 渲染模型生成 HTML 的 XSS | 沙箱 iframe,无 `allow-same-origin`,null origin;CSP 禁外联;安全回归测试断言 |
-| 模型 HTML 内出现 ``` 截断解析 | 协议文档提示;可接受风险 |
-| iframe 高度抖动/超长 | 高度 clamp;ResizeObserver 去抖(实现时按需) |
-| 主题不一致(深色) | 从父页读 CSS 变量注入 iframe `:root` |
-| 流式半截 HTML | 仅 `isComplete` 后渲染;未闭合块作 markdown |
+| 渲染模型 HTML 的 XSS | 沙箱 iframe 无 `allow-same-origin`(null origin)+ CSP 禁外联 + 安全回归断言 |
+| 读 workspace 文件越权/穿越 | cid→session 按 tenant/owner 校验;`path` 限定 `viz/` + `isPathInside` 防越界 |
+| 大 HTML 撑爆 DB | 仅"保存"时入库,受 `MAX_VISUAL_BYTES` 上限;超限拒绝并提示精简 |
+| 临时产物失效让用户困惑 | 提醒 A/B/C/D:产出即告知、预览页可保存、失效页指引重跑、列表页管已保存 |
+| 已保存链接"可分享" | 本轮按 tenant 鉴权可见;真正公开(免登录)链接留作后续 |
+
+## 10. 非目标
+- 不做数据源/取数连接器(下一块地基)。
+- 不在对话内联渲染、不改 `ChatMessageBubble`。
+- 不为临时产物建 DB 或 TTL 任务(沙箱生命周期即其寿命)。
+- 不做公开免登录分享链接;不引前端可视化库或测试框架。
