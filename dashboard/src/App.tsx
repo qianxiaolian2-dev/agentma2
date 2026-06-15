@@ -13,9 +13,12 @@ import Tools from './pages/Tools';
 import Knowledge from './pages/Knowledge';
 import Hooks from './pages/Hooks';
 import Skills from './pages/Skills';
+import VizPreview from './pages/VizPreview';
+import Visuals from './pages/Visuals';
 import Subagents from './pages/Subagents';
 import Permissions from './pages/Permissions';
 import Observability from './pages/Observability';
+import CrawlerOps from './pages/CrawlerOps';
 import Settings from './pages/Settings';
 import Account from './pages/Account';
 
@@ -36,11 +39,14 @@ export default function App() {
                 <Route path="/sessions" element={<Sessions />} />
                 <Route path="/tools" element={<Tools />} />
                 <Route path="/knowledge" element={<Knowledge />} />
+                <Route path="/viz" element={<VizPreview />} />
+                <Route path="/visuals" element={<Visuals />} />
                 <Route path="/skills" element={<Skills />} />
                 <Route path="/hooks" element={<Hooks />} />
                 <Route path="/subagents" element={<Subagents />} />
                 <Route path="/permissions" element={<Permissions />} />
                 <Route path="/observability" element={<Observability />} />
+                <Route path="/crawler" element={<CrawlerOps />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="/account" element={<Account />} />
               </Routes>

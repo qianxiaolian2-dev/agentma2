@@ -34,7 +34,12 @@ function PermissionPromptCard({ req, onResolved }: {
       });
       if (!r.ok) {
         const e = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-        setErr(e.error || `HTTP ${r.status}`);
+        const message = e.error || `HTTP ${r.status}`;
+        if (r.status === 404 && /unknown reqId|not found/i.test(message)) {
+          onResolved(req.reqId);
+          return;
+        }
+        setErr(message);
         setBusy(false);
         return;
       }
@@ -96,10 +101,13 @@ export function PermissionPromptList({ pending, onResolved }: {
   pending: PermissionRequest[];
   onResolved: (reqId: string) => void;
 }) {
-  if (!pending.length) return null;
+  const visible = Array.from(
+    new Map(pending.filter(req => req.reqId).map(req => [req.reqId, req])).values(),
+  );
+  if (!visible.length) return null;
   return (
     <div className="mb-4">
-      {pending.map(req => (
+      {visible.map(req => (
         <PermissionPromptCard key={req.reqId} req={req} onResolved={onResolved} />
       ))}
     </div>

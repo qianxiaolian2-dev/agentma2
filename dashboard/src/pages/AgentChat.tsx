@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { ClipboardEvent } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import type { AgentTemplate, ChatAttachment, ChatMessage, ChatSession, ProviderConfig, ChatImageMimeType } from '../simulator/types';
@@ -18,9 +18,21 @@ import {
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
-import { loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
+import { findPendingRunMessage, observeServerRun } from '../utils/chat-run-events';
+import { fetchProviderModels, listProviderModels, loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
+import ChatModelPicker from '../components/ChatModelPicker';
+import {
+  deriveRunPhase,
+  isWaitingPhase,
+  mapResultSubtypeToOutcome,
+  normalizeRunOutcome,
+  phaseBadgeClass,
+  phaseLabel,
+  type RunPhase,
+  type RunOutcome,
+} from '../simulator/run-state';
 import {
   CHAT_FILE_ACCEPT,
   CHAT_FILE_MAX_COUNT,
@@ -29,6 +41,7 @@ import {
   fileToChatAttachment,
   formatAttachmentBytes,
   getChatImageSrc,
+  uniqueChatImageFiles,
 } from '../utils/chat-attachments-ui';
 
 async function readChatError(response: Response) {
@@ -42,6 +55,22 @@ async function readChatError(response: Response) {
   }
 }
 
+function canResumeChatSession(session: ChatSession | null | undefined) {
+  return Boolean(session?.sdkSessionId);
+}
+
+const SCROLL_BOTTOM_THRESHOLD = 80;
+
+function isTextEntryElement(element: Element | null) {
+  if (!(element instanceof HTMLElement)) return false;
+  if (element.isContentEditable) return true;
+  const tagName = element.tagName.toLowerCase();
+  if (tagName === 'textarea' || tagName === 'select') return true;
+  if (tagName !== 'input') return false;
+  const type = ((element as HTMLInputElement).type || 'text').toLowerCase();
+  return !['button', 'checkbox', 'color', 'file', 'radio', 'range', 'reset', 'submit'].includes(type);
+}
+
 export default function AgentChat() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -52,6 +81,7 @@ export default function AgentChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [runPhase, setRunPhase] = useState<RunPhase>('idle');
   const [sessionId, setSessionId] = useState<string>('');
   const [sessionMeta, setSessionMeta] = useState<ChatSession | null>(null);
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
@@ -63,12 +93,72 @@ export default function AgentChat() {
   const [attachmentError, setAttachmentError] = useState('');
   const [collaborationError, setCollaborationError] = useState('');
   const [copyStatus, setCopyStatus] = useState('');
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
+  const [modelOptions, setModelOptions] = useState<string[]>(() => listProviderModels());
+  const [selectedModelOverride, setSelectedModelOverride] = useState<{ contextKey: string; model: string } | null>(null);
+  const [, setActiveRunId] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isInputComposingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const observingRunIdRef = useRef('');
   const provider = useRef<ProviderConfig>(resolveProviderForModel().provider);
+  const modelContextKey = `${id || ''}:${sessionId || resumeSessionId || 'new'}`;
+  const selectedModel = selectedModelOverride?.contextKey === modelContextKey ? selectedModelOverride.model : '';
+  const pendingRunMessage = useMemo(() => findPendingRunMessage(messages), [messages]);
+  const focusChatInput = useCallback(() => {
+    requestAnimationFrame(() => {
+      if (!textareaRef.current || textareaRef.current.disabled) return;
+      textareaRef.current.focus();
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!user?.tenantId) return;
+    let cancelled = false;
+    void fetchProviderModels()
+      .then((models) => {
+        if (!cancelled && models.length) setModelOptions(models);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [user?.tenantId]);
+
+  useEffect(() => {
+    if (isStreaming || pendingPermissions.length > 0 || pendingQuestions.length > 0) return;
+    focusChatInput();
+  }, [isStreaming, pendingPermissions.length, pendingQuestions.length, template, focusChatInput]);
+
+  useEffect(() => {
+    if (isStreaming || pendingPermissions.length > 0 || pendingQuestions.length > 0) return;
+    const handleTypingIntent = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key.length !== 1) return;
+      if (isTextEntryElement(document.activeElement)) return;
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+
+      const textarea = textareaRef.current;
+      if (!textarea || textarea.disabled) return;
+      event.preventDefault();
+      const start = textarea.selectionStart ?? input.length;
+      const end = textarea.selectionEnd ?? input.length;
+      const nextInput = input.slice(0, start) + event.key + input.slice(end);
+      const nextCursor = start + event.key.length;
+      setInput(nextInput);
+      requestAnimationFrame(() => {
+        textarea.focus();
+        textarea.setSelectionRange(nextCursor, nextCursor);
+        textarea.style.height = 'auto';
+        textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+      });
+    };
+    window.addEventListener('keydown', handleTypingIntent);
+    return () => window.removeEventListener('keydown', handleTypingIntent);
+  }, [input, isStreaming, pendingPermissions.length, pendingQuestions.length]);
 
   // 加载模板 + 恢复会话
   useEffect(() => {
@@ -104,9 +194,12 @@ export default function AgentChat() {
         if (cancelled) return;
 
         if (existingSession) {
-          setSessionId(existingSession.id);
-          setSessionMeta(existingSession);
-          setMessages(existingSession.messages);
+          const fullSession = await getChatSession(existingSession.id);
+          if (cancelled) return;
+          const hydratedSession = fullSession || existingSession;
+          setSessionId(hydratedSession.id);
+          setSessionMeta(hydratedSession);
+          setMessages(hydratedSession.messages);
           return;
         }
 
@@ -121,19 +214,26 @@ export default function AgentChat() {
     return () => { cancelled = true; };
   }, [id, navigate, resumeSessionId, user?.tenantId, user?.role]);
 
-  const persistSession = useCallback(async (nextMessages: ChatMessage[], sdkSessionId?: string, sdkCwd?: string) => {
+  const persistSession = useCallback(async (
+    nextMessages: ChatMessage[],
+    sdkSessionId?: string,
+    sdkCwd?: string,
+    preferredSessionId?: string,
+  ) => {
     if (!template || !id || nextMessages.length === 0) return '';
 
     const now = Date.now();
-    const nextId = sessionId || `chat-${id}-${now}`;
+    const nextId = sessionId || preferredSessionId || `chat-${id}-${now}`;
+    const effectiveModel = selectedModel || sessionMeta?.model || template.model || '';
+    const canReuseCurrentSdkSession = canResumeChatSession(sessionMeta);
     const draft: ChatSession = {
       id: nextId,
       templateId: id,
       title: createChatSessionTitle(nextMessages, sessionMeta?.title),
       messages: nextMessages,
-      model: template.model || sessionMeta?.model || '',
-      sdkSessionId: sdkSessionId || sessionMeta?.sdkSessionId,
-      sdkCwd: sdkCwd || sessionMeta?.sdkCwd,
+      model: effectiveModel,
+      sdkSessionId: canReuseCurrentSdkSession ? sessionMeta?.sdkSessionId : sdkSessionId,
+      sdkCwd: (canReuseCurrentSdkSession ? sessionMeta?.sdkCwd : undefined) || sdkCwd,
       forkedFromSessionId: sessionMeta?.forkedFromSessionId,
       forkedFromTitle: sessionMeta?.forkedFromTitle,
       pinned: sessionMeta?.pinned,
@@ -157,7 +257,7 @@ export default function AgentChat() {
       console.error('failed to persist chat session', error);
       return nextId;
     }
-  }, [template, id, sessionId, sessionMeta]);
+  }, [template, id, sessionId, sessionMeta, selectedModel]);
 
   const refreshSession = useCallback(async (targetSessionId: string) => {
     const refreshed = await getChatSession(targetSessionId);
@@ -175,6 +275,50 @@ export default function AgentChat() {
     }
     return refreshed;
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || !pendingRunMessage?.id || !pendingRunMessage.runId) {
+      observingRunIdRef.current = '';
+      return;
+    }
+    if (isStreaming || abortRef.current) return;
+    if (observingRunIdRef.current === pendingRunMessage.runId) return;
+    observingRunIdRef.current = pendingRunMessage.runId;
+    const controller = new AbortController();
+    const baseMessages = messages;
+    setPendingPermissions([]);
+    setPendingQuestions([]);
+    setAgentTasks([]);
+    setStructuredOutput(null);
+    setRunStats(null);
+    void observeServerRun({
+      runId: pendingRunMessage.runId,
+      sessionId,
+      baseMessages,
+      draftId: pendingRunMessage.id,
+      assistantTimestamp: pendingRunMessage.timestamp,
+      initialThinking: pendingRunMessage.thinking,
+      initialText: pendingRunMessage.content,
+      onMessages: setMessages,
+      persistFinal: async (nextMessages, sdkSessionId, sdkCwd) => {
+        await persistSession(nextMessages, sdkSessionId, sdkCwd, sessionId);
+      },
+      setIsStreaming,
+      setRunPhase,
+      setActiveRunId,
+      setPendingPermissions,
+      setPendingQuestions,
+      setAgentTasks,
+      setStructuredOutput,
+      setRunStats,
+      abortRef,
+      signal: controller.signal,
+    });
+    return () => {
+      controller.abort();
+      observingRunIdRef.current = '';
+    };
+  }, [sessionId, pendingRunMessage?.id, pendingRunMessage?.runId, persistSession]);
 
   useEffect(() => {
     if (!sessionId || !sessionMeta?.collaborationEnabled) return;
@@ -220,12 +364,34 @@ export default function AgentChat() {
     }
   };
 
+  const updateScrollBottomVisibility = useCallback(() => {
+    const el = messagesRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const canScroll = el.scrollHeight > el.clientHeight + 1;
+    const shouldShow = canScroll && distanceFromBottom > SCROLL_BOTTOM_THRESHOLD;
+    shouldAutoScrollRef.current = !shouldShow;
+    setShowScrollBottom(current => (current === shouldShow ? current : shouldShow));
+  }, []);
+
   useEffect(() => {
     const el = messagesRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
-    if (nearBottom || isStreaming) el.scrollTop = el.scrollHeight;
-  }, [messages, agentTasks, isStreaming]);
+    if (shouldAutoScrollRef.current) {
+      el.scrollTop = el.scrollHeight;
+      setShowScrollBottom(false);
+    } else {
+      updateScrollBottomVisibility();
+    }
+  }, [messages, agentTasks, isStreaming, updateScrollBottomVisibility]);
+
+  const scrollToBottom = () => {
+    const el = messagesRef.current;
+    if (!el) return;
+    shouldAutoScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    setShowScrollBottom(false);
+  };
 
   const handleFilePicked = useCallback(async (fileList: FileList | null) => {
     const files = Array.from(fileList || []);
@@ -261,10 +427,10 @@ export default function AgentChat() {
 
   const handlePaste = useCallback(async (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(event.clipboardData?.items || []);
-    const files = items
+    const files = uniqueChatImageFiles(items
       .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
       .map(item => item.getAsFile())
-      .filter((file): file is File => Boolean(file));
+      .filter((file): file is File => Boolean(file)));
     if (!files.length) return;
     event.preventDefault();
     setAttachmentError('');
@@ -295,7 +461,8 @@ export default function AgentChat() {
     const content = input.trim();
     const messageAttachments = attachments;
     if ((!content && messageAttachments.length === 0) || isStreaming || !template) return;
-    provider.current = resolveProviderForModel(template.model).provider;
+    const effectiveModel = selectedModel || sessionMeta?.model || template.model || '';
+    provider.current = resolveProviderForModel(effectiveModel).provider;
 
     const userMsg: ChatMessage = {
       role: 'user',
@@ -306,31 +473,68 @@ export default function AgentChat() {
     const newMessages = [...messages, userMsg];
     const assistantTimestamp = Date.now();
     const draftId = crypto.randomUUID();
-    setMessages(appendAssistantDraft(newMessages, draftId, assistantTimestamp));
+    const draftMessages = appendAssistantDraft(newMessages, draftId, assistantTimestamp);
+    shouldAutoScrollRef.current = true;
+    setShowScrollBottom(false);
+    setMessages(draftMessages);
+    requestAnimationFrame(() => {
+      const el = messagesRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setAttachmentError('');
     setIsStreaming(true);
+    setRunPhase('initializing');
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
     setRunStats(null);
 
+    const requestSessionId = sessionId || `chat-${id || template.id}-${Date.now()}`;
+    await persistSession(draftMessages, undefined, undefined, requestSessionId);
     let thinking = '';
     let text = '';
+    let runIdForDraft = '';
     let didFinalize = false;
+    let receivedOutcome: RunOutcome | null = null;
+    let outcomeDetail: string | undefined;
+    let cachedErrorMessage = '';
+    const phaseFlags = {
+      initializing: true,
+      streaming: false,
+      thinking: false,
+      toolExecuting: false,
+      awaitingPermission: false,
+      awaitingInput: false,
+      finalizing: false,
+    };
+    let pendingPermissionCount = 0;
+    let pendingQuestionCount = 0;
+    const updateRunPhase = (patch: Partial<typeof phaseFlags>) => {
+      Object.assign(phaseFlags, patch);
+      setRunPhase(deriveRunPhase(phaseFlags));
+    };
+    const finishRun = () => {
+      abortRef.current = null;
+      setIsStreaming(false);
+      setRunPhase('idle');
+      setActiveRunId('');
+    };
     const persistFinalMessage = async (
       content: string,
-      status: NonNullable<ChatMessage['status']>,
+      outcome: RunOutcome,
       sdkSessionId?: string,
       sdkCwd?: string,
+      detail?: string,
     ) => {
       if (didFinalize) return;
       didFinalize = true;
-      const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, content, status, thinking || undefined);
+      updateRunPhase({ finalizing: true, initializing: false, streaming: false, thinking: false, toolExecuting: false });
+      const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, content, outcome, thinking || undefined, detail, runIdForDraft || undefined);
       setMessages(finalMessages);
-      await persistSession(finalMessages, sdkSessionId, sdkCwd);
+      await persistSession(finalMessages, sdkSessionId, sdkCwd, requestSessionId);
     };
 
     const controller = new AbortController();
@@ -339,51 +543,73 @@ export default function AgentChat() {
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
-        signal: controller.signal,
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
+          assistantDraftId: draftId,
+          assistantTimestamp,
+          title: createChatSessionTitle(newMessages, sessionMeta?.title),
           messages: newMessages.map((m, index) => ({
             role: m.role,
             content: m.content,
             attachments: index === newMessages.length - 1 ? m.attachments : undefined,
+            timestamp: m.timestamp,
+            id: m.id,
+            status: m.status,
+            thinking: m.thinking,
+            outcome: m.outcome,
+            outcomeDetail: m.outcomeDetail,
           })),
           systemPrompt: template.systemPrompt || undefined,
-          model: template.model,
+          model: effectiveModel,
           provider: provider.current,
           providerProfiles: loadProviderProfiles(),
+          templateId: template.id,
+          sessionId: requestSessionId,
           tools: buildRequestToolsForAgent(template),
+          mcpServers: template.mcpServers || [],
           subagents: template.subagents,
           skills: template.skills || [],
           enableFileCheckpointing: template.enableFileCheckpointing || undefined,
           useKnowledge: template.useKnowledge || undefined,
           knowledgeSourceIds: template.knowledgeSourceIds || [],
           outputSchema: template.outputSchema || undefined,
-          sdkSessionId: sessionMeta?.sdkSessionId,
-          sdkCwd: sessionMeta?.sdkCwd,
+          sdkSessionId: canResumeChatSession(sessionMeta) ? sessionMeta?.sdkSessionId : undefined,
+          sdkCwd: canResumeChatSession(sessionMeta) ? sessionMeta?.sdkCwd : undefined,
+          forkedFromSessionId: sessionMeta?.forkedFromSessionId,
+          forkedFromTitle: sessionMeta?.forkedFromTitle,
+          pinned: sessionMeta?.pinned,
+          ownerSub: sessionMeta?.ownerSub,
+          collaborationEnabled: sessionMeta?.collaborationEnabled,
+          collaborationRole: sessionMeta?.collaborationRole,
+          collaborationUpdatedAt: sessionMeta?.collaborationUpdatedAt,
+          createdAt: sessionMeta?.createdAt,
         }),
       });
 
       if (!res.ok) {
-        await persistFinalMessage(await readChatError(res), 'error');
-        setIsStreaming(false);
+        const errorText = await readChatError(res);
+        await persistFinalMessage(errorText, 'rejected', undefined, undefined, errorText);
+        finishRun();
         return;
       }
 
       const reader = res.body?.getReader();
       if (!reader) {
-        await persistFinalMessage('连接失败: 响应体为空', 'error');
-        setIsStreaming(false);
+        await persistFinalMessage('连接失败: 响应体为空', 'provider_error', undefined, undefined, 'empty response body');
+        finishRun();
         return;
       }
 
       const decoder = new TextDecoder();
       let buf = '';
+      let subscribedReader = reader;
+      let subscribedDecoder = decoder;
 
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await subscribedReader.read();
         if (done) break;
 
-        buf += decoder.decode(value, { stream: true });
+        buf += subscribedDecoder.decode(value, { stream: true });
         const lines = buf.split('\n');
         buf = lines.pop() || '';
 
@@ -392,57 +618,97 @@ export default function AgentChat() {
           const json = line.slice(6);
           try {
             const data = JSON.parse(json);
-            if (data.type === 'delta') {
+            if (data.type === 'run_started') {
+              const runId = typeof data.runId === 'string' ? data.runId : '';
+              if (runId) {
+                runIdForDraft = runId;
+                setActiveRunId(runId);
+                setMessages(prev => updateAssistantDraft(prev, draftId, { runId }));
+                controller.signal.addEventListener('abort', () => {
+                  fetch(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                  }).catch(() => undefined);
+                }, { once: true });
+              }
+            } else if (data.type === 'system' && data.subtype === 'init') {
+              updateRunPhase({ initializing: true });
+            } else if (data.type === 'delta') {
               if (data.thinking) {
                 thinking += data.text || '';
                 setMessages(prev => updateAssistantDraft(prev, draftId, { thinking, status: 'streaming' }));
+                updateRunPhase({ initializing: false, thinking: true, streaming: false, toolExecuting: false });
               } else {
                 text += data.text || '';
                 setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
+                updateRunPhase({ initializing: false, thinking: false, streaming: true, toolExecuting: false });
               }
             } else if (data.type === 'result') {
+              const finalOutcome = receivedOutcome || mapResultSubtypeToOutcome(data.subtype);
+              const finalDetail = outcomeDetail || (typeof data.subtype === 'string' ? data.subtype : undefined);
               const finalContent = text || data.text || '';
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              await persistFinalMessage(finalContent, 'complete', data.sdkSessionId, data.sdkCwd);
+              await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId, data.sdkCwd, finalDetail);
+            } else if (data.type === 'run_outcome') {
+              receivedOutcome = normalizeRunOutcome(data.outcome, receivedOutcome || 'provider_error');
+              outcomeDetail = typeof data.subtype === 'string'
+                ? data.subtype
+                : typeof data.message === 'string' ? data.message : outcomeDetail;
             } else if (data.type === 'permission_request') {
+              pendingPermissionCount += 1;
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
                 title: data.title, displayName: data.displayName, description: data.description,
                 toolUseID: data.toolUseID,
               }]);
+              updateRunPhase({ awaitingPermission: true, initializing: false });
             } else if (data.type === 'permission_resolved') {
-              if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
+              if (data.reqId) {
+                pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
+                setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
+                updateRunPhase({ awaitingPermission: pendingPermissionCount > 0 });
+              }
             } else if (data.type === 'ask_user_question') {
+              pendingQuestionCount += 1;
               setPendingQuestions(prev => [...prev, {
                 reqId: data.reqId,
                 questions: data.questions || [],
                 toolUseID: data.toolUseID,
               }]);
+              updateRunPhase({ awaitingInput: true, initializing: false });
             } else if (data.type === 'ask_user_question_resolved') {
-              if (data.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
+              if (data.reqId) {
+                pendingQuestionCount = Math.max(0, pendingQuestionCount - 1);
+                setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
+                updateRunPhase({ awaitingInput: pendingQuestionCount > 0 });
+              }
             } else if (String(data.type || '').startsWith('task_')) {
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
+              updateRunPhase({ initializing: false, toolExecuting: true, thinking: false, streaming: false });
             } else if (data.type === 'error') {
-              await persistFinalMessage(`错误: ${data.message}`, 'error');
+              cachedErrorMessage = String(data.message || '未知错误');
+              receivedOutcome = receivedOutcome || 'provider_error';
+              outcomeDetail = outcomeDetail || cachedErrorMessage;
             }
           } catch {}
         }
       }
       if (!didFinalize) {
-        await persistFinalMessage(text || '连接失败: 响应提前结束', text ? 'complete' : 'error');
+        const fallbackOutcome = receivedOutcome && receivedOutcome !== 'completed' ? receivedOutcome : 'disconnected';
+        await persistFinalMessage(text || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : '连接失败: 响应提前结束'), fallbackOutcome, undefined, undefined, outcomeDetail);
       }
     } catch (e) {
       if ((e as Error).name === 'AbortError') {
-        await persistFinalMessage(text ? `${text}\n\n_（已停止）_` : '_（已停止）_', 'complete');
+        await persistFinalMessage(text, 'stopped', undefined, undefined, 'AbortError');
       } else {
-        await persistFinalMessage(`连接失败: ${(e as Error).message}`, 'error');
+        const message = (e as Error).message;
+        await persistFinalMessage(`连接失败: ${message}`, 'provider_error', undefined, undefined, message);
       }
     }
-    abortRef.current = null;
-    setIsStreaming(false);
-  }, [input, attachments, isStreaming, template, messages, persistSession]);
+    finishRun();
+  }, [input, attachments, isStreaming, template, messages, persistSession, selectedModel, sessionMeta, sessionId, id]);
 
   const handleStop = useCallback(() => {
     abortRef.current?.abort();
@@ -451,6 +717,8 @@ export default function AgentChat() {
   if (!template) {
     return <div className="page-header"><h1>加载中...</h1></div>;
   }
+
+  const displayModel = selectedModel || sessionMeta?.model || template.model || '';
 
   return (
     <div>
@@ -465,7 +733,16 @@ export default function AgentChat() {
           </div>
         </div>
         <div className="flex gap-2 mt-2" style={{ flexWrap: 'wrap' }}>
-          <span className="badge badge-muted">{template.model}</span>
+          <ChatModelPicker
+            value={displayModel}
+            templateModel={template.model}
+            models={modelOptions}
+            disabled={isStreaming}
+            onChange={model => setSelectedModelOverride({ contextKey: modelContextKey, model })}
+          />
+          {runPhase !== 'idle' && (
+            <span className={`badge ${phaseBadgeClass(runPhase)}`}>{phaseLabel(runPhase)}</span>
+          )}
           {((template.knowledgeSourceIds || []).length > 0 || template.useKnowledge) && (
             <span className="badge badge-success">知识库×{(template.knowledgeSourceIds || []).length || '全部'}</span>
           )}
@@ -477,7 +754,12 @@ export default function AgentChat() {
                 协作{sessionMeta.collaborationEnabled ? `·${sessionMeta.collaborationRole === 'member' ? '成员' : 'Owner'}` : '关闭'}
               </span>
               {sessionMeta.collaborationRole !== 'member' && (
-                <button className="btn btn-sm" onClick={handleToggleCollaboration}>
+                <button
+                  className="btn btn-sm"
+                  onClick={handleToggleCollaboration}
+                  disabled={!sessionMeta.persisted}
+                  title={sessionMeta.persisted ? undefined : '发送一条消息保存会话后才能开启协作'}
+                >
                   {sessionMeta.collaborationEnabled ? '关闭协作' : '开启协作'}
                 </button>
               )}
@@ -493,7 +775,7 @@ export default function AgentChat() {
       </div>
 
       <div className="chat-container">
-        <div className="chat-messages" ref={messagesRef}>
+        <div className="chat-messages" ref={messagesRef} onScroll={updateScrollBottomVisibility}>
           {messages.length === 0 && !isStreaming && (
             <div style={{ textAlign: 'center', color: 'var(--ink-muted)', padding: 40, flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <div>
@@ -550,6 +832,17 @@ export default function AgentChat() {
 
           <div ref={bottomRef} />
         </div>
+        {messages.length > 0 && (
+          <button
+            type="button"
+            className={`chat-scroll-bottom${showScrollBottom ? ' is-visible' : ''}`}
+            onClick={scrollToBottom}
+            aria-label="回到底部"
+            title="回到底部"
+          >
+            <span aria-hidden="true">↓</span>
+          </button>
+        )}
 
         <div style={{ padding: '0 12px' }}>
           <AskUserQuestionPromptList
@@ -615,18 +908,23 @@ export default function AgentChat() {
             value={input}
             onChange={e => { setInput(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; }}
             onKeyDown={e => {
-              if (e.key === 'Enter' && e.shiftKey) {
+              const isComposing = isInputComposingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229;
+              if (e.key === 'Enter' && !e.shiftKey && !isComposing) {
                 e.preventDefault();
-                handleSend();
+                void handleSend();
               }
             }}
+            onCompositionStart={() => { isInputComposingRef.current = true; }}
+            onCompositionEnd={() => { isInputComposingRef.current = false; }}
             onPaste={e => void handlePaste(e)}
-            placeholder="输入消息，Shift+Enter 发送，可粘贴图片，也可上传文件"
+            placeholder="输入消息，Enter 发送，Shift+Enter 换行，可粘贴图片，也可上传文件"
             style={{ resize: 'none', overflowY: 'hidden', minHeight: 38, maxHeight: 200 }}
             disabled={isStreaming}
           />
           {isStreaming ? (
-            <button className="btn btn-danger" onClick={handleStop}>停止</button>
+            <button className="btn btn-danger" onClick={handleStop}>
+              {isWaitingPhase(runPhase) ? '停止等待' : '停止'}
+            </button>
           ) : (
             <button className="btn btn-primary" onClick={handleSend} disabled={!input.trim() && attachments.length === 0}>
               发送

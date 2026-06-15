@@ -1,5 +1,6 @@
 import type { ChatAttachment, ChatImageAttachment, ChatMessage, ChatSession } from '../simulator/types';
 import { getAuthHeaders } from './client-runtime';
+import { normalizeChatMessageStatus, normalizeMessageOutcome, outcomeToMessageStatus } from '../simulator/run-state';
 
 const LEGACY_SESSION_KEY = 'agentma_chat_sessions';
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
@@ -68,15 +69,28 @@ function normalizeAttachments(value: unknown): ChatAttachment[] {
 
 function normalizeMessage(message: unknown): ChatMessage | null {
   if (!message || typeof message !== 'object') return null;
-  const role = (message as { role?: unknown }).role;
-  const content = (message as { content?: unknown }).content;
-  const attachments = normalizeAttachments((message as { attachments?: unknown }).attachments);
-  const timestamp = Number((message as { timestamp?: unknown }).timestamp);
+  const raw = message as Record<string, unknown>;
+  const role = raw.role;
+  const content = raw.content;
+  const attachments = normalizeAttachments(raw.attachments);
+  const timestamp = Number(raw.timestamp);
   if (!['user', 'assistant', 'system'].includes(String(role))) return null;
   if (typeof content !== 'string') return null;
+  const status = normalizeChatMessageStatus(raw.status);
+  const outcome = normalizeMessageOutcome(raw.outcome, status);
+  const id = typeof raw.id === 'string' && raw.id ? raw.id : undefined;
+  const thinking = typeof raw.thinking === 'string' && raw.thinking ? raw.thinking : undefined;
+  const outcomeDetail = typeof raw.outcomeDetail === 'string' && raw.outcomeDetail ? raw.outcomeDetail : undefined;
+  const runId = typeof raw.runId === 'string' && raw.runId ? raw.runId : undefined;
   return {
+    ...(id ? { id } : {}),
     role: role as ChatMessage['role'],
     content,
+    ...(thinking ? { thinking } : {}),
+    ...(status || outcome ? { status: status || outcomeToMessageStatus(outcome!) } : {}),
+    ...(outcome ? { outcome } : {}),
+    ...(outcomeDetail ? { outcomeDetail } : {}),
+    ...(runId ? { runId } : {}),
     ...(attachments.length ? { attachments } : {}),
     timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
   };
@@ -95,6 +109,7 @@ function normalizeSession(session: unknown): ChatSession | null {
   const forkedFromTitle = String((session as { forkedFromTitle?: unknown }).forkedFromTitle || '');
   const collaborationRole = String((session as { collaborationRole?: unknown }).collaborationRole || '');
   const collaborationUpdatedAt = Number((session as { collaborationUpdatedAt?: unknown }).collaborationUpdatedAt);
+  const messageCount = Number((session as { messageCount?: unknown }).messageCount);
   const createdAt = Number((session as { createdAt?: unknown }).createdAt);
   const updatedAt = Number((session as { updatedAt?: unknown }).updatedAt);
   if (!id || !templateId) return null;
@@ -111,6 +126,7 @@ function normalizeSession(session: unknown): ChatSession | null {
     templateId,
     title,
     messages,
+    messageCount: Number.isFinite(messageCount) ? messageCount : messages.length,
     model,
     sdkSessionId: sdkSessionId || undefined,
     sdkCwd: sdkCwd || undefined,
@@ -120,6 +136,7 @@ function normalizeSession(session: unknown): ChatSession | null {
     collaborationEnabled: Boolean((session as { collaborationEnabled?: unknown }).collaborationEnabled),
     collaborationRole: collaborationRole === 'owner' || collaborationRole === 'member' ? collaborationRole : undefined,
     collaborationUpdatedAt: Number.isFinite(collaborationUpdatedAt) ? collaborationUpdatedAt : undefined,
+    persisted: true,
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
   };
@@ -145,7 +162,8 @@ export function loadLegacyChatSessions(): ChatSession[] {
     if (!Array.isArray(parsed)) return [];
     return parsed.flatMap((session) => {
       const normalized = normalizeSession(session);
-      return normalized ? [normalized] : [];
+      // localStorage 里的旧会话不是服务端确认过的
+      return normalized ? [{ ...normalized, persisted: undefined }] : [];
     });
   } catch {
     return [];
@@ -154,6 +172,19 @@ export function loadLegacyChatSessions(): ChatSession[] {
 
 export async function listChatSessions(): Promise<ChatSession[]> {
   const res = await fetch('/api/chat-sessions', {
+    headers: getAuthHeaders(),
+  });
+  const data = await readJson<unknown[]>(res);
+  return Array.isArray(data)
+    ? data.flatMap((session) => {
+        const normalized = normalizeSession(session);
+        return normalized ? [normalized] : [];
+      })
+    : [];
+}
+
+export async function listChatSessionSummaries(): Promise<ChatSession[]> {
+  const res = await fetch('/api/chat-sessions?summary=1', {
     headers: getAuthHeaders(),
   });
   const data = await readJson<unknown[]>(res);
@@ -295,7 +326,7 @@ export async function deleteChatSession(sessionId: string): Promise<void> {
 }
 
 export async function bootstrapChatSessions(allowLegacyImport = true): Promise<ChatSession[]> {
-  const remoteSessions = await listChatSessions();
+  const remoteSessions = await listChatSessionSummaries();
   if (remoteSessions.length > 0) return remoteSessions;
 
   if (!allowLegacyImport) return [];
@@ -304,5 +335,5 @@ export async function bootstrapChatSessions(allowLegacyImport = true): Promise<C
   if (legacySessions.length === 0) return [];
 
   await Promise.allSettled(legacySessions.map((session) => saveChatSession(session)));
-  return listChatSessions();
+  return listChatSessionSummaries();
 }

@@ -258,15 +258,19 @@
   async function hydrateData(D) {
     const me = await api('/api/auth/me');
     const user = {
-      name: me.name || me.email || 'AgentMa',
+      id: me.id || '',
+      username: me.username || '',
+      name: me.username || me.name || me.email || 'AgentMa',
       email: me.email || '',
-      initial: (me.name || me.email || 'A').trim().slice(0, 1).toUpperCase(),
+      initial: (me.username || me.name || me.email || 'A').trim().slice(0, 1).toUpperCase(),
       tenant: me.tenantName || me.tenantId || '',
       plan: me.role || '',
       role: me.role || '',
       tenantId: me.tenantId || '',
     };
     localStorage.setItem('agentma_user', JSON.stringify({
+      id: user.id,
+      username: user.username,
       email: user.email,
       name: user.name,
       tenantId: user.tenantId,
@@ -372,6 +376,8 @@
       }));
       setJwt(result.token);
       localStorage.setItem('agentma_user', JSON.stringify({
+        id: result.id,
+        username: result.username,
         email: result.email,
         name: result.name,
         tenantId: result.tenantId,

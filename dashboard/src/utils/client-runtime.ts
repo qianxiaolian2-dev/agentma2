@@ -1,14 +1,15 @@
 export function getStoredAuthToken(): string | null {
   if (typeof window === 'undefined') return null;
-  return localStorage.getItem('agentma_jwt') || localStorage.getItem('agentma_api_key');
+  return localStorage.getItem('agentma_jwt');
 }
 
 export function isUsingApiKeyAuth(): boolean {
-  if (typeof window === 'undefined') return false;
-  return Boolean(localStorage.getItem('agentma_api_key'));
+  return false;
 }
 
 export type StoredAuthUser = {
+  id?: string;
+  username?: string;
   email: string;
   name: string;
   tenantId?: string;

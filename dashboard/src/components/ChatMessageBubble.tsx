@@ -1,9 +1,8 @@
-import { useState, useMemo } from 'react';
-import { marked } from 'marked';
+import { memo, useState, useMemo } from 'react';
+import type { MouseEvent } from 'react';
 import type { ChatAttachment, ChatMessage, ChatImageAttachment } from '../simulator/types';
-
-// Configure marked for safe rendering
-marked.setOptions({ gfm: true, breaks: true });
+import { renderMarkdown } from '../utils/render-markdown';
+import { normalizeMessageOutcome, outcomeBadgeClass, outcomeColor, outcomeLabel } from '../simulator/run-state';
 
 type Props = {
   message: ChatMessage;
@@ -81,32 +80,57 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-export default function ChatMessageBubble({ message }: Props) {
+function ChatMessageBubble({ message }: Props) {
   const isThinkingActive = message.status === 'streaming' && !!message.thinking;
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const isPending = message.role === 'assistant' && message.status === 'pending' && !message.content && !message.thinking;
-  const isError = message.status === 'error';
+  const outcome = message.role === 'assistant' ? normalizeMessageOutcome(message.outcome, message.status) : undefined;
+  const isDangerOutcome = outcome === 'exec_error' || outcome === 'provider_error' || outcome === 'rejected';
+  const isError = message.status === 'error' && isDangerOutcome;
   const isStreaming = message.status === 'streaming';
   const isComplete = message.role === 'assistant' && message.status === 'complete' && !!message.content;
-  const useMarkdown = isComplete;
+  const showOutcomeBadge = Boolean(outcome && outcome !== 'completed' && !isStreaming && !isPending);
+  const useMarkdown = message.role === 'assistant' && !isDangerOutcome && !!message.content;
 
   const htmlContent = useMemo(() => {
     if (!useMarkdown) return '';
-    try {
-      return marked.parse(message.content) as string;
-    } catch {
-      return message.content;
-    }
+    return renderMarkdown(message.content);
   }, [useMarkdown, message.content]);
+
+  const handleMarkdownClick = (event: MouseEvent<HTMLDivElement>) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    const copyButton = target.closest<HTMLButtonElement>('.chat-code-copy');
+    const code = copyButton?.dataset.code;
+    if (!copyButton || code == null) return;
+
+    void navigator.clipboard.writeText(code).then(() => {
+      copyButton.textContent = '已复制';
+      copyButton.dataset.copied = 'true';
+      window.setTimeout(() => {
+        if (copyButton.dataset.copied === 'true') {
+          copyButton.textContent = '复制';
+          delete copyButton.dataset.copied;
+        }
+      }, 1500);
+    });
+  };
 
   return (
     <div
       className={`chat-msg ${message.role}${isPending ? ' pulse' : ''}`}
       style={{
         position: 'relative',
-        ...(isError ? { borderLeft: '3px solid var(--danger)', color: 'var(--danger)' } : {}),
+        ...(outcome && outcome !== 'completed' ? { borderLeft: `3px solid ${outcomeColor(outcome)}` } : {}),
+        ...(isError ? { color: 'var(--danger)' } : {}),
       }}
     >
+      {showOutcomeBadge && outcome && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 4 }}>
+          <span className={`badge ${outcomeBadgeClass(outcome)}`}>{outcomeLabel(outcome)}</span>
+        </div>
+      )}
+
       {message.attachments && message.attachments.length > 0 && (
         <AttachmentGrid attachments={message.attachments} />
       )}
@@ -145,6 +169,7 @@ export default function ChatMessageBubble({ message }: Props) {
       {useMarkdown ? (
         <div
           className="chat-markdown"
+          onClick={handleMarkdownClick}
           dangerouslySetInnerHTML={{ __html: htmlContent }}
         />
       ) : (
@@ -166,3 +191,23 @@ export default function ChatMessageBubble({ message }: Props) {
     </div>
   );
 }
+
+function areMessagePropsEqual(prev: Props, next: Props): boolean {
+  const a = prev.message;
+  const b = next.message;
+
+  return (
+    a === b ||
+    (
+      a.id === b.id &&
+      a.role === b.role &&
+      a.content === b.content &&
+      a.thinking === b.thinking &&
+      a.status === b.status &&
+      a.timestamp === b.timestamp &&
+      a.attachments === b.attachments
+    )
+  );
+}
+
+export default memo(ChatMessageBubble, areMessagePropsEqual);

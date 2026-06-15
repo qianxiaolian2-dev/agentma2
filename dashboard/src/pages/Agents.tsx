@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useRef, useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { AgentDefinition, AgentTemplate, EffortLevel, PermissionMode, SkillInfo, RegisteredTool } from '../simulator/types';
 import { EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, initCustomTools } from '../simulator/mock-data';
@@ -30,13 +30,23 @@ type ClaudeMdPreview = {
   agentName: string;
   cwd: string;
   cwdExists: boolean;
-  cwdSource: 'latest_session' | 'new_session';
+  cwdSource: 'latest_session' | 'template_seed' | 'new_session';
   latestSession: { id: string; title: string; updatedAt: number } | null;
   settingSources: Array<'user' | 'project' | 'local'>;
   files: ClaudeMdPreviewFile[];
   loadedFiles: string[];
   effectiveContent: string;
   generatedAt: number;
+  notes: string[];
+};
+
+type AgentImportReport = {
+  templateId: string;
+  seedDir: string;
+  unpacked: Array<{ path: string; bytes: number; category: string }>;
+  detected: { agents: string[]; skills: string[]; claudeMd: boolean; remoteMcp: string[] };
+  disabled: { hooks: string[]; stdioMcp: string[] };
+  skipped: Array<{ path: string; reason: string }>;
   notes: string[];
 };
 
@@ -67,6 +77,10 @@ function normalizeKnowledgeSources(value: unknown): KnowledgeSource[] {
   });
 }
 
+function getDirectoryRelativePath(file: File) {
+  return ((file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name).replace(/\\/g, '/');
+}
+
 function newTemplate(): AgentTemplate {
   return {
     id: '', name: '', description: '', systemPrompt: '',
@@ -84,6 +98,41 @@ function defaultSubagent(): AgentDefinition {
     tools: ['Read', 'Grep', 'Glob'],
     effort: 'medium',
     permissionMode: 'default',
+  };
+}
+
+function getCloneTemplateName(sourceName: string, templates: AgentTemplate[]) {
+  const existingNames = new Set(templates.map(template => template.name.trim()).filter(Boolean));
+  const baseName = `${sourceName.trim() || '未命名 Agent'} 克隆`;
+  let name = baseName;
+  let suffix = 2;
+  while (existingNames.has(name)) {
+    name = `${baseName} ${suffix}`;
+    suffix += 1;
+  }
+  return name;
+}
+
+function getCloneTemplateId(templates: AgentTemplate[], now: number) {
+  const existingIds = new Set(templates.map(template => template.id));
+  let id = `agent-${now}`;
+  let suffix = 2;
+  while (existingIds.has(id)) {
+    id = `agent-${now}-${suffix}`;
+    suffix += 1;
+  }
+  return id;
+}
+
+function cloneTemplate(source: AgentTemplate, templates: AgentTemplate[]): AgentTemplate {
+  const now = Date.now();
+  const cloned = JSON.parse(JSON.stringify(source)) as AgentTemplate;
+  return {
+    ...cloned,
+    id: getCloneTemplateId(templates, now),
+    name: getCloneTemplateName(source.name, templates),
+    createdAt: now,
+    updatedAt: now,
   };
 }
 
@@ -239,6 +288,11 @@ export default function Agents() {
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
+  const [importReport, setImportReport] = useState<AgentImportReport | null>(null);
+  const [importedAgent, setImportedAgent] = useState<AgentTemplate | null>(null);
+  const [isImportReportOpen, setIsImportReportOpen] = useState(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   // 动态加载技能和 MCP 服务器（非写死）
   const [liveSkills] = useState<SkillInfo[]>(loadSkills);
   const [liveMcp] = useState<{ name: string }[]>(loadMcpServers);
@@ -282,6 +336,15 @@ export default function Agents() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [isPreviewOpen]);
+
+  useEffect(() => {
+    if (!isImportReportOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsImportReportOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isImportReportOpen]);
 
   // 每次页面可见时刷新自定义工具
   useEffect(() => {
@@ -359,6 +422,27 @@ export default function Agents() {
     setForm(newTemplate());
     setIsEditing(false);
     setIsEditorOpen(true);
+  };
+
+  const handleClone = async (source: AgentTemplate) => {
+    if (!user?.tenantId) return;
+    const cloned = cloneTemplate(source, templates);
+    const nextTemplates = [cloned, ...templates];
+
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      const persistedClone = persisted.find((template) => template.id === cloned.id) || cloned;
+      setTemplates(persisted);
+      setForm(persistedClone);
+      setIsEditing(true);
+      setIsEditorOpen(true);
+      setError('');
+    } catch (saveError) {
+      setError((saveError as Error).message || '克隆 Agent 失败');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleSave = async () => {
@@ -442,6 +526,56 @@ export default function Agents() {
       setError((saveError as Error).message || '删除 Agent 失败');
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const handleImportDirectory = async (fileList: FileList | null) => {
+    const files = Array.from(fileList || []);
+    if (importInputRef.current) importInputRef.current.value = '';
+    if (!files.length || !user?.tenantId) return;
+
+    setIsImporting(true);
+    setError('');
+    try {
+      const formData = new FormData();
+      formData.append('mode', 'new');
+      for (const file of files) {
+        formData.append('files', file, file.name);
+        formData.append('relativePaths', getDirectoryRelativePath(file));
+      }
+      const response = await fetch('/api/agents/import', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: formData,
+      });
+      const text = await response.text();
+      let data: { template?: AgentTemplate; report?: AgentImportReport; error?: string } = {};
+      if (text) {
+        const trimmed = text.trimStart();
+        if (trimmed.startsWith('<')) {
+          throw new Error(`导入接口返回了 HTML (${response.status})，后端可能未部署 /api/agents/import 或 /api 代理指向旧服务`);
+        }
+        try {
+          data = JSON.parse(text) as { template?: AgentTemplate; report?: AgentImportReport; error?: string };
+        } catch {
+          throw new Error('导入接口返回了无法解析的响应');
+        }
+      }
+      if (!response.ok) throw new Error(data.error || `导入失败: ${response.status}`);
+      if (!data.template || !data.report) throw new Error('导入响应缺少模板或报告');
+      const refreshed = await bootstrapAgentTemplates(user.tenantId, user.role === 'tenant_admin');
+      setTemplates(refreshed);
+      const savedTemplate = refreshed.find((template) => template.id === data.template?.id) || data.template;
+      setForm(savedTemplate);
+      setIsEditing(true);
+      setIsEditorOpen(false);
+      setImportedAgent(savedTemplate);
+      setImportReport(data.report);
+      setIsImportReportOpen(true);
+    } catch (importError) {
+      setError((importError as Error).message || '导入 Agent 失败');
+    } finally {
+      setIsImporting(false);
     }
   };
 
@@ -586,9 +720,27 @@ export default function Agents() {
       <div className="agents-page-shell">
         {/* 模板列表 */}
         <div className="agents-list-panel">
-          <button className="btn btn-primary mb-4" onClick={handleNew} style={{ width: 'min(360px, 100%)' }} disabled={isSaving}>
-            + 新建 Agent
-          </button>
+          <div className="agents-list-toolbar mb-4">
+            <button className="btn btn-primary" onClick={handleNew} disabled={isSaving || isImporting}>
+              + 新建 Agent
+            </button>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => importInputRef.current?.click()}
+              disabled={isSaving || isImporting}
+            >
+              {isImporting ? '导入中...' : '导入本地项目'}
+            </button>
+            <input
+              ref={importInputRef}
+              type="file"
+              multiple
+              {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
+              style={{ display: 'none' }}
+              onChange={event => { void handleImportDirectory(event.target.files); }}
+            />
+          </div>
 
           {isLoading ? (
             <div className="card" style={{ textAlign: 'center', color: 'var(--ink-muted)', padding: 40 }}>
@@ -626,6 +778,18 @@ export default function Agents() {
                       </button>
                       <button
                         type="button"
+                        className="btn btn-sm agent-card-clone-btn"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleClone(t);
+                        }}
+                        disabled={isSaving || !t.id}
+                        title={`克隆 ${t.name} 为新 Agent 模板`}
+                      >
+                        克隆
+                      </button>
+                      <button
+                        type="button"
                         className="btn btn-sm btn-primary agent-card-chat-btn"
                         onClick={(event) => {
                           event.stopPropagation();
@@ -641,6 +805,7 @@ export default function Agents() {
                   <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
                   <div className="agent-card-tags">
                     <span className="badge badge-muted">{t.model}</span>
+                    {t.seedDir && <span className="badge badge-warning">本地项目 seed</span>}
                     {((t.knowledgeSourceIds || []).length > 0 || t.useKnowledge) && (
                       <span className="badge badge-success">
                         知识库×{(t.knowledgeSourceIds || []).length || liveKnowledgeSources.filter(source => source.enabled).length || '全部'}
@@ -693,7 +858,11 @@ export default function Agents() {
                   <div>
                     <span className="agents-preview-meta-label">来源</span>
                     <span>
-                      {claudeMdPreview.cwdSource === 'latest_session' ? '最近运行会话' : '新会话默认临时目录'}
+                      {claudeMdPreview.cwdSource === 'latest_session'
+                        ? '最近运行会话'
+                        : claudeMdPreview.cwdSource === 'template_seed'
+                          ? '模板 seed 仓'
+                          : '新会话默认临时目录'}
                       {claudeMdPreview.cwdExists ? '' : ' · 当前不存在'}
                     </span>
                   </div>
@@ -747,6 +916,121 @@ export default function Agents() {
                 </div>
               </div>
             )}
+          </section>
+        </div>
+      )}
+
+      {isImportReportOpen && importReport && (
+        <div className="agents-preview-backdrop" onClick={() => setIsImportReportOpen(false)}>
+          <section
+            className="agents-preview-panel card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Agent 导入报告"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex-between agents-preview-head">
+              <div>
+                <div className="card-header" style={{ marginBottom: 2 }}>
+                  {importedAgent?.name || 'Imported Agent'} · 导入报告
+                </div>
+                <div className="agents-preview-subtitle">
+                  模板 seed 已写入，后续新会话会在首跑复制到 workspace cwd
+                </div>
+              </div>
+              <div className="flex gap-2">
+                {importedAgent?.id && (
+                  <button type="button" className="btn btn-sm btn-primary" onClick={() => startChat(importedAgent.id)}>
+                    开始对话
+                  </button>
+                )}
+                <button type="button" className="btn btn-sm btn-ghost" onClick={() => setIsImportReportOpen(false)}>
+                  关闭
+                </button>
+              </div>
+            </div>
+
+            <div className="agents-preview-body">
+              <div className="agents-preview-meta">
+                <div>
+                  <span className="agents-preview-meta-label">templateId</span>
+                  <code>{importReport.templateId}</code>
+                </div>
+                <div>
+                  <span className="agents-preview-meta-label">seedDir</span>
+                  <code>{importReport.seedDir}</code>
+                </div>
+                <div>
+                  <span className="agents-preview-meta-label">unpacked</span>
+                  <span>{importReport.unpacked.length} 个文件</span>
+                </div>
+                <div>
+                  <span className="agents-preview-meta-label">skipped</span>
+                  <span>{importReport.skipped.length} 个文件</span>
+                </div>
+              </div>
+
+              <div className="agents-import-detected">
+                <span className="badge badge-success">CLAUDE.md {importReport.detected.claudeMd ? '已检测' : '未检测'}</span>
+                {importReport.detected.agents.map(name => <span key={`agent-${name}`} className="badge badge-info">agent: {name}</span>)}
+                {importReport.detected.skills.map(name => <span key={`skill-${name}`} className="badge badge-info">skill: {name}</span>)}
+                {importReport.detected.remoteMcp.map(name => <span key={`mcp-${name}`} className="badge badge-success">remote MCP: {name}</span>)}
+                {!importReport.detected.agents.length && !importReport.detected.skills.length && !importReport.detected.remoteMcp.length && !importReport.detected.claudeMd && (
+                  <span className="badge badge-muted">未检测到 Claude Code 专用文件</span>
+                )}
+              </div>
+
+              {(importReport.disabled.hooks.length > 0 || importReport.disabled.stdioMcp.length > 0) && (
+                <div className="agents-preview-notes">
+                  {importReport.disabled.hooks.length > 0 && (
+                    <div>已禁用 hooks: {importReport.disabled.hooks.join(', ')}</div>
+                  )}
+                  {importReport.disabled.stdioMcp.length > 0 && (
+                    <div>已剥离 stdio MCP: {importReport.disabled.stdioMcp.join(', ')}</div>
+                  )}
+                </div>
+              )}
+
+              {importReport.notes.length > 0 && (
+                <div className="agents-preview-notes">
+                  {importReport.notes.map(note => <div key={note}>{note}</div>)}
+                </div>
+              )}
+
+              {importReport.unpacked.length > 0 && (
+                <div>
+                  <div className="agents-preview-section-title">已解包文件</div>
+                  <div className="agents-import-file-list">
+                    {importReport.unpacked.slice(0, 80).map(file => (
+                      <div key={file.path} className="agents-import-file-row">
+                        <span className="badge badge-muted">{file.category}</span>
+                        <code>{file.path}</code>
+                        <span>{formatBytes(file.bytes)}</span>
+                      </div>
+                    ))}
+                    {importReport.unpacked.length > 80 && (
+                      <div className="agents-import-file-row muted">
+                        还有 {importReport.unpacked.length - 80} 个文件未显示
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {importReport.skipped.length > 0 && (
+                <div>
+                  <div className="agents-preview-section-title">已跳过</div>
+                  <div className="agents-import-file-list">
+                    {importReport.skipped.slice(0, 40).map(file => (
+                      <div key={`${file.path}-${file.reason}`} className="agents-import-file-row skipped">
+                        <code>{file.path}</code>
+                        <span>{file.reason}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
           </section>
         </div>
       )}

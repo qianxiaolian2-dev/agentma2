@@ -39,6 +39,17 @@ export function isSupportedChatFile(file: File) {
   return CHAT_FILE_EXTENSIONS.some((extension) => name.endsWith(extension));
 }
 
+export function uniqueChatImageFiles(files: File[]) {
+  const seen = new Set<string>();
+  return files.flatMap((file) => {
+    if (!file.type.startsWith('image/')) return [];
+    const key = `${file.type}:${file.size}:${file.lastModified || 0}`;
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [file];
+  });
+}
+
 export async function fileToChatAttachment(file: File): Promise<ChatAttachment> {
   if (CHAT_IMAGE_MIME_TYPES.has(file.type as ChatImageMimeType)) {
     if (file.size > CHAT_IMAGE_MAX_BYTES) throw new Error('单张图片不能超过 5MB');

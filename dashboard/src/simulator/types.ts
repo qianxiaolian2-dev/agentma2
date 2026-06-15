@@ -3,6 +3,8 @@
 // 提取自 agent-sdk-docs-zh 文档
 // ============================================================
 
+import type { ChatMessageStatus, RunOutcome } from './run-state';
+
 // --- 权限模式 ---
 export type PermissionMode =
   | 'default'
@@ -413,6 +415,8 @@ export interface AgentTemplate {
   // 知识库：允许 agent 只读访问租户配置的本地笔记目录
   useKnowledge?: boolean;
   knowledgeSourceIds?: string[];
+  // 导入本地 Claude Code 项目时生成的模板级 seed 仓路径。
+  seedDir?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -492,7 +496,10 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   thinking?: string;
-  status?: 'pending' | 'streaming' | 'complete' | 'error';
+  status?: ChatMessageStatus;
+  outcome?: RunOutcome;
+  outcomeDetail?: string;
+  runId?: string;
   attachments?: ChatAttachment[];
   timestamp: number;
 }
@@ -513,6 +520,7 @@ export interface ChatSession {
   pinned?: boolean;
   title: string;
   messages: ChatMessage[];
+  messageCount?: number;
   model: string;
   sdkSessionId?: string;
   sdkCwd?: string;
@@ -521,6 +529,8 @@ export interface ChatSession {
   collaborationEnabled?: boolean;
   collaborationRole?: 'owner' | 'member';
   collaborationUpdatedAt?: number;
+  /** 仅前端使用: 来自服务端响应的会话为 true,本地草稿没有。协作等需要服务端行存在的操作据此门控。 */
+  persisted?: boolean;
   createdAt: number;
   updatedAt: number;
 }

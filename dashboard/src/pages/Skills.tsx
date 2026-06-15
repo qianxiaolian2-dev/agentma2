@@ -3,6 +3,7 @@ import type { PublicSkillInfo, SkillInfo } from '../simulator/types';
 import { initSkills, saveSkills } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { getAuthHeaders } from '../utils/client-runtime';
+import { parseConversationIdInput } from '../utils/conversation-links';
 import StatusBadge from '../components/common/StatusBadge';
 
 const LOCATION_LABELS: Record<string, { label: string; color: string }> = {
@@ -71,6 +72,7 @@ export default function Skills() {
   const [publishingName, setPublishingName] = useState('');
   const [learnConflict, setLearnConflict] = useState<{ skill: PublicSkillInfo; message: string } | null>(null);
   const [learnNameOverride, setLearnNameOverride] = useState('');
+  const workspaceConversationLabel = parseConversationIdInput(workspaceConversationId) || workspaceConversationId.trim();
 
   const handleImportFromGitHub = async () => {
     if (!ghUrl.trim()) return;
@@ -242,8 +244,12 @@ export default function Skills() {
   };
 
   const handleScanWorkspacePath = async () => {
-    const conversationId = workspaceConversationId.trim();
-    if (!conversationId) return;
+    const conversationId = parseConversationIdInput(workspaceConversationId);
+    if (!conversationId) {
+      setWorkspaceMsg('请粘贴包含 conversationId 或 join 参数的会话链接，或直接输入对话 ID');
+      return;
+    }
+    if (conversationId !== workspaceConversationId.trim()) setWorkspaceConversationId(conversationId);
     setWorkspaceLoading(true);
     setWorkspaceMsg('');
     setWorkspaceCandidates([]);
@@ -267,9 +273,7 @@ export default function Skills() {
         return;
       }
 
-      const existingNames = new Set(skills.map(s => s.name));
       const defaultSelected = candidates
-        .filter(skill => !skill.installed && !existingNames.has(skill.name))
         .map(candidatePath);
       setWorkspaceCandidates(candidates);
       setSelectedWorkspacePaths(defaultSelected);
@@ -288,24 +292,32 @@ export default function Skills() {
   };
 
   const selectAllWorkspaceCandidates = () => {
-    const existingNames = new Set(skills.map(s => s.name));
     setSelectedWorkspacePaths(
       workspaceCandidates
-        .filter(skill => !skill.installed && !existingNames.has(skill.name))
         .map(candidatePath),
     );
   };
 
   const installSelectedWorkspaceSkills = async () => {
-    const conversationId = workspaceConversationId.trim();
+    const conversationId = parseConversationIdInput(workspaceConversationId);
     if (!conversationId) {
-      setWorkspaceMsg('请先输入对话 ID');
+      setWorkspaceMsg('请粘贴包含 conversationId 或 join 参数的会话链接，或直接输入对话 ID');
       return;
     }
+    if (conversationId !== workspaceConversationId.trim()) setWorkspaceConversationId(conversationId);
     const selected = workspaceCandidates.filter(skill => selectedWorkspacePaths.includes(candidatePath(skill)));
     if (!selected.length) {
       setWorkspaceMsg('请先选择要安装的 workspace 技能');
       return;
+    }
+    const existingNames = new Set(skills.map(skill => skill.name));
+    const shouldOverwrite = (skill: SkillInfo) => existingNames.has(skill.name) || skill.installed === true;
+    const overwriteNames = selected.filter(shouldOverwrite).map(skill => skill.name);
+    if (overwriteNames.length) {
+      const confirmed = window.confirm(
+        `将覆盖我的技能背包中的同名技能：${overwriteNames.join('、')}。\n\n覆盖后原技能不可恢复，确定继续导入吗？`,
+      );
+      if (!confirmed) return;
     }
 
     setWorkspaceLoading(true);
@@ -319,7 +331,7 @@ export default function Skills() {
         const res = await fetch('/api/skills/workspace/install', {
           method: 'POST',
           headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({ conversationId, name: skill.name }),
+          body: JSON.stringify({ conversationId, name: skill.name, overwrite: shouldOverwrite(skill) }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -334,8 +346,11 @@ export default function Skills() {
 
     if (installed.length) {
       setSkills(prev => {
-        const existing = new Set(prev.map(skill => skill.name));
-        return [...prev, ...installed.filter(skill => !existing.has(skill.name))];
+        const installedNames = new Set(installed.map(skill => skill.name));
+        return [
+          ...prev.filter(skill => !installedNames.has(skill.name)),
+          ...installed,
+        ];
       });
     }
     setWorkspaceCandidates(prev => prev.map(skill => (
@@ -344,8 +359,10 @@ export default function Skills() {
         : skill
     )));
     setSelectedWorkspacePaths([]);
+    const overwroteCount = installed.filter(skill => overwriteNames.includes(skill.name)).length;
     setWorkspaceMsg([
       installed.length ? `✓ 已安装 ${installed.length} 个技能到 ~/.claude/skills/` : '',
+      overwroteCount ? `覆盖 ${overwroteCount} 个同名技能` : '',
       failed.length ? `失败 ${failed.length} 个：${failed.join('；')}` : '',
     ].filter(Boolean).join(' '));
     setWorkspaceLoading(false);
@@ -664,14 +681,14 @@ export default function Skills() {
       <div className="card mb-4">
         <div className="card-header">从 Workspace 抽取技能</div>
         <div style={{ fontSize: '.82em', color: 'var(--ink-secondary)', marginBottom: 10 }}>
-          输入对话 ID，系统会从该对话的 workspace 自动扫描你创建的可学习技能
+          粘贴会话链接或输入对话 ID，系统会从该对话的 workspace 自动扫描你创建的可学习技能
         </div>
         <div className="flex gap-2" style={{ alignItems: 'flex-start' }}>
           <input
             value={workspaceConversationId}
             onChange={e => setWorkspaceConversationId(e.target.value)}
             onKeyDown={e => { if (e.key === 'Enter') handleScanWorkspacePath(); }}
-            placeholder="输入对话 ID"
+            placeholder="会话链接或对话 ID"
             style={{ fontFamily: 'var(--font-mono)', fontSize: '.8em', flex: 1 }}
           />
           <button className="btn btn-primary" onClick={handleScanWorkspacePath} disabled={workspaceLoading}>
@@ -695,7 +712,7 @@ export default function Skills() {
             <div style={{ maxHeight: 260, overflowY: 'auto' }}>
               {workspaceCandidates.map(skill => {
                 const exists = skills.some(item => item.name === skill.name);
-                const disabled = exists || skill.installed === true;
+                const willOverwrite = exists || skill.installed === true;
                 const sourcePath = candidatePath(skill);
                 return (
                   <label
@@ -707,14 +724,12 @@ export default function Skills() {
                       alignItems: 'start',
                       padding: '9px 10px',
                       borderBottom: '1px solid var(--border)',
-                      opacity: disabled ? .55 : 1,
-                      cursor: disabled ? 'not-allowed' : 'pointer',
+                      cursor: 'pointer',
                     }}
                   >
                     <input
                       type="checkbox"
                       checked={selectedWorkspacePaths.includes(sourcePath)}
-                      disabled={disabled}
                       onChange={() => toggleWorkspaceCandidate(sourcePath)}
                       style={{ width: 'auto', marginTop: 3 }}
                     />
@@ -726,7 +741,7 @@ export default function Skills() {
                         {skill.description}
                       </span>
                       <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.68em', color: 'var(--ink-muted)', marginTop: 2 }}>
-                        来自对话 {workspaceConversationId.trim()}
+                        来自对话 {workspaceConversationLabel}
                       </span>
                       {skill.installedPath && (
                         <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.68em', color: 'var(--success)', marginTop: 2 }}>
@@ -734,7 +749,7 @@ export default function Skills() {
                         </span>
                       )}
                     </span>
-                    {skill.installed ? <span className="badge badge-muted">已安装</span> : exists && <span className="badge badge-muted">已存在</span>}
+                    {willOverwrite && <span className="badge badge-warning">将覆盖</span>}
                   </label>
                 );
               })}

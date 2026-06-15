@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { AgentTemplate } from '../simulator/types';
 import { getAuthHeaders } from '../utils/client-runtime';
 import { useAuth } from '../contexts/AuthContext';
 import { fetchAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
 import { listProviderModels } from '../utils/providers';
+import { parseConversationIdInput } from '../utils/conversation-links';
 
 type KnowledgeSource = {
   id: string;
@@ -56,6 +57,55 @@ type WorkspaceWikiCandidate = {
   sampleFiles: string[];
 };
 
+type KnowledgeGraphNode = {
+  id: string;
+  label: string;
+  path?: string;
+  kind: 'file' | 'missing';
+  inbound: number;
+  outbound: number;
+  sizeBytes?: number;
+};
+
+type KnowledgeGraphEdge = {
+  source: string;
+  target: string;
+  count: number;
+};
+
+type KnowledgeGraph = {
+  source: { id: string; name: string };
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+  stats: {
+    files: number;
+    nodes: number;
+    edges: number;
+    missing: number;
+    truncated?: boolean;
+  };
+};
+
+type GraphPreviewState = {
+  source: KnowledgeSource;
+  mode: string;
+  graph: KnowledgeGraph;
+};
+
+type KnowledgeFilePreview = {
+  path: string;
+  name: string;
+  content: string;
+  sizeBytes: number;
+  truncated?: boolean;
+};
+
+type GraphLayoutNode = KnowledgeGraphNode & {
+  x: number;
+  y: number;
+  radius: number;
+};
+
 const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const KNOWLEDGE_UPLOAD_EXTENSIONS = ['.md', '.markdown', '.txt', '.csv', '.xls', '.xlsx'];
@@ -89,6 +139,38 @@ function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function layoutKnowledgeGraph(graph: KnowledgeGraph) {
+  const visibleNodes = graph.nodes.slice(0, 140);
+  const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
+  const visibleEdges = graph.edges
+    .filter((edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target))
+    .slice(0, 260);
+  const width = 920;
+  const height = 560;
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const sorted = [...visibleNodes].sort((a, b) => (b.inbound + b.outbound) - (a.inbound + a.outbound) || a.label.localeCompare(b.label));
+  const maxDegree = Math.max(1, ...sorted.map((node) => node.inbound + node.outbound));
+  const nodes = sorted.map((node, index): GraphLayoutNode => {
+    const degree = node.inbound + node.outbound;
+    const radius = 5 + Math.min(9, Math.sqrt(degree + 1) * 2);
+    if (index === 0) return { ...node, x: centerX, y: centerY, radius: radius + 3 };
+    const ring = index < 16 ? 1 : index < 56 ? 2 : 3;
+    const ringIndex = ring === 1 ? index - 1 : ring === 2 ? index - 16 : index - 56;
+    const ringCount = ring === 1 ? Math.min(15, Math.max(1, sorted.length - 1)) : ring === 2 ? 40 : Math.max(1, sorted.length - 56);
+    const angle = (Math.PI * 2 * ringIndex) / ringCount - Math.PI / 2 + ring * 0.19;
+    const spread = 110 + ring * 82 + (degree / maxDegree) * 20;
+    return {
+      ...node,
+      x: centerX + Math.cos(angle) * spread,
+      y: centerY + Math.sin(angle) * spread * 0.72,
+      radius,
+    };
+  });
+  const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+  return { width, height, nodes, edges: visibleEdges, nodeMap };
 }
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -163,6 +245,11 @@ export default function Knowledge() {
   const [wikiLaunchLoadingId, setWikiLaunchLoadingId] = useState('');
   const [graphLoadingId, setGraphLoadingId] = useState('');
   const [graphMsg, setGraphMsg] = useState('');
+  const [graphPreview, setGraphPreview] = useState<GraphPreviewState | null>(null);
+  const [selectedGraphNode, setSelectedGraphNode] = useState<KnowledgeGraphNode | null>(null);
+  const [graphFilePreview, setGraphFilePreview] = useState<KnowledgeFilePreview | null>(null);
+  const [graphFileLoading, setGraphFileLoading] = useState(false);
+  const [graphFileError, setGraphFileError] = useState('');
 
   const changed = useMemo(() => JSON.stringify(sources) !== JSON.stringify(savedSources), [sources, savedSources]);
   const visibleSources = useMemo(() => sources
@@ -172,14 +259,24 @@ export default function Knowledge() {
       if (archived !== 0) return archived;
       return (b.updatedAt || 0) - (a.updatedAt || 0) || a.name.localeCompare(b.name);
     }), [sources]);
-  const canManageSource = (source: KnowledgeSource) => canManageSources || Boolean(user?.email && source.createdBy === user.email);
+  const canManageSource = useCallback((source: KnowledgeSource) => (
+    canManageSources || Boolean(user?.email && source.createdBy === user.email)
+  ), [canManageSources, user?.email]);
   const publicSources = useMemo(() => visibleSources.filter((source) => source.publishedAt && !source.archivedAt && source.enabled), [visibleSources]);
   const mineSources = useMemo(() => visibleSources.filter((source) => (
     canManageSource(source) || (!source.publishedAt && canManageSources)
-  )), [visibleSources, canManageSources, user?.email]);
+  )), [visibleSources, canManageSources, canManageSource]);
   const canSaveSources = mineSources.some((source) => canManageSource(source));
   const mineEnabledCount = mineSources.filter((source) => !source.archivedAt && source.enabled && source.path.trim()).length;
   const archivedCount = mineSources.filter((source) => source.archivedAt).length;
+  const graphLayout = useMemo(() => graphPreview ? layoutKnowledgeGraph(graphPreview.graph) : null, [graphPreview]);
+  const graphTopNodes = useMemo(() => (
+    graphPreview
+      ? [...graphPreview.graph.nodes]
+        .sort((a, b) => (b.inbound + b.outbound) - (a.inbound + a.outbound) || a.label.localeCompare(b.label))
+        .slice(0, 10)
+      : []
+  ), [graphPreview]);
   const uploadFileLimit = user?.role === 'tenant_admin'
     ? quota.knowledgeUploadAdminMaxFiles
     : quota.knowledgeUploadMemberMaxFiles;
@@ -478,11 +575,12 @@ export default function Knowledge() {
   };
 
   const scanWorkspaceWikis = async () => {
-    const conversationId = wikiConversationId.trim();
+    const conversationId = parseConversationIdInput(wikiConversationId);
     if (!conversationId) {
-      setWikiWorkspaceMsg('请先输入对话 ID');
+      setWikiWorkspaceMsg('请粘贴包含 conversationId 或 join 参数的会话链接，或直接输入对话 ID');
       return;
     }
+    if (conversationId !== wikiConversationId.trim()) setWikiConversationId(conversationId);
     setWikiWorkspaceLoading(true);
     setWikiWorkspaceMsg('');
     setWikiCandidates([]);
@@ -517,11 +615,12 @@ export default function Knowledge() {
   };
 
   const importSelectedWorkspaceWikis = async () => {
-    const conversationId = wikiConversationId.trim();
+    const conversationId = parseConversationIdInput(wikiConversationId);
     if (!conversationId) {
-      setWikiWorkspaceMsg('请先输入对话 ID');
+      setWikiWorkspaceMsg('请粘贴包含 conversationId 或 join 参数的会话链接，或直接输入对话 ID');
       return;
     }
+    if (conversationId !== wikiConversationId.trim()) setWikiConversationId(conversationId);
     const selected = wikiCandidates.filter((candidate) => selectedWikiPaths.includes(candidate.path));
     if (!selected.length) {
       setWikiWorkspaceMsg('请先选择要同步的 wiki');
@@ -563,20 +662,61 @@ export default function Knowledge() {
   const openObsidianGraph = async (source: KnowledgeSource) => {
     setGraphLoadingId(source.id);
     setGraphMsg('');
+    closeGraphPreview();
     try {
       const response = await fetch(`/api/knowledge/sources/${encodeURIComponent(source.id)}/graph`, {
         method: 'POST',
         headers: jsonAuthHeaders(),
         body: JSON.stringify({}),
       });
-      await readJson<{ ok: boolean }>(response);
-      setGraphMsg(`已请求 Obsidian 打开 "${source.name || '知识库'}" 图谱`);
+      const data = await readJson<{ ok: boolean; mode?: string; graph?: KnowledgeGraph }>(response);
+      if (data.graph) {
+        setGraphPreview({ source, graph: data.graph, mode: data.mode || 'native' });
+        const firstFileNode = data.graph.nodes.find((node) => node.kind === 'file' && node.path) || data.graph.nodes[0] || null;
+        if (firstFileNode) void selectGraphNode(source, firstFileNode);
+        setGraphMsg(`已生成 "${source.name || '知识库'}" 图谱`);
+      } else {
+        setGraphMsg(`已请求 Obsidian 打开 "${source.name || '知识库'}" 图谱`);
+      }
     } catch (graphFailure) {
       setGraphMsg(`图谱预览失败: ${(graphFailure as Error).message}`);
     } finally {
       setGraphLoadingId('');
     }
   };
+
+  function closeGraphPreview() {
+    setGraphPreview(null);
+    setSelectedGraphNode(null);
+    setGraphFilePreview(null);
+    setGraphFileError('');
+    setGraphFileLoading(false);
+  }
+
+  async function selectGraphNode(source: KnowledgeSource, node: KnowledgeGraphNode) {
+    setSelectedGraphNode(node);
+    setGraphFilePreview(null);
+    setGraphFileError('');
+    if (node.kind !== 'file' || !node.path) {
+      setGraphFileLoading(false);
+      return;
+    }
+
+    setGraphFileLoading(true);
+    try {
+      const response = await fetch(`/api/knowledge/sources/${encodeURIComponent(source.id)}/file-preview`, {
+        method: 'POST',
+        headers: jsonAuthHeaders(),
+        body: JSON.stringify({ path: node.path }),
+      });
+      const data = await readJson<{ file?: KnowledgeFilePreview }>(response);
+      setGraphFilePreview(data.file || null);
+    } catch (previewFailure) {
+      setGraphFileError((previewFailure as Error).message || '读取文件失败');
+    } finally {
+      setGraphFileLoading(false);
+    }
+  }
 
   return (
     <div>
@@ -684,7 +824,7 @@ export default function Knowledge() {
           <div>
             <div className="card-header" style={{ marginBottom: 4 }}>从会话同步 Wiki 知识库</div>
             <div className="tool-card-desc">
-              输入 Wiki 化会话 ID，扫描该会话 workspace 里的 wiki/ 产物，并同步为新的知识库 source。
+              粘贴 Wiki 化会话链接或输入对话 ID，扫描该会话 workspace 里的 wiki/ 产物，并同步为新的知识库 source。
             </div>
           </div>
           <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
@@ -692,8 +832,8 @@ export default function Knowledge() {
               value={wikiConversationId}
               onChange={e => setWikiConversationId(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') void scanWorkspaceWikis(); }}
-              placeholder="conversationId"
-              style={{ width: 220, fontFamily: 'var(--font-mono)', fontSize: '.8em' }}
+              placeholder="会话链接或 conversationId"
+              style={{ width: 300, fontFamily: 'var(--font-mono)', fontSize: '.8em' }}
             />
             <button className="btn btn-sm btn-primary" onClick={() => void scanWorkspaceWikis()} disabled={wikiWorkspaceLoading}>
               {wikiWorkspaceLoading ? '扫描中...' : '扫描'}
@@ -969,6 +1109,138 @@ export default function Knowledge() {
           </div>
         )}
       </div>
+
+      {graphPreview && graphLayout && (
+        <div className="knowledge-graph-backdrop" role="presentation" onClick={closeGraphPreview}>
+          <div className="knowledge-graph-modal" role="dialog" aria-modal="true" aria-label="知识库图谱预览" onClick={event => event.stopPropagation()}>
+            <div className="knowledge-graph-header">
+              <div style={{ minWidth: 0 }}>
+                <div className="knowledge-graph-title">{graphPreview.source.name || '未命名知识库'}</div>
+                <div className="knowledge-graph-subtitle">
+                  {graphPreview.graph.stats.files} markdown · {graphPreview.graph.stats.nodes} 节点 · {graphPreview.graph.stats.edges} 连线
+                  {graphPreview.graph.stats.truncated ? ' · 已截断' : ''}
+                </div>
+              </div>
+              <button className="btn btn-sm" onClick={closeGraphPreview}>关闭</button>
+            </div>
+
+            <div className="knowledge-graph-body">
+              <div className="knowledge-graph-canvas">
+                {graphLayout.nodes.length === 0 ? (
+                  <div className="knowledge-graph-empty">没有可展示的 Markdown 图谱</div>
+                ) : (
+                  <svg viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`} role="img" aria-label="知识库文件链接图">
+                    <defs>
+                      <filter id="knowledgeGraphGlow" x="-40%" y="-40%" width="180%" height="180%">
+                        <feGaussianBlur stdDeviation="4" result="blur" />
+                        <feMerge>
+                          <feMergeNode in="blur" />
+                          <feMergeNode in="SourceGraphic" />
+                        </feMerge>
+                      </filter>
+                    </defs>
+                    {graphLayout.edges.map((edge) => {
+                      const sourceNode = graphLayout.nodeMap.get(edge.source);
+                      const targetNode = graphLayout.nodeMap.get(edge.target);
+                      if (!sourceNode || !targetNode) return null;
+                      return (
+                        <line
+                          key={`${edge.source}->${edge.target}`}
+                          x1={sourceNode.x}
+                          y1={sourceNode.y}
+                          x2={targetNode.x}
+                          y2={targetNode.y}
+                          strokeWidth={Math.min(4, 1 + edge.count * 0.7)}
+                          className="knowledge-graph-edge"
+                        />
+                      );
+                    })}
+                    {graphLayout.nodes.map((node) => {
+                      const degree = node.inbound + node.outbound;
+                      const labelVisible = degree >= 2 || graphLayout.nodes.length <= 30;
+                      const selected = selectedGraphNode?.id === node.id;
+                      return (
+                        <g
+                          key={node.id}
+                          className={`knowledge-graph-node ${node.kind === 'missing' ? 'missing' : 'file'}${selected ? ' selected' : ''}`}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => void selectGraphNode(graphPreview.source, node)}
+                          onKeyDown={event => {
+                            if (event.key === 'Enter' || event.key === ' ') {
+                              event.preventDefault();
+                              void selectGraphNode(graphPreview.source, node);
+                            }
+                          }}
+                        >
+                          <circle cx={node.x} cy={node.y} r={node.radius} filter={degree >= 5 ? 'url(#knowledgeGraphGlow)' : undefined}>
+                            <title>{node.path || node.label}</title>
+                          </circle>
+                          {labelVisible && (
+                            <text x={node.x} y={node.y + node.radius + 13} textAnchor="middle">
+                              {node.label.length > 18 ? `${node.label.slice(0, 17)}…` : node.label}
+                            </text>
+                          )}
+                        </g>
+                      );
+                    })}
+                  </svg>
+                )}
+              </div>
+
+              <aside className="knowledge-graph-side">
+                <div className="knowledge-graph-metric-grid">
+                  <div><strong>{graphPreview.graph.stats.files}</strong><span>文件</span></div>
+                  <div><strong>{graphPreview.graph.stats.nodes}</strong><span>节点</span></div>
+                  <div><strong>{graphPreview.graph.stats.edges}</strong><span>连线</span></div>
+                  <div><strong>{graphPreview.graph.stats.missing}</strong><span>缺失引用</span></div>
+                </div>
+
+                {selectedGraphNode && (
+                  <div className="knowledge-graph-selected">
+                    <div className="knowledge-graph-selected-title">{selectedGraphNode.label}</div>
+                    <div className="knowledge-graph-selected-meta">
+                      {selectedGraphNode.kind === 'missing' ? '缺失引用' : selectedGraphNode.path || '文件'}
+                    </div>
+                    <div className="knowledge-graph-selected-meta">
+                      入链 {selectedGraphNode.inbound} · 出链 {selectedGraphNode.outbound}
+                    </div>
+                    {graphFileLoading && <div className="knowledge-graph-preview-state">读取中...</div>}
+                    {graphFileError && <div className="knowledge-graph-preview-state danger">{graphFileError}</div>}
+                    {selectedGraphNode.kind === 'missing' && (
+                      <div className="knowledge-graph-preview-state">这个链接还没有对应的知识库文件。</div>
+                    )}
+                    {graphFilePreview && (
+                      <div className="knowledge-graph-file-preview">
+                        <div className="knowledge-graph-file-head">
+                          <span>{graphFilePreview.name}</span>
+                          <b>{formatBytes(graphFilePreview.sizeBytes)}</b>
+                        </div>
+                        <pre>{graphFilePreview.content}</pre>
+                        {graphFilePreview.truncated && <div className="knowledge-graph-preview-state">内容已截断</div>}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="knowledge-graph-list">
+                  {graphTopNodes.map((node) => (
+                    <button
+                      key={node.id}
+                      type="button"
+                      className={`knowledge-graph-list-item${selectedGraphNode?.id === node.id ? ' selected' : ''}`}
+                      onClick={() => void selectGraphNode(graphPreview.source, node)}
+                    >
+                      <span>{node.label}</span>
+                      <b>{node.inbound + node.outbound}</b>
+                    </button>
+                  ))}
+                </div>
+              </aside>
+            </div>
+          </div>
+        </div>
+      )}
 
       {Object.values(tests).some((test) => test.result?.ok && test.result.sampleFiles?.length) && (
         <div className="card" style={{ marginTop: 16 }}>

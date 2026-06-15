@@ -14,8 +14,10 @@ import {
   type SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { evaluateHookRules, evaluatePermissionRules, listHookRules, listKnowledgeSources, listProtectedSdkCwds, recordAgentRun } from './server-store.ts';
-import type { HookRuleEvent } from './server-store.ts';
+import { evaluateHookRules, evaluatePermissionRules, listDatasources, listHookRules, listKnowledgeSources, listProtectedSdkCwds, recordAgentRun } from './server-store.ts';
+import type { DatasourceRow, HookRuleEvent } from './server-store.ts';
+import { runDatasourceQuery, serializeQueryResult, DATASOURCE_QUERY_MAX_ROWS } from './server-datasource.ts';
+import { mapResultSubtypeToOutcome, type RunOutcome } from './src/simulator/run-state.ts';
 
 // ─── Pricing ─────────────────────────────────────────────────────────────────
 // Edit to match your provider's actual rates. The SDK's own total_cost_usd
@@ -37,7 +39,39 @@ export const SAFE_AUTO_ALLOW_TOOLS = new Set<string>([
   'Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch',
   'TodoWrite', 'TodoRead', 'TaskGet', 'TaskList', 'TaskOutput',
   'ListMcpResources', 'ReadMcpResource',
+  // 数据源工具只读(readOnly 连接 + 单条 SELECT/WITH 校验),在 MCP 层自我兜底,放心自动放行。
+  'list_datasources', 'query_datasource',
 ]);
+
+function visualSkillWriteTarget(toolName: string, input: unknown, skills: string[] | undefined, cwd: string) {
+  if (toolName !== 'Write') return '';
+  if (!skills?.includes('agentma-visual')) return '';
+  const filePath = (input as Record<string, unknown> | null | undefined)?.file_path;
+  if (typeof filePath !== 'string') return '';
+  const normalized = filePath.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+  if (/^viz\/[A-Za-z0-9._-]+\.html$/.test(normalized)) return normalized;
+
+  const resolved = path.resolve(cwd, filePath);
+  let resolvedCwd = path.resolve(cwd);
+  try {
+    resolvedCwd = fs.realpathSync.native(cwd);
+  } catch {}
+  const vizRoot = path.resolve(resolvedCwd, 'viz');
+  let resolvedDir = path.dirname(resolved);
+  try {
+    resolvedDir = fs.realpathSync.native(resolvedDir);
+  } catch {
+    resolvedDir = path.resolve(resolvedDir);
+  }
+  const basename = path.basename(resolved);
+  if (
+    resolvedDir === vizRoot
+    && /^[A-Za-z0-9._-]+\.html$/.test(basename)
+  ) {
+    return `viz/${basename}`;
+  }
+  return '';
+}
 
 // File-mutating tools mapped to the input field that carries their target path.
 // Used to enforce that knowledge-source directories stay read-only.
@@ -191,6 +225,54 @@ export function buildCustomToolsMcp(requestTools: unknown[]) {
   }
   if (!sdkTools.length) return null;
   return createSdkMcpServer({ name: 'custom', version: '1.0.0', tools: sdkTools });
+}
+
+// ─── 数据源 MCP(ChatBI 只读查询)────────────────────────────────────────────
+// in-process 跑在服务进程里(受信代码),agent(沙箱内)只能拿到查询结果,
+// 摸不到 SQLite 文件本身。只读保证见 server-datasource.ts。
+export function buildDatasourceMcp(datasources: DatasourceRow[]) {
+  if (!datasources.length) return null;
+  const byId = new Map(datasources.map((source) => [source.id, source]));
+  const summarize = (source: DatasourceRow) => ({
+    id: source.id,
+    name: source.name,
+    tables: source.tables.map((table) => ({
+      name: table.name,
+      rowCount: table.rowCount,
+      columns: table.columns.map((column) => `${column.name} ${column.type}`.trim()),
+    })),
+  });
+  return createSdkMcpServer({
+    name: 'datasource',
+    version: '1.0.0',
+    tools: [
+      tool(
+        'list_datasources',
+        '列出当前可查询的数据源及其表结构(表名、行数、列名/类型)。',
+        {},
+        async () => ({
+          content: [{ type: 'text', text: JSON.stringify(datasources.map(summarize)) }],
+        }),
+      ),
+      tool(
+        'query_datasource',
+        `对指定数据源执行只读 SQL(SQLite 方言)。只允许单条 SELECT/WITH;结果最多返回 ${DATASOURCE_QUERY_MAX_ROWS} 行,聚合请在 SQL 内完成。`,
+        { datasourceId: z.string(), sql: z.string() },
+        async (args: { datasourceId: string; sql: string }) => {
+          const source = byId.get(String(args.datasourceId || '').trim());
+          if (!source) {
+            return { content: [{ type: 'text', text: `err: 数据源不存在或未对本次运行开放: ${args.datasourceId}` }], isError: true };
+          }
+          try {
+            const result = runDatasourceQuery(source.path, String(args.sql || ''));
+            return { content: [{ type: 'text', text: serializeQueryResult(result) }] };
+          } catch (error) {
+            return { content: [{ type: 'text', text: `err: ${(error as Error).message}` }], isError: true };
+          }
+        },
+      ),
+    ],
+  });
 }
 
 // ─── Permission request system ──────────────────────────────────────────────
@@ -361,6 +443,8 @@ export type AgentEvent =
   | { type: 'task_progress'; taskId: string; toolUseId?: string; description: string; subagentType?: string; lastToolName?: string; summary?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }; sdkSessionId?: string }
   | { type: 'task_updated'; taskId: string; status?: string; description?: string; error?: string; backgrounded?: boolean; sdkSessionId?: string }
   | { type: 'task_notification'; taskId: string; toolUseId?: string; status: string; summary?: string; outputFile?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }; sdkSessionId?: string }
+  | { type: 'run_log'; level: 'info' | 'warn'; scope: 'skill'; message: string }
+  | { type: 'run_outcome'; outcome: RunOutcome; subtype?: string; message?: string }
   | { type: 'result'; subtype: string; text: string; usage: { input_tokens: number; output_tokens: number }; duration_ms: number; cost_usd: number; model: string; sdkSessionId?: string; sdkCwd?: string; structuredOutput?: unknown }
   | { type: 'error'; message: string };
 
@@ -386,11 +470,18 @@ export interface RunAgentOptions {
   enableFileCheckpointing?: boolean;
   /** SDK skills to expose to the main session. */
   skills?: string[];
+  /** MCP server names expected to be loaded natively from project .mcp.json. */
+  mcpServers?: string[];
   /** Allow the agent to read tenant-configured knowledge source directories. */
   useKnowledge?: boolean;
   knowledgeSourceIds?: string[];
+  /** Tenant datasource ids exposed via the read-only datasource MCP tools. */
+  datasourceIds?: string[];
   maxTurns?: number;
+  abortController?: AbortController;
   cwd?: string;
+  /** Persistent template seed copied into a fresh run cwd before SDK query starts. */
+  seedDir?: string;
   resumeSdkSessionId?: string;
   tenantId: string;
   sub: string;
@@ -403,6 +494,10 @@ export interface RunAgentOptions {
 const RUN_CWD_PREFIX = 'agentma-run-';
 const RUN_CWD_DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RUN_CWD_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const AGENT_SEED_MARKER = '.agentma-seeded';
+const BLOCKED_AGENT_SEED_COPY_ENTRIES = new Set(['.git', 'node_modules', '.agent-home', AGENT_SEED_MARKER]);
+const USER_SKILLS_DIR = path.resolve(process.env.AGENTMA_USER_SKILLS_DIR || path.join(os.homedir(), '.claude', 'skills'));
+const SAFE_SKILL_NAME_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 // P1: 给租户 run 的 env 白名单，绝不把宿主全部 process.env 拷进 agent run。
 // 需要额外变量时用 AGENTMA_RUN_ENV_ALLOWLIST 逗号分隔追加，先在 dev 验证不破坏 SDK/MCP。
 const RUN_ENV_DEFAULT_ALLOWLIST = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TMPDIR', 'SHELL'];
@@ -471,6 +566,102 @@ function cleanupExpiredRunCwds(excludeCwd: string) {
       } catch {}
     }
   }
+}
+
+function copyAgentSeedSafe(sourceDir: string, destDir: string) {
+  const sourceRoot = path.resolve(sourceDir);
+  const destRoot = path.resolve(destDir);
+
+  const copyRecursive = (currentSource: string, currentDest: string) => {
+    fs.mkdirSync(currentDest, { recursive: true });
+    const entries = fs.readdirSync(currentSource, { withFileTypes: true });
+    for (const entry of entries) {
+      const sourcePath = path.join(currentSource, entry.name);
+      const destPath = path.join(currentDest, entry.name);
+      const relativePath = path.relative(sourceRoot, sourcePath) || entry.name;
+      const stat = fs.lstatSync(sourcePath);
+      if (stat.isSymbolicLink()) throw new Error(`Agent seed cannot contain symlinks: ${relativePath}`);
+      if (BLOCKED_AGENT_SEED_COPY_ENTRIES.has(entry.name)) throw new Error(`Agent seed cannot contain blocked entry: ${relativePath}`);
+
+      const resolvedDest = path.resolve(destPath);
+      if (resolvedDest !== destRoot && !resolvedDest.startsWith(destRoot + path.sep)) {
+        throw new Error(`Agent seed copy escaped run cwd: ${relativePath}`);
+      }
+
+      if (stat.isDirectory()) {
+        copyRecursive(sourcePath, destPath);
+      } else if (stat.isFile()) {
+        if (!fs.existsSync(destPath)) fs.copyFileSync(sourcePath, destPath);
+      } else {
+        throw new Error(`Agent seed contains unsupported file type: ${relativePath}`);
+      }
+    }
+  };
+
+  copyRecursive(sourceRoot, destRoot);
+}
+
+// Skill 投放,一句话: run 启动时把选中的 skill 从宿主技能库复制进 workspace 的
+// .claude/skills(settingSources 不含 'user',SDK 只认这里),宿主有的以宿主为准,
+// 只在 workspace 里有的沿用 workspace 的,失败的发 run_log 警告。
+// 安全边界两条: skill 目录本身按 realpath 解析(宿主管理员放的软链接可信,如 cc-switch);
+// 目录内部的软链接一律丢弃(防止 skill 内容把 ~/.ssh 等宿主文件带进沙箱)。
+interface SkillProvisionResult {
+  provisioned: string[];
+  issues: Array<{ skill: string; reason: string }>;
+}
+
+function copySkillTree(sourceDir: string, destDir: string) {
+  fs.mkdirSync(destDir, { recursive: true });
+  for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+    const sourcePath = path.join(sourceDir, entry.name);
+    const stat = fs.lstatSync(sourcePath);
+    if (stat.isSymbolicLink()) continue;
+    if (stat.isDirectory()) copySkillTree(sourcePath, path.join(destDir, entry.name));
+    else if (stat.isFile()) fs.copyFileSync(sourcePath, path.join(destDir, entry.name));
+  }
+}
+
+export function provisionRunSkills(skills: string[] | undefined, cwd: string): SkillProvisionResult {
+  const result: SkillProvisionResult = { provisioned: [], issues: [] };
+  if (!skills?.length) return result;
+
+  const targetRoot = path.resolve(cwd, '.claude', 'skills');
+  for (const rawSkill of skills) {
+    const skill = rawSkill.trim();
+    if (!skill) continue;
+    // 名称校验 + 包含性检查: 正则允许 '.',所以 '..' 之类仍可能拼出越界路径。
+    const destDir = path.resolve(targetRoot, skill);
+    if (!SAFE_SKILL_NAME_RE.test(skill) || !destDir.startsWith(targetRoot + path.sep)) {
+      result.issues.push({ skill, reason: '名称非法' });
+      continue;
+    }
+
+    let sourceDir = '';
+    try {
+      sourceDir = fs.realpathSync(path.join(USER_SKILLS_DIR, skill));
+    } catch { /* 宿主库没有 */ }
+
+    if (!sourceDir) {
+      if (fs.existsSync(path.join(destDir, 'SKILL.md'))) result.provisioned.push(skill);
+      else result.issues.push({ skill, reason: '宿主技能库中不存在' });
+      continue;
+    }
+    if (!fs.existsSync(path.join(sourceDir, 'SKILL.md'))) {
+      result.issues.push({ skill, reason: '不是有效 skill 目录(缺 SKILL.md)' });
+      continue;
+    }
+
+    try {
+      fs.rmSync(destDir, { recursive: true, force: true });
+      copySkillTree(sourceDir, destDir);
+      result.provisioned.push(skill);
+    } catch (error) {
+      fs.rmSync(destDir, { recursive: true, force: true });
+      result.issues.push({ skill, reason: (error as Error).message });
+    }
+  }
+  return result;
 }
 
 const SUPPORTED_HOOK_EVENTS: HookRuleEvent[] = ['PreToolUse', 'PostToolUse', 'Notification'];
@@ -563,6 +754,16 @@ function buildKnowledgeSystemPrompt(sources: Array<{ name: string; path: string 
     ...sources.map((source) => `- "${source.name}": ${source.path}`),
     '回答涉及个人知识、笔记、历史记录或知识库内容时,主动使用 Glob 找文件、Grep 全文搜索、Read 读取内容。',
     '引用时给出文件路径；markdown 段落标题、CSV 行列或上传 .xlsx 生成的 .md 表格摘要都可以作为定位信息。Obsidian 风格的 [[wikilink]] 和 #tag 可以直接 grep。',
+  ].join('\n');
+}
+
+function buildDatasourceSystemPrompt(datasources: DatasourceRow[]) {
+  return [
+    '当前运行已接入以下只读数据源(SQLite),通过 MCP 工具查询:',
+    ...datasources.map((source) => `- "${source.name}" (id: ${source.id}): 表 ${source.tables.map((table) => `${table.name}(${table.rowCount} 行)`).join('、') || '(无表)'}`),
+    '需要数据时:先用 list_datasources 查看表结构,再用 query_datasource 执行单条 SELECT/WITH 查询(SQLite 方言)。',
+    `查询结果最多 ${DATASOURCE_QUERY_MAX_ROWS} 行;统计、聚合、排序尽量放在 SQL 里完成,不要把全表拉出来自己算。`,
+    '不要编造数据;回答里的数字必须来自查询结果。需要可视化时,把查到的数据渲染成 HTML 写入 ./viz/<slug>.html。',
   ].join('\n');
 }
 
@@ -663,6 +864,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   fs.mkdirSync(cwd, { recursive: true });
   cleanupExpiredRunCwds(cwd);
 
+  const seedMarkerPath = path.join(cwd, AGENT_SEED_MARKER);
+  const isFreshCwd = !opts.resumeSdkSessionId && !fs.existsSync(seedMarkerPath);
+  if (opts.seedDir && isFreshCwd && fs.existsSync(opts.seedDir)) {
+    copyAgentSeedSafe(opts.seedDir, cwd);
+    fs.writeFileSync(seedMarkerPath, String(Date.now()));
+  }
+
   // Per-call env: 仅白名单，绝不把宿主全部 process.env 灌进租户 run。
   const env: Record<string, string> = {};
   for (const key of RUN_ENV_ALLOWLIST) {
@@ -673,6 +881,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // 使用 cwd 下的稳定子目录，保证同一对话跨 run resume 时 HOME 保持稳定。
   const runHome = path.join(cwd, '.agent-home');
   fs.mkdirSync(runHome, { recursive: true });
+  const skillProvision = provisionRunSkills(opts.skills, cwd);
+  const runSkills = skillProvision.provisioned;
+  for (const issue of skillProvision.issues) {
+    console.warn(`[skill] 未投放 "${issue.skill}": ${issue.reason} (tenant=${opts.tenantId})`);
+    opts.emit({ type: 'run_log', level: 'warn', scope: 'skill', message: `Skill "${issue.skill}" 未加载: ${issue.reason}` });
+  }
   env.HOME = runHome;
   env.ANTHROPIC_API_KEY = opts.apiKey;
   if (opts.baseUrl) env.ANTHROPIC_BASE_URL = opts.baseUrl;
@@ -696,10 +910,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     .filter((source) => !isKnowledgeSourceWritable(source, opts.sub))
     .map((source) => path.resolve(source.path));
   const knowledgeSystemPrompt = knowledgeSources.length ? buildKnowledgeSystemPrompt(knowledgeSources) : '';
-  const skillsSystemPrompt = opts.skills?.length ? buildSkillsSystemPrompt(opts.skills) : '';
+  const requestedDatasourceIds = new Set((opts.datasourceIds || []).map((id) => String(id).trim()).filter(Boolean));
+  const datasources = requestedDatasourceIds.size
+    ? listDatasources(opts.tenantId).filter((source) => source.enabled && requestedDatasourceIds.has(source.id))
+    : [];
+  const datasourceMcp = buildDatasourceMcp(datasources);
+  const datasourceSystemPrompt = datasources.length ? buildDatasourceSystemPrompt(datasources) : '';
+  const skillsSystemPrompt = runSkills.length ? buildSkillsSystemPrompt(runSkills) : '';
   const askUserQuestionSystemPrompt = opts.tools?.includes('AskUserQuestion') ? buildAskUserQuestionSystemPrompt() : '';
-  const effectiveSystemPrompt = [opts.systemPrompt, buildRunIsolationSystemPrompt(), knowledgeSystemPrompt, skillsSystemPrompt, askUserQuestionSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
+  const effectiveSystemPrompt = [opts.systemPrompt, buildRunIsolationSystemPrompt(), knowledgeSystemPrompt, datasourceSystemPrompt, skillsSystemPrompt, askUserQuestionSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
   const agentNames = Object.keys(opts.subagents || {});
+  const nativeMcpServerNames = new Set((opts.mcpServers || []).map((name) => name.trim()).filter((name) => /^[A-Za-z0-9._-]{1,128}$/.test(name)));
   const subagentToolNames = new Set<string>();
   for (const agent of Object.values(opts.subagents || {})) {
     for (const toolName of agent.tools || []) subagentToolNames.add(toolName);
@@ -731,6 +952,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       sdkBuiltinTools.add(toolName);
     }
   }
+  if (datasources.length) {
+    // 模板限定工具时也放行数据源 MCP 工具(随 datasourceIds 启用,不要求模板手填)。
+    templateToolNames.add('mcp__datasource__list_datasources');
+    templateToolNames.add('mcp__datasource__query_datasource');
+  }
+  if (nativeMcpServerNames.size) {
+    for (const serverName of nativeMcpServerNames) {
+      const wildcardTool = `mcp__${serverName}__*`;
+      templateToolNames.add(wildcardTool);
+      sdkBuiltinTools.add(wildcardTool);
+    }
+  }
   if (opts.skills?.length) {
     templateToolNames.add('Skill');
     sdkBuiltinTools.add('Skill');
@@ -742,7 +975,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   const canUseTool: CanUseTool = async (toolName, input, callOpts) => {
     // 1. Template restriction — if template specifies tools and this isn't one of them, deny.
     const allowedBySubagentDefinition = Boolean(callOpts.agentID && subagentToolNames.has(toolName));
-    if (templateToolNames.size > 0 && !templateToolNames.has(toolName) && !allowedBySubagentDefinition) {
+    const allowedByNativeMcpServer = toolName.startsWith('mcp__') && Array.from(nativeMcpServerNames).some((serverName) => (
+      toolName.startsWith(`mcp__${serverName}__`)
+    ));
+    if (templateToolNames.size > 0 && !templateToolNames.has(toolName) && !allowedBySubagentDefinition && !allowedByNativeMcpServer) {
       return { behavior: 'deny', message: `Tool '${toolName}' is not enabled by the agent template.` } as PermissionResult;
     }
     const blockedHostPath = hostPathToolBlock(toolName, input, cwd, additionalDirectories);
@@ -797,6 +1033,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       }
       return { behavior: 'deny', message: policyDecision.reason } as PermissionResult;
     }
+    const visualWriteTarget = visualSkillWriteTarget(toolName, input, opts.skills, cwd);
+    if (visualWriteTarget) {
+      opts.emit({
+        type: 'permission_resolved',
+        toolName,
+        decision: 'allow',
+        reason: `agentma-visual:${visualWriteTarget}`,
+      });
+      return { behavior: 'allow', updatedInput: input } as PermissionResult;
+    }
     // 3. Safe auto-allow (read-only). Strip MCP prefix to check the bare name.
     const bareName = toolName.startsWith('mcp__') ? (toolName.split('__').pop() || toolName) : toolName;
     if (SAFE_AUTO_ALLOW_TOOLS.has(bareName)) {
@@ -819,7 +1065,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   };
 
   const startTime = Date.now();
-  let inTok = 0, outTok = 0, finalText = '', status = 'success', sdkSessionId = opts.resumeSdkSessionId || '', structuredOutput: unknown = undefined;
+  let inTok = 0, outTok = 0, finalText = '', status = 'success', outcome: RunOutcome = 'completed', sdkSessionId = opts.resumeSdkSessionId || '', structuredOutput: unknown = undefined;
   let emittedThinking = false;
   const emitThinking = (text: string) => {
     if (!text) return;
@@ -828,10 +1074,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   };
 
   try {
-    const selectedSkillCommand = getSelectedSkillSlashCommand(opts.prompt, opts.skills);
+    const selectedSkillCommand = getSelectedSkillSlashCommand(opts.prompt, runSkills);
     if (selectedSkillCommand) {
       const args = selectedSkillCommand.args ? ` ${selectedSkillCommand.args.slice(0, 160)}` : '';
-      opts.emit({ type: 'delta', text: `\n[Skill] /${selectedSkillCommand.command}${args} -> ${selectedSkillCommand.skill}\n` });
+      opts.emit({ type: 'run_log', level: 'info', scope: 'skill', message: `/${selectedSkillCommand.command}${args} -> ${selectedSkillCommand.skill}` });
     }
     const queryPrompt = opts.promptImages?.length
       ? buildUserPromptStream(opts.prompt, opts.promptImages)
@@ -841,6 +1087,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       options: {
         model: opts.model,
         permissionMode: 'default',  // canUseTool decides everything
+        ...(opts.abortController ? { abortController: opts.abortController } : {}),
         ...(sdkBuiltinTools.size ? { tools: Array.from(sdkBuiltinTools) } : {}),
         canUseTool,
         ...(opts.tools?.includes('AskUserQuestion') ? { toolConfig: { askUserQuestion: { previewFormat: 'markdown' } } } : {}),
@@ -861,11 +1108,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         ...(opts.resumeSdkSessionId ? { resume: opts.resumeSdkSessionId } : {}),
         ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
         ...(opts.enableFileCheckpointing ? { enableFileCheckpointing: true } : {}),
-        ...(opts.skills?.length ? { skills: opts.skills } : {}),
+        ...(runSkills.length ? { skills: runSkills } : {}),
         env,
         settings: { showThinkingSummaries: true },
         ...(hooks ? { hooks, includeHookEvents: true } : {}),
-        ...(customMcp ? { mcpServers: { custom: customMcp } } : {}),
+        ...(customMcp || datasourceMcp ? {
+          mcpServers: {
+            ...(customMcp ? { custom: customMcp } : {}),
+            ...(datasourceMcp ? { datasource: datasourceMcp } : {}),
+          },
+        } : {}),
         ...(effectiveSystemPrompt ? { systemPrompt: effectiveSystemPrompt } : {}),
       },
     })) {
@@ -893,6 +1145,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         }
       } else if (m.type === 'result') {
         status = m.subtype || 'success';
+        outcome = mapResultSubtypeToOutcome(status);
+        opts.emit({ type: 'run_outcome', outcome, subtype: status });
         if (m.session_id) sdkSessionId = m.session_id;
         if (m.result) finalText = m.result;
         if (m.structured_output !== undefined) structuredOutput = m.structured_output;
@@ -946,13 +1200,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       }
     }
   } catch (e) {
-    status = 'error';
-    opts.emit({ type: 'error', message: (e as Error).message });
+    const message = (e as Error).message || String(e);
+    const isAbort = opts.abortController?.signal.aborted || (e as Error).name === 'AbortError';
+    status = isAbort ? 'aborted' : 'error';
+    outcome = isAbort ? 'stopped' : 'provider_error';
+    opts.emit({ type: 'run_outcome', outcome, message });
+    opts.emit({ type: 'error', message });
   }
 
   const durationMs = Date.now() - startTime;
   const costUsd = estimateCostUsd(opts.model, inTok, outTok);
-  try { recordAgentRun(opts.tenantId, { sub: opts.sub, model: opts.model, durationMs, inputTokens: inTok, outputTokens: outTok, costUsd, status }); } catch {}
+  try { recordAgentRun(opts.tenantId, { sub: opts.sub, model: opts.model, durationMs, inputTokens: inTok, outputTokens: outTok, costUsd, status: outcome }); } catch {}
   opts.emit({
     type: 'result',
     subtype: status,

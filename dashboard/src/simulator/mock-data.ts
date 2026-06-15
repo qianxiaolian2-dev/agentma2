@@ -494,6 +494,7 @@ export const DEFAULT_SKILLS: SkillInfo[] = [
   { name: 'docx', description: '读写 Word 文档 (.docx)', location: 'user', path: '~/.claude/skills/docx/', enabled: true },
   { name: 'xlsx', description: '读写 Excel 电子表格', location: 'user', path: '~/.claude/skills/xlsx/', enabled: false },
   { name: 'pptx', description: '创建和编辑 PPT 演示文稿', location: 'user', path: '~/.claude/skills/pptx/', enabled: false },
+  { name: 'agentma-visual', description: '把内容渲染成可预览和保存的 HTML 可视化', location: 'user', path: '~/.claude/skills/agentma-visual/', enabled: true },
   { name: 'code-review', description: '自动化代码审查助手', location: 'project', path: '.claude/skills/code-review/', enabled: true },
   { name: 'i18n-helper', description: '国际化翻译辅助工具', location: 'project', path: '.claude/skills/i18n-helper/', enabled: false },
   { name: 'api-doc-gen', description: '从代码生成 API 文档', location: 'project', path: '.claude/skills/api-doc-gen/', enabled: true },
@@ -506,7 +507,15 @@ export function initSkills(): SkillInfo[] {
   const key = 'agentma_skills';
   try {
     const raw = localStorage.getItem(key);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return DEFAULT_SKILLS;
+      const existingNames = new Set(parsed.map((skill: SkillInfo) => skill?.name).filter(Boolean));
+      const missingDefaults = DEFAULT_SKILLS.filter((skill) => !existingNames.has(skill.name));
+      const merged = missingDefaults.length ? [...parsed, ...missingDefaults] : parsed;
+      if (missingDefaults.length) localStorage.setItem(key, JSON.stringify(merged));
+      return merged;
+    }
   } catch {}
   // 首次初始化：写入默认技能
   localStorage.setItem(key, JSON.stringify(DEFAULT_SKILLS));

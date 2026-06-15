@@ -3,6 +3,8 @@ import type { ReactNode } from 'react';
 import { getAuthHeaders, getStoredAuthToken, getStoredAuthUser } from '../utils/client-runtime';
 
 interface User {
+  id?: string;
+  username?: string;
   email: string;
   name: string;
   tenantId?: string;
@@ -15,15 +17,12 @@ interface AuthContextType {
   isLoggedIn: boolean;
   login: (email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
   register: (name: string, email: string, password: string) => Promise<{ ok: boolean; error?: string }>;
-  loginWithApiKey: (key: string) => Promise<{ ok: boolean; error?: string }>;
   logout: () => void;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
 function saveJwt(token: string) { localStorage.setItem('agentma_jwt', token); }
-function clearJwt() { localStorage.removeItem('agentma_jwt'); }
-function saveApiKey(key: string) { localStorage.setItem('agentma_api_key', key); }
 function clearApiKey() { localStorage.removeItem('agentma_api_key'); }
 function saveUser(user: User) { localStorage.setItem('agentma_user', JSON.stringify(user)); }
 
@@ -51,6 +50,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (!res.ok) return;
         const data = await res.json();
         const nextUser: User = {
+          id: data.id || user?.id,
+          username: data.username || user?.username,
           email: data.email || user?.email || '',
           name: data.name || user?.name || '',
           tenantId: data.tenantId || user?.tenantId,
@@ -77,9 +78,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!res.ok) return { ok: false, error: data.error || '登录失败' };
       clearApiKey();
       saveJwt(data.token);
-      saveUser({ email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
+      saveUser({ id: data.id, username: data.username, email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
       setToken(data.token);
-      setUser({ email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
+      setUser({ id: data.id, username: data.username, email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
       return { ok: true };
     } catch (e) { return { ok: false, error: (e as Error).message }; }
   }, []);
@@ -95,25 +96,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!res.ok) return { ok: false, error: data.error || '注册失败' };
       clearApiKey();
       saveJwt(data.token);
-      saveUser({ email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
+      saveUser({ id: data.id, username: data.username, email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
       setToken(data.token);
-      setUser({ email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
-      return { ok: true };
-    } catch (e) { return { ok: false, error: (e as Error).message }; }
-  }, []);
-
-  const loginWithApiKey = useCallback(async (key: string) => {
-    try {
-      const res = await fetch('/api/auth/me', {
-        headers: { Authorization: `Bearer ${key}` },
-      });
-      const data = await res.json();
-      if (!res.ok) return { ok: false, error: 'API 密钥无效' };
-      clearJwt();
-      saveApiKey(key);
-      saveUser({ email: data.email || '', name: data.name || '', tenantId: data.tenantId, role: data.role });
-      setToken(key);
-      setUser({ email: data.email || '', name: data.name || '', tenantId: data.tenantId, role: data.role });
+      setUser({ id: data.id, username: data.username, email: data.email, name: data.name, tenantId: data.tenantId, role: data.role });
       return { ok: true };
     } catch (e) { return { ok: false, error: (e as Error).message }; }
   }, []);
@@ -127,7 +112,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, token, isLoggedIn: !!token, login, register, loginWithApiKey, logout }}>
+    <AuthContext.Provider value={{ user, token, isLoggedIn: !!token, login, register, logout }}>
       {children}
     </AuthContext.Provider>
   );

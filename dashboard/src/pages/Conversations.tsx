@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { ClipboardEvent } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig, ChatAttachment, ChatImageMimeType } from '../simulator/types';
@@ -8,13 +8,25 @@ import { getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '
 import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
 import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../components/AskUserQuestionPrompt';
 import { useAuth } from '../contexts/AuthContext';
-import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
+import { bootstrapAgentTemplates, ensureVizAgentTemplate, loadCachedAgentTemplates } from '../utils/agent-templates';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
 import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
-import { loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
+import { findPendingRunMessage, observeServerRun } from '../utils/chat-run-events';
+import { fetchProviderModels, listProviderModels, loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
+import ChatModelPicker from '../components/ChatModelPicker';
+import {
+  deriveRunPhase,
+  isWaitingPhase,
+  mapResultSubtypeToOutcome,
+  normalizeRunOutcome,
+  phaseBadgeClass,
+  phaseLabel,
+  type RunOutcome,
+  type RunPhase,
+} from '../simulator/run-state';
 import {
   CHAT_FILE_ACCEPT,
   CHAT_FILE_MAX_COUNT,
@@ -24,6 +36,7 @@ import {
   fileToChatAttachment,
   formatAttachmentBytes,
   getChatImageSrc,
+  uniqueChatImageFiles,
 } from '../utils/chat-attachments-ui';
 import {
   bootstrapChatSessions,
@@ -128,7 +141,19 @@ function getSessionsForAgent(sessions: ChatSession[], agentId: string) {
 
 function canResumeSessionForAgent(session: ChatSession | null | undefined, agent: AgentTemplate | null | undefined) {
   if (!session?.sdkSessionId || !agent) return false;
-  return session.templateId === agent.id && (!session.model || session.model === agent.model);
+  return session.templateId === agent.id;
+}
+
+const SCROLL_BOTTOM_THRESHOLD = 80;
+
+function isTextEntryElement(element: Element | null) {
+  if (!(element instanceof HTMLElement)) return false;
+  if (element.isContentEditable) return true;
+  const tagName = element.tagName.toLowerCase();
+  if (tagName === 'textarea' || tagName === 'select') return true;
+  if (tagName !== 'input') return false;
+  const type = ((element as HTMLInputElement).type || 'text').toLowerCase();
+  return !['button', 'checkbox', 'color', 'file', 'radio', 'range', 'reset', 'submit'].includes(type);
 }
 
 type ConversationUrlState = Pick<ChatSession, 'id' | 'sdkSessionId'> | null;
@@ -143,15 +168,23 @@ export default function Conversations() {
   const requestedDraft = searchParams.get('draft') || '';
   const { user } = useAuth();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sessionsError, setSessionsError] = useState('');
   const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
   const [selectedAgentId, setSelectedAgentId] = useState('');
+  const [modelOptions, setModelOptions] = useState<string[]>(() => listProviderModels());
+  const [selectedModelOverride, setSelectedModelOverride] = useState<{ contextKey: string; model: string } | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [loadingSessionId, setLoadingSessionId] = useState('');
+  const [sessionLoadError, setSessionLoadError] = useState('');
   const [mobileListOpen, setMobileListOpen] = useState(false);
 
   // 聊天状态
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
+  const [runPhase, setRunPhase] = useState<RunPhase>('idle');
+  const [, setActiveRunId] = useState('');
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
@@ -159,16 +192,32 @@ export default function Conversations() {
   const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState('');
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const sessionLoadSeqRef = useRef(0);
+  const isInputComposingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const observingRunIdRef = useRef('');
   const activeItemRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(resolveProviderForModel().provider);
   const currentAgent = templates.find(t => t.id === selectedAgentId);
   const activeSession = activeSessionId ? sessions.find(s => s.id === activeSessionId) || null : null;
+  const isSessionDetailLoading = Boolean(activeSessionId && loadingSessionId === activeSessionId);
+  const modelContextKey = `${selectedAgentId || ''}:${activeSessionId || 'new'}`;
+  const selectedModel = selectedModelOverride?.contextKey === modelContextKey ? selectedModelOverride.model : '';
+  const effectiveModel = selectedModel || activeSession?.model || currentAgent?.model || '';
+  const pendingRunMessage = useMemo(() => findPendingRunMessage(messages), [messages]);
+  const focusChatInput = useCallback(() => {
+    requestAnimationFrame(() => {
+      if (!textareaRef.current || textareaRef.current.disabled) return;
+      textareaRef.current.focus();
+    });
+  }, []);
 
   const [botEvents, setBotEvents] = useState<Array<{ type: string; source?: string; username?: string; message?: string; health?: number; timestamp: number }>>([]);
   const [eventSources, setEventSources] = useState<EventSourceConfig[]>([]);
@@ -182,6 +231,67 @@ export default function Conversations() {
     .filter(session => !sessionSearch || getChatSessionDisplayTitle(session).toLowerCase().includes(sessionSearch.toLowerCase()));
   const persistRef = useRef<((msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => Promise<string>) | null>(null);
   const appliedDraftRef = useRef('');
+  const appliedConversationRequestRef = useRef('');
+
+  useEffect(() => {
+    if (!user?.tenantId) return;
+    let cancelled = false;
+    void fetchProviderModels()
+      .then((models) => {
+        if (!cancelled && models.length) setModelOptions(models);
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [user?.tenantId]);
+
+  useEffect(() => {
+    if (!currentAgent || isStreaming || isSessionDetailLoading || pendingPermissions.length > 0 || pendingQuestions.length > 0) return;
+    focusChatInput();
+  }, [
+    activeSessionId,
+    currentAgent,
+    focusChatInput,
+    isSessionDetailLoading,
+    isStreaming,
+    pendingPermissions.length,
+    pendingQuestions.length,
+    selectedAgentId,
+  ]);
+
+  useEffect(() => {
+    if (!currentAgent || isStreaming || isSessionDetailLoading || pendingPermissions.length > 0 || pendingQuestions.length > 0) return;
+    const handleTypingIntent = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key.length !== 1) return;
+      if (isTextEntryElement(document.activeElement)) return;
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+
+      const textarea = textareaRef.current;
+      if (!textarea || textarea.disabled) return;
+      event.preventDefault();
+      const start = textarea.selectionStart ?? input.length;
+      const end = textarea.selectionEnd ?? input.length;
+      const nextInput = input.slice(0, start) + event.key + input.slice(end);
+      const nextCursor = start + event.key.length;
+      setInput(nextInput);
+      requestAnimationFrame(() => {
+        textarea.focus();
+        textarea.setSelectionRange(nextCursor, nextCursor);
+        textarea.style.height = 'auto';
+        textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+      });
+    };
+    window.addEventListener('keydown', handleTypingIntent);
+    return () => window.removeEventListener('keydown', handleTypingIntent);
+  }, [
+    currentAgent,
+    input,
+    isSessionDetailLoading,
+    isStreaming,
+    pendingPermissions.length,
+    pendingQuestions.length,
+  ]);
 
   const syncConversationUrl = useCallback((session: ConversationUrlState) => {
     const next = new URLSearchParams(searchParams);
@@ -202,20 +312,78 @@ export default function Conversations() {
     });
   }, []);
 
+  const openSession = useCallback(async (session: ChatSession) => {
+    const loadSeq = ++sessionLoadSeqRef.current;
+    const messageCount = session.messageCount ?? session.messages.length;
+    const hasFullMessages = session.messages.length >= messageCount;
+
+    setActiveSessionId(session.id);
+    setMessages(hasFullMessages ? session.messages : []);
+    setPendingQuestions([]);
+    setAgentTasks([]);
+    setSessionLoadError('');
+    setInput('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    setAttachments([]);
+    setAttachmentError('');
+    if (session.templateId && templates.find(t => t.id === session.templateId)) {
+      setSelectedAgentId(session.templateId);
+    }
+    setMobileListOpen(false);
+    syncConversationUrl(session);
+
+    if (hasFullMessages) {
+      setLoadingSessionId('');
+      return session;
+    }
+
+    setLoadingSessionId(session.id);
+    try {
+      const fullSession = await getChatSession(session.id);
+      if (sessionLoadSeqRef.current !== loadSeq) return null;
+      if (!fullSession) {
+        setSessions(prev => prev.filter(item => item.id !== session.id));
+        setActiveSessionId(null);
+        setMessages([]);
+        syncConversationUrl(null);
+        return null;
+      }
+      upsertSession(fullSession);
+      setMessages(fullSession.messages);
+      if (fullSession.templateId && templates.find(t => t.id === fullSession.templateId)) {
+        setSelectedAgentId(fullSession.templateId);
+      }
+      syncConversationUrl(fullSession);
+      return fullSession;
+    } catch (error) {
+      if (sessionLoadSeqRef.current === loadSeq) {
+        setSessionLoadError((error as Error).message || '历史消息读取失败');
+      }
+      return null;
+    } finally {
+      if (sessionLoadSeqRef.current === loadSeq) setLoadingSessionId('');
+    }
+  }, [syncConversationUrl, templates, upsertSession]);
+
   // 自动回复
   const doAutoReply = useCallback(async (eventText: string) => {
     if (!currentAgent || isStreaming || !activeSessionId) return;
 
     const agent = currentAgent;
     const currentMsgs = messages;
-    const prov = resolveProviderForModel(agent.model).provider;
+    const active = sessions.find((session) => session.id === activeSessionId);
+    const autoModel = selectedModel || active?.model || agent.model;
+    const prov = resolveProviderForModel(autoModel).provider;
 
     setIsStreaming(true);
+    setRunPhase('initializing');
     const eventMsg: ChatMessage = { role: 'user', content: eventText, timestamp: Date.now() };
     const newMsgs = [...currentMsgs, eventMsg];
     const assistantTimestamp = Date.now();
     const draftId0 = crypto.randomUUID();
-    setMessages(appendAssistantDraft(newMsgs, draftId0, assistantTimestamp));
+    const draftMsgs = appendAssistantDraft(newMsgs, draftId0, assistantTimestamp);
+    setMessages(draftMsgs);
+    await persistRef.current?.(draftMsgs, activeSessionId, undefined, undefined);
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
@@ -223,16 +391,43 @@ export default function Conversations() {
 
     let thinking = '';
     let text = '';
+    let runIdForDraft = '';
     let didFinalize = false;
+    let receivedOutcome: RunOutcome | null = null;
+    let outcomeDetail: string | undefined;
+    let cachedErrorMessage = '';
+    const phaseFlags = {
+      initializing: true,
+      streaming: false,
+      thinking: false,
+      toolExecuting: false,
+      awaitingPermission: false,
+      awaitingInput: false,
+      finalizing: false,
+    };
+    let pendingPermissionCount = 0;
+    let pendingQuestionCount = 0;
+    const updateRunPhase = (patch: Partial<typeof phaseFlags>) => {
+      Object.assign(phaseFlags, patch);
+      setRunPhase(deriveRunPhase(phaseFlags));
+    };
+    const finishRun = () => {
+      abortRef.current = null;
+      setIsStreaming(false);
+      setRunPhase('idle');
+      setActiveRunId('');
+    };
     const persistFinalMessage = async (
       content: string,
-      status: NonNullable<ChatMessage['status']>,
+      outcome: RunOutcome,
       sdkSessionId?: string,
       sdkCwd?: string,
+      detail?: string,
     ) => {
       if (didFinalize) return;
       didFinalize = true;
-      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId0, assistantTimestamp, content, status, thinking || undefined);
+      updateRunPhase({ finalizing: true, initializing: false, streaming: false, thinking: false, toolExecuting: false });
+      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId0, assistantTimestamp, content, outcome, thinking || undefined, detail, runIdForDraft || undefined);
       setMessages(finalMsgs);
       const sid = await (persistRef.current?.(finalMsgs, activeSessionId, sdkSessionId, sdkCwd) || Promise.resolve(''));
       if (sid) setActiveSessionId(sid);
@@ -242,23 +437,33 @@ export default function Conversations() {
     abortRef.current = controller;
 
     try {
-      const active = sessions.find((session) => session.id === activeSessionId);
       const shouldResume = canResumeSessionForAgent(active, agent);
       const res = await fetch('/api/chat', {
         method: 'POST',
-        signal: controller.signal,
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
+          assistantDraftId: draftId0,
+          assistantTimestamp,
+          title: createChatSessionTitle(newMsgs, active?.title),
           messages: newMsgs.map((m, index) => ({
             role: m.role,
             content: m.content,
             attachments: index === newMsgs.length - 1 ? m.attachments : undefined,
+            timestamp: m.timestamp,
+            id: m.id,
+            status: m.status,
+            thinking: m.thinking,
+            outcome: m.outcome,
+            outcomeDetail: m.outcomeDetail,
           })),
           systemPrompt: agent.systemPrompt || undefined,
-          model: agent.model,
+          model: autoModel,
           provider: prov,
           providerProfiles: loadProviderProfiles(),
+          templateId: agent.id,
+          sessionId: activeSessionId || undefined,
           tools: buildRequestToolsForAgent(agent),
+          mcpServers: agent.mcpServers || [],
           subagents: agent.subagents,
           skills: agent.skills || [],
           enableFileCheckpointing: agent.enableFileCheckpointing || undefined,
@@ -267,19 +472,28 @@ export default function Conversations() {
           outputSchema: agent.outputSchema || undefined,
           sdkSessionId: shouldResume ? active?.sdkSessionId : undefined,
           sdkCwd: shouldResume ? active?.sdkCwd : undefined,
+          forkedFromSessionId: active?.forkedFromSessionId,
+          forkedFromTitle: active?.forkedFromTitle,
+          pinned: active?.pinned,
+          ownerSub: active?.ownerSub,
+          collaborationEnabled: active?.collaborationEnabled,
+          collaborationRole: active?.collaborationRole,
+          collaborationUpdatedAt: active?.collaborationUpdatedAt,
+          createdAt: active?.createdAt,
         }),
       });
 
       if (!res.ok) {
-        await persistFinalMessage(await readChatError(res), 'error');
-        setIsStreaming(false);
+        const errorText = await readChatError(res);
+        await persistFinalMessage(errorText, 'rejected', undefined, undefined, errorText);
+        finishRun();
         return;
       }
 
       const reader = res.body?.getReader();
       if (!reader) {
-        await persistFinalMessage('连接失败: 响应体为空', 'error');
-        setIsStreaming(false);
+        await persistFinalMessage('连接失败: 响应体为空', 'provider_error', undefined, undefined, 'empty response body');
+        finishRun();
         return;
       }
 
@@ -295,57 +509,97 @@ export default function Conversations() {
           if (!line.startsWith('data: ')) continue;
           try {
             const d = JSON.parse(line.slice(6));
-            if (d.type === 'delta') {
+            if (d.type === 'run_started') {
+              const runId = typeof d.runId === 'string' ? d.runId : '';
+              if (runId) {
+                runIdForDraft = runId;
+                setActiveRunId(runId);
+                setMessages(prev => updateAssistantDraft(prev, draftId0, { runId }));
+                controller.signal.addEventListener('abort', () => {
+                  fetch(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                  }).catch(() => undefined);
+                }, { once: true });
+              }
+            } else if (d.type === 'system' && d.subtype === 'init') {
+              updateRunPhase({ initializing: true });
+            } else if (d.type === 'delta') {
               if (d.thinking) {
                 thinking += d.text || '';
                 setMessages(prev => updateAssistantDraft(prev, draftId0, { thinking, status: 'streaming' }));
+                updateRunPhase({ initializing: false, thinking: true, streaming: false, toolExecuting: false });
               } else {
                 text += d.text || '';
                 setMessages(prev => updateAssistantDraft(prev, draftId0, { content: text, status: 'streaming' }));
+                updateRunPhase({ initializing: false, thinking: false, streaming: true, toolExecuting: false });
               }
             } else if (d.type === 'result') {
+              const finalOutcome = receivedOutcome || mapResultSubtypeToOutcome(d.subtype);
+              const finalDetail = outcomeDetail || (typeof d.subtype === 'string' ? d.subtype : undefined);
               const content = text || d.text || '';
               if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
               if (d.cost_usd !== undefined || d.duration_ms !== undefined)
                 setRunStats({ costUsd: d.cost_usd, durationMs: d.duration_ms, inTok: d.usage?.input_tokens, outTok: d.usage?.output_tokens });
-              await persistFinalMessage(content, 'complete', d.sdkSessionId, d.sdkCwd);
+              await persistFinalMessage(content || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, d.sdkSessionId, d.sdkCwd, finalDetail);
+            } else if (d.type === 'run_outcome') {
+              receivedOutcome = normalizeRunOutcome(d.outcome, receivedOutcome || 'provider_error');
+              outcomeDetail = typeof d.subtype === 'string'
+                ? d.subtype
+                : typeof d.message === 'string' ? d.message : outcomeDetail;
             } else if (d.type === 'permission_request') {
+              pendingPermissionCount += 1;
               setPendingPermissions(prev => [...prev, {
                 reqId: d.reqId, toolName: d.toolName, input: d.input,
                 title: d.title, displayName: d.displayName, description: d.description,
                 toolUseID: d.toolUseID,
               }]);
+              updateRunPhase({ awaitingPermission: true, initializing: false });
             } else if (d.type === 'permission_resolved') {
-              if (d.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
+              if (d.reqId) {
+                pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
+                setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
+                updateRunPhase({ awaitingPermission: pendingPermissionCount > 0 });
+              }
             } else if (d.type === 'ask_user_question') {
+              pendingQuestionCount += 1;
               setPendingQuestions(prev => [...prev, {
                 reqId: d.reqId,
                 questions: d.questions || [],
                 toolUseID: d.toolUseID,
               }]);
+              updateRunPhase({ awaitingInput: true, initializing: false });
             } else if (d.type === 'ask_user_question_resolved') {
-              if (d.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== d.reqId));
+              if (d.reqId) {
+                pendingQuestionCount = Math.max(0, pendingQuestionCount - 1);
+                setPendingQuestions(prev => prev.filter(p => p.reqId !== d.reqId));
+                updateRunPhase({ awaitingInput: pendingQuestionCount > 0 });
+              }
             } else if (String(d.type || '').startsWith('task_')) {
               setAgentTasks(prev => mergeAgentTaskEvent(prev, d));
+              updateRunPhase({ initializing: false, toolExecuting: true, thinking: false, streaming: false });
             } else if (d.type === 'error') {
-              await persistFinalMessage(`错误: ${d.message}`, 'error');
+              cachedErrorMessage = String(d.message || '未知错误');
+              receivedOutcome = receivedOutcome || 'provider_error';
+              outcomeDetail = outcomeDetail || cachedErrorMessage;
             }
           } catch {}
         }
       }
       if (!didFinalize) {
-        await persistFinalMessage(text || '连接失败: 响应提前结束', text ? 'complete' : 'error');
+        const fallbackOutcome = receivedOutcome && receivedOutcome !== 'completed' ? receivedOutcome : 'disconnected';
+        await persistFinalMessage(text || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : '连接失败: 响应提前结束'), fallbackOutcome, undefined, undefined, outcomeDetail);
       }
     } catch (error) {
       if ((error as Error).name === 'AbortError') {
-        await persistFinalMessage(text ? `${text}\n\n_（已停止）_` : '_（已停止）_', 'complete');
+        await persistFinalMessage(text, 'stopped', undefined, undefined, 'AbortError');
       } else {
-        await persistFinalMessage(`连接失败: ${(error as Error).message}`, 'error');
+        const message = (error as Error).message;
+        await persistFinalMessage(`连接失败: ${message}`, 'provider_error', undefined, undefined, message);
       }
     }
-    abortRef.current = null;
-    setIsStreaming(false);
-  }, [currentAgent, isStreaming, activeSessionId, messages, sessions]);
+    finishRun();
+  }, [currentAgent, isStreaming, activeSessionId, messages, sessions, selectedModel]);
 
   // 订阅 EventSource — 当 MCP 服务器部署后，自动桥接 bot 事件到当前会话
   useEffect(() => {
@@ -404,22 +658,30 @@ export default function Conversations() {
   useEffect(() => {
     let cancelled = false;
     if (user?.tenantId) {
-      setTemplates(loadCachedAgentTemplates(user.tenantId));
-      void bootstrapAgentTemplates(user.tenantId, user.role === 'tenant_admin')
-        .then((list) => {
+      const tenantId = user.tenantId;
+      setTemplates(loadCachedAgentTemplates(tenantId));
+      void (async () => {
+        try {
+          const bootstrapped = await bootstrapAgentTemplates(tenantId, user.role === 'tenant_admin');
+          const list = await ensureVizAgentTemplate(tenantId, bootstrapped);
           if (!cancelled) setTemplates(list);
-        })
-        .catch((error) => {
+        } catch (error) {
           console.error('failed to load agent templates', error);
-        });
+        }
+      })();
     }
 
     (async () => {
+      setSessionsLoading(true);
+      setSessionsError('');
       try {
         const savedSessions = await bootstrapChatSessions(!isUsingApiKeyAuth());
         if (!cancelled) setSessions(savedSessions);
       } catch (error) {
         console.error('failed to load chat sessions', error);
+        if (!cancelled) setSessionsError((error as Error).message || '历史对话加载失败');
+      } finally {
+        if (!cancelled) setSessionsLoading(false);
       }
     })();
 
@@ -442,33 +704,41 @@ export default function Conversations() {
   }, [requestedAgentId, sessions, templates, selectedAgentId]);
 
   useEffect(() => {
-    if (joinSessionId) return;
-    if (!requestedConversationId && !requestedSessionId) return;
+    if (joinSessionId) {
+      appliedConversationRequestRef.current = '';
+      return;
+    }
+    const requestKey = requestedConversationId
+      ? `conversation:${requestedConversationId}`
+      : requestedSessionId
+        ? `sdk:${requestedSessionId}`
+        : '';
+    if (!requestKey) {
+      appliedConversationRequestRef.current = '';
+      return;
+    }
+    if (appliedConversationRequestRef.current === requestKey) return;
+
     const requestedSession = (requestedConversationId
       ? sessions.find((session) => session.id === requestedConversationId)
       : null)
       || (requestedSessionId
         ? sessions.find((session) => session.sdkSessionId === requestedSessionId)
         : null);
-    if (!requestedSession || activeSessionId === requestedSession.id) return;
+    if (!requestedSession) return;
 
-    setActiveSessionId(requestedSession.id);
-    setMessages(requestedSession.messages);
-    setPendingQuestions([]);
-    setAgentTasks([]);
-    setInput('');
-    if (textareaRef.current) textareaRef.current.style.height = 'auto';
-    setAttachments([]);
-    setAttachmentError('');
-    if (requestedSession.templateId && templates.find(t => t.id === requestedSession.templateId)) {
-      setSelectedAgentId(requestedSession.templateId);
+    appliedConversationRequestRef.current = requestKey;
+    if (activeSessionId !== requestedSession.id) {
+      void openSession(requestedSession);
     }
-    setMobileListOpen(false);
-  }, [joinSessionId, requestedConversationId, requestedSessionId, sessions, activeSessionId, templates]);
+  }, [joinSessionId, requestedConversationId, requestedSessionId, sessions, activeSessionId, openSession]);
 
   useEffect(() => {
     if (!requestedDraft || appliedDraftRef.current === requestedDraft) return;
     appliedDraftRef.current = requestedDraft;
+    sessionLoadSeqRef.current += 1;
+    setLoadingSessionId('');
+    setSessionLoadError('');
     setActiveSessionId(null);
     setMessages([]);
     setPendingQuestions([]);
@@ -482,12 +752,34 @@ export default function Conversations() {
     setSearchParams(next, { replace: true });
   }, [requestedDraft, searchParams, setSearchParams]);
 
+  const updateScrollBottomVisibility = useCallback(() => {
+    const el = messagesRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const canScroll = el.scrollHeight > el.clientHeight + 1;
+    const shouldShow = canScroll && distanceFromBottom > SCROLL_BOTTOM_THRESHOLD;
+    shouldAutoScrollRef.current = !shouldShow;
+    setShowScrollBottom(current => (current === shouldShow ? current : shouldShow));
+  }, []);
+
   useEffect(() => {
     const el = messagesRef.current;
     if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
-    if (nearBottom || isStreaming) el.scrollTop = el.scrollHeight;
-  }, [messages, agentTasks, isStreaming]);
+    if (shouldAutoScrollRef.current) {
+      el.scrollTop = el.scrollHeight;
+      setShowScrollBottom(false);
+    } else {
+      updateScrollBottomVisibility();
+    }
+  }, [messages, agentTasks, isStreaming, updateScrollBottomVisibility]);
+
+  const scrollToBottom = () => {
+    const el = messagesRef.current;
+    if (!el) return;
+    shouldAutoScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    setShowScrollBottom(false);
+  };
 
   // 保存会话（服务端持久化 + 本地状态同步）
   const persistSession = useCallback(async (msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => {
@@ -495,16 +787,17 @@ export default function Conversations() {
     const now = Date.now();
     const id = sid || `chat-${Date.now()}`;
     const existing = sid ? sessions.find((session) => session.id === sid) : undefined;
-    const currentModel = currentAgent?.model || existing?.model || '';
-    const keepsSameAgent = Boolean(existing && existing.templateId === selectedAgentId && (!existing.model || existing.model === currentModel));
+    const currentModel = selectedModel || existing?.model || currentAgent?.model || '';
+    const canReuseExistingSdkSession = canResumeSessionForAgent(existing, currentAgent);
     const draft: ChatSession = {
       id,
       templateId: selectedAgentId,
       title: createChatSessionTitle(msgs, existing?.title),
       messages: msgs,
+      messageCount: msgs.length,
       model: currentModel,
-      sdkSessionId: sdkSessionId || (keepsSameAgent ? existing?.sdkSessionId : undefined),
-      sdkCwd: sdkCwd || (keepsSameAgent ? existing?.sdkCwd : undefined),
+      sdkSessionId: canReuseExistingSdkSession ? existing?.sdkSessionId : sdkSessionId,
+      sdkCwd: (canReuseExistingSdkSession ? existing?.sdkCwd : undefined) || sdkCwd,
       forkedFromSessionId: existing?.forkedFromSessionId,
       forkedFromTitle: existing?.forkedFromTitle,
       pinned: existing?.pinned,
@@ -533,7 +826,7 @@ export default function Conversations() {
       syncConversationUrl(draft);
       return id;
     }
-  }, [selectedAgentId, currentAgent, sessions, syncConversationUrl]);
+  }, [selectedAgentId, currentAgent, sessions, syncConversationUrl, selectedModel]);
 
   // 把 persistSession 存到 ref 供 doAutoReply 使用
   persistRef.current = persistSession;
@@ -541,6 +834,9 @@ export default function Conversations() {
   // 新建对话
   const handleNew = () => {
     if (!selectedAgentId) return;
+    sessionLoadSeqRef.current += 1;
+    setLoadingSessionId('');
+    setSessionLoadError('');
     setActiveSessionId(null);
     setMessages([]);
     setPendingQuestions([]);
@@ -562,22 +858,13 @@ export default function Conversations() {
 
   // 恢复已有会话
   const handleSelect = useCallback((s: ChatSession) => {
-    setActiveSessionId(s.id);
-    setMessages(s.messages);
-    setPendingQuestions([]);
-    setAgentTasks([]);
-    setInput('');
-    if (textareaRef.current) textareaRef.current.style.height = 'auto';
-    setAttachments([]);
-    setAttachmentError('');
-    if (s.templateId && templates.find(t => t.id === s.templateId)) {
-      setSelectedAgentId(s.templateId);
-    }
-    setMobileListOpen(false);
-    syncConversationUrl(s);
-  }, [templates, syncConversationUrl]);
+    void openSession(s);
+  }, [openSession]);
 
   const handleAgentChange = useCallback((agentId: string) => {
+    sessionLoadSeqRef.current += 1;
+    setLoadingSessionId('');
+    setSessionLoadError('');
     setSelectedAgentId(agentId);
     setSessionSearch('');
     setPendingQuestions([]);
@@ -593,22 +880,23 @@ export default function Conversations() {
 
     const nextSession = getSessionsForAgent(sessions, agentId)[0];
     if (nextSession) {
-      setActiveSessionId(nextSession.id);
-      setMessages(nextSession.messages);
-      syncConversationUrl(nextSession);
+      void openSession(nextSession);
       return;
     }
 
     setActiveSessionId(null);
     setMessages([]);
     syncConversationUrl(null);
-  }, [sessions, syncConversationUrl]);
+  }, [sessions, syncConversationUrl, openSession]);
 
   const refreshSession = useCallback(async (sessionId: string) => {
     const refreshed = await getChatSession(sessionId);
     if (!refreshed) {
       setSessions(prev => prev.filter(session => session.id !== sessionId));
       if (activeSessionId === sessionId) {
+        sessionLoadSeqRef.current += 1;
+        setLoadingSessionId('');
+        setSessionLoadError('');
         setActiveSessionId(null);
         setMessages([]);
         syncConversationUrl(null);
@@ -625,6 +913,51 @@ export default function Conversations() {
   }, [activeSessionId, upsertSession, syncConversationUrl]);
 
   useEffect(() => {
+    if (!activeSessionId || !pendingRunMessage?.id || !pendingRunMessage.runId) {
+      observingRunIdRef.current = '';
+      return;
+    }
+    if (isStreaming || abortRef.current) return;
+    if (observingRunIdRef.current === pendingRunMessage.runId) return;
+    observingRunIdRef.current = pendingRunMessage.runId;
+    const controller = new AbortController();
+    const baseMessages = messages;
+    setPendingPermissions([]);
+    setPendingQuestions([]);
+    setAgentTasks([]);
+    setStructuredOutput(null);
+    setRunStats(null);
+    void observeServerRun({
+      runId: pendingRunMessage.runId,
+      sessionId: activeSessionId,
+      baseMessages,
+      draftId: pendingRunMessage.id,
+      assistantTimestamp: pendingRunMessage.timestamp,
+      initialThinking: pendingRunMessage.thinking,
+      initialText: pendingRunMessage.content,
+      onMessages: setMessages,
+      persistFinal: async (nextMessages, sdkSessionId, sdkCwd) => {
+        const sid = await persistSession(nextMessages, activeSessionId, sdkSessionId, sdkCwd);
+        if (sid) setActiveSessionId(sid);
+      },
+      setIsStreaming,
+      setRunPhase,
+      setActiveRunId,
+      setPendingPermissions,
+      setPendingQuestions,
+      setAgentTasks,
+      setStructuredOutput,
+      setRunStats,
+      abortRef,
+      signal: controller.signal,
+    });
+    return () => {
+      controller.abort();
+      observingRunIdRef.current = '';
+    };
+  }, [activeSessionId, pendingRunMessage?.id, pendingRunMessage?.runId, persistSession]);
+
+  useEffect(() => {
     if (!joinSessionId) return;
     let cancelled = false;
     const clearJoinParam = () => {
@@ -639,6 +972,8 @@ export default function Conversations() {
         const joined = await joinChatSessionApi(joinSessionId);
         if (cancelled) return;
         upsertSession(joined);
+        setLoadingSessionId('');
+        setSessionLoadError('');
         setActiveSessionId(joined.id);
         setMessages(joined.messages);
         if (joined.templateId) setSelectedAgentId(joined.templateId);
@@ -660,6 +995,9 @@ export default function Conversations() {
       if (event.type === 'connected') return;
       if (event.type === 'session_deleted') {
         setSessions(prev => prev.filter(session => session.id !== activeSession.id));
+        sessionLoadSeqRef.current += 1;
+        setLoadingSessionId('');
+        setSessionLoadError('');
         setActiveSessionId(null);
         setMessages([]);
         return;
@@ -714,7 +1052,7 @@ export default function Conversations() {
       const copied = await forkChatSessionApi(source.id);
       setSessions(prev => [copied, ...prev.filter(s => s.id !== copied.id)]);
       setSessionSearch('');
-      handleSelect(copied);
+      void openSession(copied);
     } catch (error) {
       alert(`复制会话失败: ${(error as Error).message || '未知错误'}`);
     }
@@ -725,6 +1063,9 @@ export default function Conversations() {
     const updated = sessions.filter(s => s.id !== id);
     setSessions(updated);
     if (activeSessionId === id) {
+      sessionLoadSeqRef.current += 1;
+      setLoadingSessionId('');
+      setSessionLoadError('');
       setActiveSessionId(null);
       setMessages([]);
       setAttachments([]);
@@ -768,12 +1109,11 @@ export default function Conversations() {
   const handlePaste = useCallback(async (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const clipboardItems = Array.from(event.clipboardData.items || []);
     const clipboardFiles = Array.from(event.clipboardData.files || []);
-    const itemFiles = clipboardItems
+    const itemFiles = clipboardFiles.length ? [] : clipboardItems
       .filter(item => item.kind === 'file')
       .map(item => item.getAsFile())
       .filter((file): file is File => Boolean(file));
-    const files = [...clipboardFiles, ...itemFiles]
-      .filter((file, index, all) => file.type.startsWith('image/') && all.findIndex(candidate => candidate === file) === index);
+    const files = uniqueChatImageFiles([...clipboardFiles, ...itemFiles]);
 
     if (!files.length) return;
     event.preventDefault();
@@ -848,9 +1188,10 @@ export default function Conversations() {
   const handleSend = useCallback(async () => {
     const content = input.trim();
     const messageAttachments = attachments;
-    if ((!content && messageAttachments.length === 0) || isStreaming || !currentAgent) return;
+    if ((!content && messageAttachments.length === 0) || isStreaming || isSessionDetailLoading || !currentAgent) return;
 
-    provider.current = resolveProviderForModel(currentAgent.model).provider;
+    const sendModel = selectedModel || activeSession?.model || currentAgent.model;
+    provider.current = resolveProviderForModel(sendModel).provider;
 
     const userMsg: ChatMessage = {
       role: 'user',
@@ -861,31 +1202,68 @@ export default function Conversations() {
     const newMsgs = [...messages, userMsg];
     const assistantTimestamp = Date.now();
     const draftId = crypto.randomUUID();
-    setMessages(appendAssistantDraft(newMsgs, draftId, assistantTimestamp));
+    const draftMsgs = appendAssistantDraft(newMsgs, draftId, assistantTimestamp);
+    shouldAutoScrollRef.current = true;
+    setShowScrollBottom(false);
+    setMessages(draftMsgs);
+    requestAnimationFrame(() => {
+      const el = messagesRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setAttachmentError('');
     setIsStreaming(true);
+    setRunPhase('initializing');
     setPendingQuestions([]);
     setAgentTasks([]);
     setStructuredOutput(null);
     setRunStats(null);
 
+    const requestSessionId = activeSessionId || `chat-${Date.now()}`;
+    await persistSession(draftMsgs, requestSessionId, undefined, undefined);
     let thinking = '';
     let text = '';
+    let runIdForDraft = '';
     let didFinalize = false;
+    let receivedOutcome: RunOutcome | null = null;
+    let outcomeDetail: string | undefined;
+    let cachedErrorMessage = '';
+    const phaseFlags = {
+      initializing: true,
+      streaming: false,
+      thinking: false,
+      toolExecuting: false,
+      awaitingPermission: false,
+      awaitingInput: false,
+      finalizing: false,
+    };
+    let pendingPermissionCount = 0;
+    let pendingQuestionCount = 0;
+    const updateRunPhase = (patch: Partial<typeof phaseFlags>) => {
+      Object.assign(phaseFlags, patch);
+      setRunPhase(deriveRunPhase(phaseFlags));
+    };
+    const finishRun = () => {
+      abortRef.current = null;
+      setIsStreaming(false);
+      setRunPhase('idle');
+      setActiveRunId('');
+    };
     const persistFinalMessage = async (
       finalContent: string,
-      status: NonNullable<ChatMessage['status']>,
+      outcome: RunOutcome,
       sdkSessionId?: string,
       sdkCwd?: string,
+      detail?: string,
     ) => {
       if (didFinalize) return;
       didFinalize = true;
-      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, finalContent, status, thinking || undefined);
+      updateRunPhase({ finalizing: true, initializing: false, streaming: false, thinking: false, toolExecuting: false });
+      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, finalContent, outcome, thinking || undefined, detail, runIdForDraft || undefined);
       setMessages(finalMsgs);
-      const sid = await persistSession(finalMsgs, activeSessionId, sdkSessionId, sdkCwd);
+      const sid = await persistSession(finalMsgs, requestSessionId, sdkSessionId, sdkCwd);
       if (sid) setActiveSessionId(sid);
     };
 
@@ -897,19 +1275,30 @@ export default function Conversations() {
       const shouldResume = canResumeSessionForAgent(active, currentAgent);
       const res = await fetch('/api/chat', {
         method: 'POST',
-        signal: controller.signal,
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
+          assistantDraftId: draftId,
+          assistantTimestamp,
+          title: createChatSessionTitle(newMsgs, active?.title),
           messages: newMsgs.map((m, index) => ({
             role: m.role,
             content: m.content,
             attachments: index === newMsgs.length - 1 ? m.attachments : undefined,
+            timestamp: m.timestamp,
+            id: m.id,
+            status: m.status,
+            thinking: m.thinking,
+            outcome: m.outcome,
+            outcomeDetail: m.outcomeDetail,
           })),
           systemPrompt: currentAgent.systemPrompt || undefined,
-          model: currentAgent.model,
+          model: sendModel,
           provider: provider.current,
           providerProfiles: loadProviderProfiles(),
+          templateId: currentAgent.id,
+          sessionId: requestSessionId,
           tools: buildRequestToolsForAgent(currentAgent),
+          mcpServers: currentAgent.mcpServers || [],
           subagents: currentAgent.subagents,
           skills: currentAgent.skills || [],
           enableFileCheckpointing: currentAgent.enableFileCheckpointing || undefined,
@@ -918,19 +1307,28 @@ export default function Conversations() {
           outputSchema: currentAgent.outputSchema || undefined,
           sdkSessionId: shouldResume ? active?.sdkSessionId : undefined,
           sdkCwd: shouldResume ? active?.sdkCwd : undefined,
+          forkedFromSessionId: active?.forkedFromSessionId,
+          forkedFromTitle: active?.forkedFromTitle,
+          pinned: active?.pinned,
+          ownerSub: active?.ownerSub,
+          collaborationEnabled: active?.collaborationEnabled,
+          collaborationRole: active?.collaborationRole,
+          collaborationUpdatedAt: active?.collaborationUpdatedAt,
+          createdAt: active?.createdAt,
         }),
       });
 
       if (!res.ok) {
-        await persistFinalMessage(await readChatError(res), 'error');
-        setIsStreaming(false);
+        const errorText = await readChatError(res);
+        await persistFinalMessage(errorText, 'rejected', undefined, undefined, errorText);
+        finishRun();
         return;
       }
 
       const reader = res.body?.getReader();
       if (!reader) {
-        await persistFinalMessage('连接失败: 响应体为空', 'error');
-        setIsStreaming(false);
+        await persistFinalMessage('连接失败: 响应体为空', 'provider_error', undefined, undefined, 'empty response body');
+        finishRun();
         return;
       }
 
@@ -947,57 +1345,97 @@ export default function Conversations() {
           if (!line.startsWith('data: ')) continue;
           try {
             const data = JSON.parse(line.slice(6));
-            if (data.type === 'delta') {
+            if (data.type === 'run_started') {
+              const runId = typeof data.runId === 'string' ? data.runId : '';
+              if (runId) {
+                runIdForDraft = runId;
+                setActiveRunId(runId);
+                setMessages(prev => updateAssistantDraft(prev, draftId, { runId }));
+                controller.signal.addEventListener('abort', () => {
+                  fetch(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
+                    method: 'POST',
+                    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+                  }).catch(() => undefined);
+                }, { once: true });
+              }
+            } else if (data.type === 'system' && data.subtype === 'init') {
+              updateRunPhase({ initializing: true });
+            } else if (data.type === 'delta') {
               if (data.thinking) {
                 thinking += data.text || '';
                 setMessages(prev => updateAssistantDraft(prev, draftId, { thinking, status: 'streaming' }));
+                updateRunPhase({ initializing: false, thinking: true, streaming: false, toolExecuting: false });
               } else {
                 text += data.text || '';
                 setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
+                updateRunPhase({ initializing: false, thinking: false, streaming: true, toolExecuting: false });
               }
             } else if (data.type === 'result') {
+              const finalOutcome = receivedOutcome || mapResultSubtypeToOutcome(data.subtype);
+              const finalDetail = outcomeDetail || (typeof data.subtype === 'string' ? data.subtype : undefined);
               const finalContent = text || data.text || '';
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
               if (data.cost_usd !== undefined || data.duration_ms !== undefined)
                 setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              await persistFinalMessage(finalContent, 'complete', data.sdkSessionId, data.sdkCwd);
+              await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId, data.sdkCwd, finalDetail);
+            } else if (data.type === 'run_outcome') {
+              receivedOutcome = normalizeRunOutcome(data.outcome, receivedOutcome || 'provider_error');
+              outcomeDetail = typeof data.subtype === 'string'
+                ? data.subtype
+                : typeof data.message === 'string' ? data.message : outcomeDetail;
             } else if (data.type === 'permission_request') {
+              pendingPermissionCount += 1;
               setPendingPermissions(prev => [...prev, {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
                 title: data.title, displayName: data.displayName, description: data.description,
                 toolUseID: data.toolUseID,
               }]);
+              updateRunPhase({ awaitingPermission: true, initializing: false });
             } else if (data.type === 'permission_resolved') {
-              if (data.reqId) setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
+              if (data.reqId) {
+                pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
+                setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
+                updateRunPhase({ awaitingPermission: pendingPermissionCount > 0 });
+              }
             } else if (data.type === 'ask_user_question') {
+              pendingQuestionCount += 1;
               setPendingQuestions(prev => [...prev, {
                 reqId: data.reqId,
                 questions: data.questions || [],
                 toolUseID: data.toolUseID,
               }]);
+              updateRunPhase({ awaitingInput: true, initializing: false });
             } else if (data.type === 'ask_user_question_resolved') {
-              if (data.reqId) setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
+              if (data.reqId) {
+                pendingQuestionCount = Math.max(0, pendingQuestionCount - 1);
+                setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
+                updateRunPhase({ awaitingInput: pendingQuestionCount > 0 });
+              }
             } else if (String(data.type || '').startsWith('task_')) {
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
+              updateRunPhase({ initializing: false, toolExecuting: true, thinking: false, streaming: false });
             } else if (data.type === 'error') {
-              await persistFinalMessage(`错误: ${data.message}`, 'error');
+              cachedErrorMessage = String(data.message || '未知错误');
+              receivedOutcome = receivedOutcome || 'provider_error';
+              outcomeDetail = outcomeDetail || cachedErrorMessage;
             }
           } catch {}
         }
       }
       if (!didFinalize) {
-        await persistFinalMessage(text || '连接失败: 响应提前结束', text ? 'complete' : 'error');
+        const fallbackOutcome = receivedOutcome && receivedOutcome !== 'completed' ? receivedOutcome : 'disconnected';
+        await persistFinalMessage(text || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : '连接失败: 响应提前结束'), fallbackOutcome, undefined, undefined, outcomeDetail);
       }
     } catch (e) {
       if ((e as Error).name === 'AbortError') {
-        await persistFinalMessage(text ? `${text}\n\n_（已停止）_` : '_（已停止）_', 'complete');
+        await persistFinalMessage(text, 'stopped', undefined, undefined, 'AbortError');
       } else {
-        await persistFinalMessage(`连接失败: ${(e as Error).message}`, 'error');
+        const message = (e as Error).message;
+        await persistFinalMessage(`连接失败: ${message}`, 'provider_error', undefined, undefined, message);
       }
     }
-    abortRef.current = null;
-    setIsStreaming(false);
-  }, [input, attachments, isStreaming, currentAgent, messages, activeSessionId, persistSession, sessions]);
+    finishRun();
+  }, [input, attachments, isStreaming, isSessionDetailLoading, currentAgent, messages, activeSessionId, persistSession, sessions, selectedModel, activeSession?.model]);
 
   const handleStop = useCallback(() => {
     abortRef.current?.abort();
@@ -1052,7 +1490,7 @@ export default function Conversations() {
               <div
                 key={s.id}
                 ref={activeSessionId === s.id ? activeItemRef : undefined}
-                onClick={() => handleSelect(s)}
+                onClick={() => { void handleSelect(s); }}
                 style={{
                   padding: '10px 12px', borderRadius: 6, cursor: 'pointer',
                   marginBottom: 4, transition: 'all .1s',
@@ -1095,7 +1533,7 @@ export default function Conversations() {
                   <span>{templates.find(t => t.id === s.templateId)?.name || 'Agent'}</span>
                   <span style={{ marginLeft: 8, whiteSpace: 'nowrap' }}>
                     {s.collaborationEnabled && <span title={s.collaborationRole === 'member' ? '我加入的协作会话' : '我开启的协作会话'}>协作 · </span>}
-                    {s.messages.length} 条
+                    {s.messageCount ?? s.messages.length} 条
                   </span>
                 </div>
                 {s.forkedFromTitle && (
@@ -1121,7 +1559,18 @@ export default function Conversations() {
                 </div>
               </div>
             ))}
-          {sessions.length === 0 && (
+          {sessionsLoading && (
+            <div style={{ textAlign: 'center', padding: 20, color: 'var(--ink-muted)', fontSize: '.82em' }}>
+              正在读取历史对话...
+            </div>
+          )}
+          {!sessionsLoading && sessionsError && (
+            <div style={{ textAlign: 'center', padding: 20, color: 'var(--danger)', fontSize: '.82em' }}>
+              历史对话加载失败
+              <div style={{ color: 'var(--ink-muted)', marginTop: 4 }}>{sessionsError}</div>
+            </div>
+          )}
+          {!sessionsLoading && !sessionsError && sessions.length === 0 && (
             <div style={{ textAlign: 'center', padding: 20, color: 'var(--ink-muted)', fontSize: '.82em' }}>
               {templates.length === 0 ? '请先创建 Agent' : '选择 Agent 开始对话'}
             </div>
@@ -1165,7 +1614,18 @@ export default function Conversations() {
                 >
                   会话id {formatShortId(activeSession?.sdkSessionId)}
                 </span>
-                {currentAgent?.model && <span className="badge badge-muted">{currentAgent.model}</span>}
+                {currentAgent && (
+                  <ChatModelPicker
+                    value={effectiveModel}
+                    templateModel={currentAgent.model}
+                    models={modelOptions}
+                    disabled={isStreaming}
+                    onChange={model => setSelectedModelOverride({ contextKey: modelContextKey, model })}
+                  />
+                )}
+                {runPhase !== 'idle' && (
+                  <span className={`badge ${phaseBadgeClass(runPhase)}`}>{phaseLabel(runPhase)}</span>
+                )}
                 {((currentAgent?.knowledgeSourceIds || []).length > 0 || currentAgent?.useKnowledge) && (
                   <span className="badge badge-success">知识库×{(currentAgent?.knowledgeSourceIds || []).length || '全部'}</span>
                 )}
@@ -1232,7 +1692,12 @@ export default function Conversations() {
                       协作{activeSession.collaborationEnabled ? `·${activeSession.collaborationRole === 'member' ? '成员' : 'Owner'}` : '关闭'}
                     </span>
                     {activeSession.collaborationRole !== 'member' && (
-                      <button className="btn btn-sm" onClick={handleToggleCollaboration}>
+                      <button
+                        className="btn btn-sm"
+                        onClick={handleToggleCollaboration}
+                        disabled={!activeSession.persisted}
+                        title={activeSession.persisted ? undefined : '发送一条消息保存会话后才能开启协作'}
+                      >
                         {activeSession.collaborationEnabled ? '关闭协作' : '开启协作'}
                       </button>
                     )}
@@ -1251,7 +1716,7 @@ export default function Conversations() {
             </div>
 
             {/* 消息列表 */}
-            <div className="conversation-messages" ref={messagesRef}>
+            <div className="conversation-messages" ref={messagesRef} onScroll={updateScrollBottomVisibility}>
               {/* Bot 实时事件 */}
               {activeSessionId && (
                 <details style={{ fontSize: '.78em' }}>
@@ -1272,7 +1737,23 @@ export default function Conversations() {
                 </details>
               )}
 
-              {messages.length === 0 && !isStreaming && (
+              {isSessionDetailLoading && !isStreaming && (
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--ink-muted)' }}>
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontWeight: 700 }}>正在读取历史消息...</div>
+                    <div style={{ fontSize: '.82em', maxWidth: 300, marginTop: 4 }}>历史列表已可操作，完整消息会话加载完成后自动显示。</div>
+                  </div>
+                </div>
+              )}
+              {sessionLoadError && !isSessionDetailLoading && !isStreaming && (
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--danger)' }}>
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontWeight: 700 }}>历史消息读取失败</div>
+                    <div style={{ fontSize: '.82em', maxWidth: 320, marginTop: 4, color: 'var(--ink-muted)' }}>{sessionLoadError}</div>
+                  </div>
+                </div>
+              )}
+              {messages.length === 0 && !isSessionDetailLoading && !sessionLoadError && !isStreaming && (
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--ink-muted)' }}>
                   <div style={{ textAlign: 'center' }}>
                     <div style={{ fontSize: '2em' }}>🤖</div>
@@ -1325,6 +1806,17 @@ export default function Conversations() {
               )}
               <div ref={bottomRef} />
             </div>
+            {messages.length > 0 && (
+              <button
+                type="button"
+                className={`chat-scroll-bottom${showScrollBottom ? ' is-visible' : ''}`}
+                onClick={scrollToBottom}
+                aria-label="回到底部"
+                title="回到底部"
+              >
+                <span aria-hidden="true">↓</span>
+              </button>
+            )}
 
             <div className="conversation-prompts">
               <AskUserQuestionPromptList
@@ -1380,7 +1872,7 @@ export default function Conversations() {
                 <button
                   className="btn"
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={isStreaming}
+                  disabled={isStreaming || isSessionDetailLoading}
                   title="上传文件"
                   aria-label="上传文件"
                   style={{ width: 34, height: 34, minWidth: 34, padding: 0, borderRadius: 6, fontSize: 20, lineHeight: '30px' }}
@@ -1392,17 +1884,25 @@ export default function Conversations() {
                   value={input}
                   onChange={e => { setInput(e.target.value); e.target.style.height = 'auto'; e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'; }}
                   onKeyDown={e => {
-                    if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); handleSend(); }
+                    const isComposing = isInputComposingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229;
+                    if (e.key === 'Enter' && !e.shiftKey && !isComposing) {
+                      e.preventDefault();
+                      void handleSend();
+                    }
                   }}
+                  onCompositionStart={() => { isInputComposingRef.current = true; }}
+                  onCompositionEnd={() => { isInputComposingRef.current = false; }}
                   onPaste={handlePaste}
-                  placeholder="输入消息，Shift+Enter 发送，可粘贴图片，也可上传文件"
+                  placeholder="输入消息，Enter 发送，Shift+Enter 换行，可粘贴图片，也可上传文件"
                   style={{ resize: 'none', overflowY: 'hidden', minHeight: 38, maxHeight: 200 }}
-                  disabled={isStreaming}
+                  disabled={isStreaming || isSessionDetailLoading}
                 />
                 {isStreaming ? (
-                  <button className="btn btn-danger" onClick={handleStop}>停止</button>
+                  <button className="btn btn-danger" onClick={handleStop}>
+                    {isWaitingPhase(runPhase) ? '停止等待' : '停止'}
+                  </button>
                 ) : (
-                  <button className="btn btn-primary" onClick={handleSend} disabled={!input.trim() && attachments.length === 0}>
+                  <button className="btn btn-primary" onClick={handleSend} disabled={isSessionDetailLoading || (!input.trim() && attachments.length === 0)}>
                     发送
                   </button>
                 )}

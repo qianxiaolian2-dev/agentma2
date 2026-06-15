@@ -4,11 +4,22 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import bcrypt from 'bcryptjs';
+import {
+  agentRunOutcomeIsFailure,
+  normalizeChatMessageStatus,
+  normalizeMessageOutcome,
+  normalizeRunOutcome,
+  outcomeToMessageStatus,
+  type ChatMessageStatus,
+  type RunOutcome,
+} from './src/simulator/run-state.ts';
 
 export type Role = 'tenant_admin' | 'team_admin' | 'member';
 
 export type AuthIdentity = {
   sub: string;
+  email?: string;
+  username?: string;
   tenantId: string;
   role: Role | null;
   authType: 'jwt' | 'api_key';
@@ -16,6 +27,8 @@ export type AuthIdentity = {
 };
 
 export type UserRow = {
+  id: string;
+  username: string;
   email: string;
   name: string;
   tenantId: string;
@@ -52,7 +65,7 @@ export type QuotaUsageRun = {
   id: string;
   actor: string;
   model: string;
-  status: string;
+  status: RunOutcome;
   durationMs: number;
   inputTokens: number;
   outputTokens: number;
@@ -163,8 +176,14 @@ export type HookRuleDecision = {
 };
 
 export type ChatHistoryMessage = {
+  id?: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  thinking?: string;
+  status?: ChatMessageStatus;
+  outcome?: RunOutcome;
+  outcomeDetail?: string;
+  runId?: string;
   attachments?: ChatHistoryAttachment[];
   timestamp: number;
 };
@@ -184,6 +203,7 @@ export type ChatHistorySession = {
   templateId: string;
   title: string;
   messages: ChatHistoryMessage[];
+  messageCount?: number;
   model: string;
   sdkSessionId?: string;
   sdkCwd?: string;
@@ -262,7 +282,21 @@ export type LearnedSkillRow = {
   learnedAt: number;
 };
 
+export type VisualRow = {
+  id: string;
+  tenantId: string;
+  ownerSub: string;
+  title?: string;
+  html: string;
+  sizeBytes: number;
+  sourceSlug?: string;
+  createdAt: number;
+};
+
+export type VisualListRow = Pick<VisualRow, 'id' | 'title' | 'sizeBytes' | 'createdAt'>;
+
 const LEGACY_PREFIX = 'legacy_sha256$';
+export const MAX_VISUAL_BYTES = 4 * 1024 * 1024;
 const DEFAULT_QUOTA = {
   monthlyActiveSecondsLimit: 36000,
   monthlyActiveSecondsUsed: 0,
@@ -291,6 +325,8 @@ db.exec('PRAGMA foreign_keys = ON');
 
 initSchema();
 migrateLegacyJson();
+backfillUserIdentityColumns();
+migrateOwnerSubsToUserIds();
 
 const JWT_SECRET = process.env.JWT_SECRET || readOrCreateSecret();
 
@@ -299,6 +335,85 @@ function ensureColumn(tableName: string, columnName: string, definition: string)
   const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
   if (rows.some((row) => row.name === columnName)) return;
   db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function baseUsernameFromEmail(email: string) {
+  const prefix = String(email || '').split('@')[0] || 'user';
+  const normalized = prefix
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return normalized || 'user';
+}
+
+function uniqueUsernameForEmail(email: string, existing: Set<string>) {
+  const base = baseUsernameFromEmail(email);
+  let candidate = base;
+  let suffix = 2;
+  while (existing.has(candidate)) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  existing.add(candidate);
+  return candidate;
+}
+
+function loadExistingUsernames() {
+  const rows = db.prepare('SELECT username FROM users WHERE username IS NOT NULL').all() as Array<{ username: string }>;
+  return new Set(rows.map((row) => row.username));
+}
+
+function backfillUserIdentityColumns() {
+  const rows = db.prepare(`
+    SELECT email, id, username
+    FROM users
+    ORDER BY created_at ASC, email ASC
+  `).all() as Array<{ email: string; id?: string | null; username?: string | null }>;
+  const existingUsernames = new Set(rows.flatMap((row) => row.username ? [row.username] : []));
+  const updateId = db.prepare('UPDATE users SET id = ? WHERE email = ?');
+  const updateUsername = db.prepare('UPDATE users SET username = ? WHERE email = ?');
+  for (const row of rows) {
+    if (!row.id) updateId.run(crypto.randomUUID(), row.email);
+    if (!row.username) updateUsername.run(uniqueUsernameForEmail(row.email, existingUsernames), row.email);
+  }
+}
+
+function migrateOwnerSubsToUserIds() {
+  const ownerTables = [
+    ['chat_sessions', 'owner_sub'],
+    ['chat_session_members', 'member_sub'],
+    ['learned_skills', 'owner_sub'],
+    ['visuals', 'owner_sub'],
+  ] as const;
+
+  for (const [tableName, columnName] of ownerTables) {
+    db.exec(`
+      UPDATE ${tableName}
+      SET ${columnName} = (
+        SELECT u.id FROM users u WHERE u.email = ${tableName}.${columnName}
+      )
+      WHERE EXISTS (
+        SELECT 1 FROM users u WHERE u.email = ${tableName}.${columnName}
+      );
+    `);
+    db.exec(`
+      UPDATE ${tableName}
+      SET ${columnName} = (
+        SELECT u.id
+        FROM api_keys k
+        JOIN users u ON u.email = k.created_by
+        WHERE ('api_key:' || k.id) = ${tableName}.${columnName}
+      )
+      WHERE ${columnName} LIKE 'api_key:%'
+        AND EXISTS (
+          SELECT 1
+          FROM api_keys k
+          JOIN users u ON u.email = k.created_by
+          WHERE ('api_key:' || k.id) = ${tableName}.${columnName}
+        );
+    `);
+  }
 }
 
 function initSchema() {
@@ -318,6 +433,8 @@ function initSchema() {
     );
 
     CREATE TABLE IF NOT EXISTS users (
+      id TEXT UNIQUE,
+      username TEXT UNIQUE,
       email TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       password_hash TEXT NOT NULL,
@@ -384,6 +501,7 @@ function initSchema() {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_id_created_at ON audit_logs (tenant_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_action_created_at ON audit_logs (tenant_id, action, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS chat_sessions (
       id TEXT PRIMARY KEY,
@@ -402,6 +520,7 @@ function initSchema() {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_chat_sessions_owner_updated_at ON chat_sessions (tenant_id, owner_sub, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_chat_sessions_owner_pinned_updated_at ON chat_sessions (tenant_id, owner_sub, pinned DESC, updated_at DESC);
 
     CREATE TABLE IF NOT EXISTS chat_session_members (
       session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
@@ -510,13 +629,53 @@ function initSchema() {
       PRIMARY KEY (tenant_id, owner_sub, skill_name)
     );
     CREATE INDEX IF NOT EXISTS idx_learned_skills_owner ON learned_skills (tenant_id, owner_sub, learned_at DESC);
+
+    CREATE TABLE IF NOT EXISTS visuals (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      owner_sub TEXT NOT NULL,
+      title TEXT,
+      html TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      source_slug TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_visuals_owner ON visuals (tenant_id, owner_sub, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS datasources (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      path TEXT NOT NULL,
+      original_filename TEXT,
+      format TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      tables_json TEXT NOT NULL,
+      created_by TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_datasources_tenant ON datasources (tenant_id, updated_at DESC);
   `);
+  ensureColumn('users', 'id', 'TEXT');
+  ensureColumn('users', 'username', 'TEXT');
+  backfillUserIdentityColumns();
+  migrateOwnerSubsToUserIds();
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_id ON users (id)');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users (username)');
   ensureColumn('chat_sessions', 'sdk_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
   ensureColumn('chat_sessions', 'forked_from_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'collaboration_enabled', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('chat_sessions', 'collaboration_updated_at', 'INTEGER');
+  ensureColumn('chat_messages', 'message_id', 'TEXT');
   ensureColumn('chat_messages', 'attachments_json', 'TEXT');
+  ensureColumn('chat_messages', 'status', 'TEXT');
+  ensureColumn('chat_messages', 'thinking', 'TEXT');
+  ensureColumn('chat_messages', 'outcome', 'TEXT');
+  ensureColumn('chat_messages', 'outcome_detail', 'TEXT');
+  ensureColumn('chat_messages', 'run_id', 'TEXT');
   ensureColumn('quotas', 'knowledge_upload_admin_max_files', 'INTEGER NOT NULL DEFAULT 100');
   ensureColumn('quotas', 'knowledge_upload_member_max_files', 'INTEGER NOT NULL DEFAULT 20');
   ensureColumn('quotas', 'knowledge_upload_max_file_bytes', 'INTEGER NOT NULL DEFAULT 1048576');
@@ -602,9 +761,9 @@ function migrateLegacyJson() {
         ? user.passwordHash
         : `${LEGACY_PREFIX}${user.passwordHash}`;
       db.prepare(`
-        INSERT OR IGNORE INTO users (email, name, password_hash, tenant_id, role, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(user.email, user.name, passwordHash, user.tenantId, user.role, user.createdAt);
+        INSERT OR IGNORE INTO users (id, username, email, name, password_hash, tenant_id, role, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(crypto.randomUUID(), uniqueUsernameForEmail(user.email, loadExistingUsernames()), user.email, user.name, passwordHash, user.tenantId, user.role, user.createdAt);
     }
 
     for (const quota of Object.values(legacyQuotas)) {
@@ -949,6 +1108,8 @@ function mapTenant(row: any): TenantRow {
 
 function mapUser(row: any): UserRow {
   return {
+    id: row.id,
+    username: row.username,
     email: row.email,
     name: row.name,
     tenantId: row.tenant_id,
@@ -993,11 +1154,12 @@ function mapQuotaUsageRun(row: any): QuotaUsageRun {
   const diff = asAgentRunDiff(row.diff_json ? JSON.parse(row.diff_json) : {});
   const inputTokens = toFiniteNumber(diff.inputTokens);
   const outputTokens = toFiniteNumber(diff.outputTokens);
+  const status = normalizeRunOutcome(diff.status, 'provider_error');
   return {
     id: row.id,
     actor: row.actor,
     model: String(diff.model || row.resource || '').replace(/^run:/, ''),
-    status: String(diff.status || 'unknown'),
+    status,
     durationMs: toFiniteNumber(diff.durationMs),
     inputTokens,
     outputTokens,
@@ -1144,15 +1306,28 @@ function normalizeChatMessages(messages: unknown): ChatHistoryMessage[] {
   if (!Array.isArray(messages)) return [];
   return messages.flatMap((message, index) => {
     if (!message || typeof message !== 'object') return [];
-    const role = (message as { role?: unknown }).role;
-    const content = (message as { content?: unknown }).content;
-    const attachments = normalizeChatAttachments((message as { attachments?: unknown }).attachments);
-    const timestamp = Number((message as { timestamp?: unknown }).timestamp);
+    const raw = message as Record<string, unknown>;
+    const role = raw.role;
+    const content = raw.content;
+    const attachments = normalizeChatAttachments(raw.attachments);
+    const timestamp = Number(raw.timestamp);
     if (!['user', 'assistant', 'system'].includes(String(role))) return [];
     if (typeof content !== 'string') return [];
+    const status = normalizeChatMessageStatus(raw.status);
+    const outcome = normalizeMessageOutcome(raw.outcome, status);
+    const id = typeof raw.id === 'string' && raw.id ? raw.id : undefined;
+    const thinking = typeof raw.thinking === 'string' && raw.thinking ? raw.thinking : undefined;
+    const outcomeDetail = typeof raw.outcomeDetail === 'string' && raw.outcomeDetail ? raw.outcomeDetail : undefined;
+    const runId = typeof raw.runId === 'string' && raw.runId ? raw.runId : undefined;
     return [{
+      ...(id ? { id } : {}),
       role: role as ChatHistoryMessage['role'],
       content,
+      ...(thinking ? { thinking } : {}),
+      ...(status || outcome ? { status: status || outcomeToMessageStatus(outcome!) } : {}),
+      ...(outcome ? { outcome } : {}),
+      ...(outcomeDetail ? { outcomeDetail } : {}),
+      ...(runId ? { runId } : {}),
       ...(attachments.length ? { attachments } : {}),
       timestamp: Number.isFinite(timestamp) ? timestamp : now() + index,
     }];
@@ -1163,12 +1338,14 @@ function mapChatSession(row: any, messages: ChatHistoryMessage[], viewerSub?: st
   const collaborationRole = viewerSub
     ? (row.owner_sub === viewerSub ? 'owner' : 'member')
     : undefined;
+  const rawMessageCount = Number(row.message_count);
   return {
     id: row.id,
     ownerSub: row.owner_sub,
     templateId: row.template_id,
     title: row.title,
     messages,
+    messageCount: Number.isFinite(rawMessageCount) ? rawMessageCount : messages.length,
     model: row.model,
     sdkSessionId: row.sdk_session_id || undefined,
     sdkCwd: row.sdk_cwd || undefined,
@@ -1183,12 +1360,18 @@ function mapChatSession(row: any, messages: ChatHistoryMessage[], viewerSub?: st
   };
 }
 
+function mapChatSessionSummary(row: any, viewerSub?: string): ChatHistorySession {
+  return mapChatSession(row, [], viewerSub);
+}
+
 function getUserWithPassword(email: string) {
   return db.prepare(`
-    SELECT email, name, password_hash, tenant_id, role, created_at
+    SELECT id, username, email, name, password_hash, tenant_id, role, created_at
     FROM users
     WHERE email = ?
   `).get(email) as {
+    id: string;
+    username: string;
     email: string;
     name: string;
     password_hash: string;
@@ -1200,11 +1383,24 @@ function getUserWithPassword(email: string) {
 
 function getUser(email: string) {
   const row = db.prepare(`
-    SELECT email, name, tenant_id, role, created_at
+    SELECT id, username, email, name, tenant_id, role, created_at
     FROM users
     WHERE email = ?
   `).get(email);
   return row ? mapUser(row) : null;
+}
+
+function getUserById(id: string) {
+  const row = db.prepare(`
+    SELECT id, username, email, name, tenant_id, role, created_at
+    FROM users
+    WHERE id = ?
+  `).get(id);
+  return row ? mapUser(row) : null;
+}
+
+function getUserBySubject(subject: string) {
+  return getUserById(subject) || getUser(subject);
 }
 
 function getTenant(tenantId: string) {
@@ -1263,10 +1459,12 @@ export function authenticateToken(token: string | undefined | null): AuthIdentit
 
   const jwtPayload = verifyJwtOnly(token);
   if (jwtPayload) {
-    const user = getUser(jwtPayload.sub);
+    const user = getUserBySubject(jwtPayload.sub);
     if (!user) return null;
     return {
-      sub: user.email,
+      sub: user.id,
+      email: user.email,
+      username: user.username,
       tenantId: jwtPayload.tenantId,
       role: user.role,
       authType: 'jwt',
@@ -1275,25 +1473,25 @@ export function authenticateToken(token: string | undefined | null): AuthIdentit
 
   const keyHash = sha256(token);
   const row = db.prepare(`
-    SELECT id, tenant_id, created_by, expires_at
+    SELECT id, tenant_id, name, expires_at
     FROM api_keys
     WHERE key_hash = ? AND revoked_at IS NULL
     LIMIT 1
   `).get(keyHash) as {
     id: string;
     tenant_id: string;
-    created_by: string | null;
+    name: string;
     expires_at: number | null;
   } | undefined;
   if (!row) return null;
   if (row.expires_at && row.expires_at <= now()) return null;
 
   db.prepare('UPDATE api_keys SET last_used_at = ? WHERE id = ?').run(now(), row.id);
-  const user = row.created_by ? getUser(row.created_by) : null;
   return {
-    sub: row.created_by || `api_key:${row.id}`,
+    sub: `api_key:${row.id}`,
+    username: row.name || `api_key:${row.id}`,
     tenantId: row.tenant_id,
-    role: user?.role || null,
+    role: null,
     authType: 'api_key',
     apiKeyId: row.id,
   };
@@ -1314,9 +1512,9 @@ export function registerUser(name: string, email: string, password: string) {
     `).run(tenantId, `${name || email}'s Workspace`, 'us', 'free', 'active', createdAt);
 
     db.prepare(`
-      INSERT INTO users (email, name, password_hash, tenant_id, role, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(email, name || email.split('@')[0], passwordHash, tenantId, 'tenant_admin', createdAt);
+      INSERT INTO users (id, username, email, name, password_hash, tenant_id, role, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(crypto.randomUUID(), uniqueUsernameForEmail(email, loadExistingUsernames()), email, name || email.split('@')[0], passwordHash, tenantId, 'tenant_admin', createdAt);
 
     ensureQuotaForTenant(tenantId);
     db.exec('COMMIT');
@@ -1350,9 +1548,9 @@ export function createTenantUser(tenantId: string, name: string, email: string, 
   }
 
   db.prepare(`
-    INSERT INTO users (email, name, password_hash, tenant_id, role, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(normalizedEmail, normalizedName, bcrypt.hashSync(password, 10), tenantId, role, now());
+    INSERT INTO users (id, username, email, name, password_hash, tenant_id, role, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(crypto.randomUUID(), uniqueUsernameForEmail(normalizedEmail, loadExistingUsernames()), normalizedEmail, normalizedName, bcrypt.hashSync(password, 10), tenantId, role, now());
 
   return { ok: true as const, user: getUser(normalizedEmail)! };
 }
@@ -1378,6 +1576,8 @@ export function loginUser(email: string, password: string) {
   return {
     ok: true as const,
     user: {
+      id: user.id,
+      username: user.username,
       email: user.email,
       name: user.name,
       tenantId: user.tenant_id,
@@ -1388,9 +1588,11 @@ export function loginUser(email: string, password: string) {
 }
 
 export function getMe(identity: AuthIdentity) {
-  const user = identity.sub.startsWith('api_key:') ? null : getUser(identity.sub);
+  const user = identity.sub.startsWith('api_key:') ? null : getUserById(identity.sub);
   const tenant = getTenant(identity.tenantId);
   return {
+    id: user?.id || undefined,
+    username: user?.username || identity.username || undefined,
     email: user?.email || undefined,
     tenantId: identity.tenantId,
     name: user?.name,
@@ -1411,7 +1613,7 @@ export function updateTenant(tenantId: string, patch: { name?: string; plan?: st
 
 export function listUsers(tenantId: string) {
   const rows = db.prepare(`
-    SELECT email, name, tenant_id, role, created_at
+    SELECT id, username, email, name, tenant_id, role, created_at
     FROM users
     WHERE tenant_id = ?
     ORDER BY created_at ASC
@@ -1533,8 +1735,8 @@ export function getQuotaUsageSummary(tenantId: string): QuotaUsageSummary {
         percent: clampPercent(quota.weeklyRunCountUsed, quota.weeklyRunCountLimit),
       },
       totalRuns: runs.length,
-      successfulRuns: runs.filter((run) => run.status === 'success').length,
-      failedRuns: runs.filter((run) => run.status !== 'success').length,
+      successfulRuns: runs.filter((run) => run.status === 'completed').length,
+      failedRuns: runs.filter((run) => agentRunOutcomeIsFailure(run.status)).length,
       totalDurationMs,
       totalInputTokens,
       totalOutputTokens,
@@ -2346,22 +2548,43 @@ function getAnyChatSessionRow(sessionId: string) {
 
 function listMessagesForSession(sessionId: string) {
   const rows = db.prepare(`
-    SELECT role, content, attachments_json, timestamp
+    SELECT message_id, role, content, attachments_json, status, thinking, outcome, outcome_detail, run_id, timestamp
     FROM chat_messages
     WHERE session_id = ?
     ORDER BY seq ASC
   `).all(sessionId) as Array<{
+    message_id?: string | null;
     role: ChatHistoryMessage['role'];
     content: string;
     attachments_json?: string | null;
+    status?: string | null;
+    thinking?: string | null;
+    outcome?: string | null;
+    outcome_detail?: string | null;
+    run_id?: string | null;
     timestamp: number;
   }>;
-  return rows.map((row) => ({
-    role: row.role,
-    content: row.content,
-    ...(parseChatAttachments(row.attachments_json).length ? { attachments: parseChatAttachments(row.attachments_json) } : {}),
-    timestamp: row.timestamp,
-  }));
+  return rows.map((row) => {
+    const attachments = parseChatAttachments(row.attachments_json);
+    const status = normalizeChatMessageStatus(row.status);
+    const outcome = normalizeMessageOutcome(row.outcome, status);
+    const id = row.message_id || undefined;
+    const thinking = row.thinking || undefined;
+    const outcomeDetail = row.outcome_detail || undefined;
+    const runId = row.run_id || undefined;
+    return {
+      ...(id ? { id } : {}),
+      role: row.role,
+      content: row.content,
+      ...(thinking ? { thinking } : {}),
+      ...(status || outcome ? { status: status || outcomeToMessageStatus(outcome!) } : {}),
+      ...(outcome ? { outcome } : {}),
+      ...(outcomeDetail ? { outcomeDetail } : {}),
+      ...(runId ? { runId } : {}),
+      ...(attachments.length ? { attachments } : {}),
+      timestamp: row.timestamp,
+    };
+  });
 }
 
 export function listChatSessions(tenantId: string, ownerSub: string) {
@@ -2388,6 +2611,42 @@ export function listChatSessions(tenantId: string, ownerSub: string) {
     ORDER BY s.pinned DESC, s.updated_at DESC
   `).all(tenantId, ownerSub, ownerSub);
   return rows.map((row: any) => mapChatSession(row, listMessagesForSession(row.id), ownerSub));
+}
+
+export function listChatSessionSummaries(tenantId: string, ownerSub: string) {
+  const ownedRows = db.prepare(`
+    SELECT ${CHAT_SESSION_SELECT},
+      (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id) AS message_count
+    FROM chat_sessions s
+    LEFT JOIN chat_sessions parent
+      ON parent.id = s.forked_from_session_id
+      AND parent.tenant_id = s.tenant_id
+      AND parent.owner_sub = s.owner_sub
+    WHERE s.tenant_id = ? AND s.owner_sub = ?
+    ORDER BY s.pinned DESC, s.updated_at DESC
+  `).all(tenantId, ownerSub);
+  const joinedRows = db.prepare(`
+    SELECT ${CHAT_SESSION_SELECT},
+      (SELECT COUNT(*) FROM chat_messages cm WHERE cm.session_id = s.id) AS message_count
+    FROM chat_session_members m
+    JOIN chat_sessions s
+      ON s.id = m.session_id
+      AND s.tenant_id = m.tenant_id
+    LEFT JOIN chat_sessions parent
+      ON parent.id = s.forked_from_session_id
+      AND parent.tenant_id = s.tenant_id
+      AND parent.owner_sub = s.owner_sub
+    WHERE m.tenant_id = ?
+      AND m.member_sub = ?
+      AND s.collaboration_enabled = 1
+      AND s.owner_sub <> ?
+    ORDER BY s.pinned DESC, s.updated_at DESC
+  `).all(tenantId, ownerSub, ownerSub);
+  const rows = [...ownedRows, ...joinedRows].sort((a: any, b: any) => {
+    if (Number(a.pinned) !== Number(b.pinned)) return Number(b.pinned) - Number(a.pinned);
+    return Number(b.updated_at || 0) - Number(a.updated_at || 0);
+  });
+  return rows.map((row: any) => mapChatSessionSummary(row, ownerSub));
 }
 
 export function getLatestAgentRuntimeSession(tenantId: string, ownerSub: string, templateId: string) {
@@ -2432,6 +2691,193 @@ export function getChatSession(tenantId: string, ownerSub: string, sessionId: st
   const row = getAccessibleChatSessionRow(tenantId, ownerSub, sessionId);
   if (!row) return null;
   return mapChatSession(row, listMessagesForSession(sessionId), ownerSub);
+}
+
+function mapVisualRow(row: {
+  id: string;
+  tenant_id: string;
+  owner_sub: string;
+  title: string | null;
+  html: string;
+  size_bytes: number;
+  source_slug: string | null;
+  created_at: number;
+}): VisualRow {
+  return {
+    id: row.id,
+    tenantId: row.tenant_id,
+    ownerSub: row.owner_sub,
+    title: row.title || undefined,
+    html: row.html,
+    sizeBytes: row.size_bytes,
+    sourceSlug: row.source_slug || undefined,
+    createdAt: row.created_at,
+  };
+}
+
+export function createVisual(
+  tenantId: string,
+  ownerSub: string,
+  input: { title?: string; html: string; sourceSlug?: string },
+) {
+  const html = String(input.html || '');
+  const sizeBytes = Buffer.byteLength(html);
+  if (sizeBytes > MAX_VISUAL_BYTES) {
+    throw new Error(`visual html exceeds ${MAX_VISUAL_BYTES} bytes`);
+  }
+  const id = crypto.randomUUID();
+  const createdAt = now();
+  const title = typeof input.title === 'string' && input.title.trim() ? input.title.trim() : null;
+  const sourceSlug = typeof input.sourceSlug === 'string' && input.sourceSlug.trim() ? input.sourceSlug.trim() : null;
+  db.prepare(`
+    INSERT INTO visuals (id, tenant_id, owner_sub, title, html, size_bytes, source_slug, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, tenantId, ownerSub, title, html, sizeBytes, sourceSlug, createdAt);
+  return { id };
+}
+
+export function getVisual(tenantId: string, ownerSub: string, id: string) {
+  const row = db.prepare(`
+    SELECT id, tenant_id, owner_sub, title, html, size_bytes, source_slug, created_at
+    FROM visuals
+    WHERE tenant_id = ? AND owner_sub = ? AND id = ?
+  `).get(tenantId, ownerSub, id) as {
+    id: string;
+    tenant_id: string;
+    owner_sub: string;
+    title: string | null;
+    html: string;
+    size_bytes: number;
+    source_slug: string | null;
+    created_at: number;
+  } | undefined;
+  return row ? mapVisualRow(row) : null;
+}
+
+export function listVisuals(tenantId: string, ownerSub: string): VisualListRow[] {
+  const rows = db.prepare(`
+    SELECT id, title, size_bytes, created_at
+    FROM visuals
+    WHERE tenant_id = ? AND owner_sub = ?
+    ORDER BY created_at DESC
+  `).all(tenantId, ownerSub) as Array<{
+    id: string;
+    title: string | null;
+    size_bytes: number;
+    created_at: number;
+  }>;
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title || undefined,
+    sizeBytes: row.size_bytes,
+    createdAt: row.created_at,
+  }));
+}
+
+export function deleteVisual(tenantId: string, ownerSub: string, id: string) {
+  const result = db.prepare(`
+    DELETE FROM visuals
+    WHERE tenant_id = ? AND owner_sub = ? AND id = ?
+  `).run(tenantId, ownerSub, id) as { changes?: number };
+  return Number(result.changes || 0) > 0;
+}
+
+// ─── 数据源(ChatBI)──────────────────────────────────────────────────────────
+export type DatasourceRow = {
+  id: string;
+  tenantId: string;
+  name: string;
+  path: string;
+  originalFilename?: string;
+  format: string;
+  sizeBytes: number;
+  tables: Array<{ name: string; rowCount: number; columns: Array<{ name: string; type: string }> }>;
+  createdBy?: string;
+  enabled: boolean;
+  createdAt: number;
+  updatedAt: number;
+};
+
+function mapDatasourceRow(row: Record<string, unknown>): DatasourceRow {
+  let tables: DatasourceRow['tables'] = [];
+  try {
+    const parsed = JSON.parse(String(row.tables_json || '[]'));
+    if (Array.isArray(parsed)) tables = parsed;
+  } catch {}
+  return {
+    id: String(row.id),
+    tenantId: String(row.tenant_id),
+    name: String(row.name),
+    path: String(row.path),
+    originalFilename: row.original_filename ? String(row.original_filename) : undefined,
+    format: String(row.format),
+    sizeBytes: Number(row.size_bytes) || 0,
+    tables,
+    createdBy: row.created_by ? String(row.created_by) : undefined,
+    enabled: row.enabled !== 0,
+    createdAt: Number(row.created_at) || 0,
+    updatedAt: Number(row.updated_at) || 0,
+  };
+}
+
+export function createDatasource(
+  tenantId: string,
+  input: {
+    name: string;
+    path: string;
+    originalFilename?: string;
+    format: string;
+    sizeBytes: number;
+    tables: DatasourceRow['tables'];
+    createdBy?: string;
+  },
+): DatasourceRow {
+  const id = crypto.randomUUID();
+  const timestamp = now();
+  db.prepare(`
+    INSERT INTO datasources (id, tenant_id, name, path, original_filename, format, size_bytes, tables_json, created_by, enabled, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+  `).run(
+    id,
+    tenantId,
+    String(input.name || '').slice(0, 80) || '数据源',
+    input.path,
+    input.originalFilename || null,
+    input.format,
+    input.sizeBytes,
+    JSON.stringify(input.tables || []),
+    input.createdBy || null,
+    timestamp,
+    timestamp,
+  );
+  return getDatasource(tenantId, id)!;
+}
+
+export function listDatasources(tenantId: string): DatasourceRow[] {
+  const rows = db.prepare(`
+    SELECT id, tenant_id, name, path, original_filename, format, size_bytes, tables_json, created_by, enabled, created_at, updated_at
+    FROM datasources
+    WHERE tenant_id = ?
+    ORDER BY updated_at DESC, name ASC
+  `).all(tenantId) as Array<Record<string, unknown>>;
+  return rows.map(mapDatasourceRow);
+}
+
+export function getDatasource(tenantId: string, id: string): DatasourceRow | null {
+  const row = db.prepare(`
+    SELECT id, tenant_id, name, path, original_filename, format, size_bytes, tables_json, created_by, enabled, created_at, updated_at
+    FROM datasources
+    WHERE tenant_id = ? AND id = ?
+  `).get(tenantId, id) as Record<string, unknown> | undefined;
+  return row ? mapDatasourceRow(row) : null;
+}
+
+export function deleteDatasource(tenantId: string, id: string) {
+  const result = db.prepare(`
+    DELETE FROM datasources
+    WHERE tenant_id = ? AND id = ?
+  `).run(tenantId, id) as { changes?: number };
+  return Number(result.changes || 0) > 0;
 }
 
 export function listProtectedSdkCwds() {
@@ -2506,12 +2952,25 @@ export function saveChatSession(
     db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(id);
     if (messages.length > 0) {
       const insertMessage = db.prepare(`
-        INSERT INTO chat_messages (session_id, seq, role, content, attachments_json, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO chat_messages (session_id, seq, message_id, role, content, attachments_json, status, thinking, outcome, outcome_detail, run_id, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       messages.forEach((message, index) => {
         const attachmentsJson = message.attachments?.length ? JSON.stringify(message.attachments) : null;
-        insertMessage.run(id, index, message.role, message.content, attachmentsJson, Number(message.timestamp) || updatedAt + index);
+        insertMessage.run(
+          id,
+          index,
+          message.id || null,
+          message.role,
+          message.content,
+          attachmentsJson,
+          message.status || null,
+          message.thinking || null,
+          message.outcome || null,
+          message.outcomeDetail || null,
+          message.runId || null,
+          Number(message.timestamp) || updatedAt + index,
+        );
       });
     }
 
@@ -2798,7 +3257,7 @@ export function replaceAgentTemplates(tenantId: string, templates: Array<Record<
 }
 
 // ═══ Agent Runs (real SDK execution metering) ═══
-export function recordAgentRun(tenantId: string, info: { sub: string; model: string; durationMs: number; inputTokens: number; outputTokens: number; costUsd?: number; status: string }) {
+export function recordAgentRun(tenantId: string, info: { sub: string; model: string; durationMs: number; inputTokens: number; outputTokens: number; costUsd?: number; status: RunOutcome }) {
   ensureQuotaForTenant(tenantId);
   const seconds = Math.max(0, Math.round(info.durationMs / 1000));
   db.prepare('UPDATE quotas SET weekly_run_count_used = weekly_run_count_used + 1, monthly_active_seconds_used = monthly_active_seconds_used + ? WHERE tenant_id = ?').run(seconds, tenantId);

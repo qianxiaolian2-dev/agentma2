@@ -1,0 +1,30 @@
+# Generate Flashcards or Quizzes in NotebookLM
+Flashcards or Quizzes help you master your material by turning information from your sources into interactive study aids.
+- Open an existing notebook or create a new one and upload sources.
+- To generate or delete flashcards or quizzes, you need edit access to a notebook.
+- In the "Studio" panel, select "Flashcards" or “Quizzes” to start, or use the pencil icon to customize before generating. Your study aids will be generated in the background, so you can continue working in your notebook.
+- (Optional) Within the customization panel, you can also express preferences for your flashcards or quizzes:
+- Select the difficulty: Choose between easy, medium, and hard.
+- Input a prompt: Input a prompt to describe the flashcards or quizzes you want to create. You can add a high-level outline, or guide the audience, style, and focus.
+### Study with Flashcards & Quizzes
+Once generated, you can interact with your study aids to help improve your mastery:
+- Choose the number: Select from fewer, standard, and more.
+- Get explanations: Explain cards or answers by clicking the “Explain” button.
+- Track progress:
+- For flashcards, you can mark a flashcard as “Got it!” (checkmark) or “Missed it!” (crossmark)
+- NotebookLM will remember your progress, and you can pick up where you left off if you leave and return.
+- Review: At the end of your flashcards or quiz, you will see your results, and you can choose to review or retake.
+- For flashcards, you can choose to practice again with “Same cards”, “All cards” or focus only on the specific concepts you struggled with by selecting “Only cards you missed.”
+### Flashcard Controls
+You can manage your current deck using the available controls:
+- Previous or Next arrows to navigate to a different card.
+- Full Screen to expand the flashcard viewer
+- Shuffle the order of the cards.
+- Delete a card to remove it from the deck.
+- Restart the session from the beginning.
+- Download your flashcards as a CSV file.
+### Quiz Controls
+You can manage your current quiz using the available controls:
+- Full Screen to expand the quiz viewer.
+- Hint for some help thinking about a quiz question.
+- Previous or Next arrows  to navigate to a different question.

@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { getAuthHeaders } from '../utils/client-runtime';
 import type { ProviderProfile } from '../simulator/types';
 import { createProviderProfile, loadProviderProfiles, mergeProviderProfiles, saveProviderProfiles, splitAvailableModels } from '../utils/providers';
+import { normalizeRunOutcome, outcomeBadgeClass, outcomeLabel } from '../simulator/run-state';
 
 const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
 
@@ -428,11 +429,11 @@ function UserManager() {
       {createError && <div style={{ color: 'var(--danger)', fontSize: '.82em', marginBottom: 10 }}>{createError}</div>}
       <div className="table-wrap">
         <table>
-          <thead><tr><th>邮箱</th><th>名称</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
+          <thead><tr><th>用户名</th><th>邮箱</th><th>名称</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
           <tbody>
             {users.map((u: any) => (
               <tr key={u.email}>
-                <td>{u.email}</td><td>{u.name}</td>
+                <td>{u.username || u.email}</td><td>{u.email}</td><td>{u.name}</td>
                 <td>
                   <select value={u.role} onChange={e => changeRole(u.email, e.target.value)} style={{ width: 130 }}>
                     <option value="tenant_admin">管理员</option><option value="team_admin">团队管理</option><option value="member">成员</option>
@@ -565,11 +566,57 @@ function TeamManager() {
 function QuotaManager() {
   const [quota, setQuota] = useState<any>(null);
   const [usage, setUsage] = useState<QuotaUsageSummary | null>(null);
+  const [quotaLoading, setQuotaLoading] = useState(true);
+  const [usageLoading, setUsageLoading] = useState(true);
+  const [quotaError, setQuotaError] = useState('');
+  const [usageError, setUsageError] = useState('');
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState<any>({});
   useEffect(() => {
-    fetch('/api/quota', { headers: getAuthHeaders() }).then(r => r.json()).then(d => { setQuota(d); setForm(d); });
-    fetch('/api/quota/usage', { headers: getAuthHeaders() }).then(r => r.json()).then(setUsage).catch(() => setUsage(null));
+    let cancelled = false;
+    setQuotaLoading(true);
+    setUsageLoading(true);
+    setQuotaError('');
+    setUsageError('');
+
+    fetch('/api/quota', { headers: getAuthHeaders() })
+      .then(async r => {
+        if (!r.ok) throw new Error(await r.text() || '配额数据加载失败');
+        return r.json();
+      })
+      .then(d => {
+        if (cancelled) return;
+        setQuota(d);
+        setForm(d);
+      })
+      .catch(error => {
+        if (!cancelled) setQuotaError((error as Error).message || '配额数据加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setQuotaLoading(false);
+      });
+
+    fetch('/api/quota/usage', { headers: getAuthHeaders() })
+      .then(async r => {
+        if (!r.ok) throw new Error(await r.text() || '真实用量加载失败');
+        return r.json();
+      })
+      .then(d => {
+        if (!cancelled) setUsage(d);
+      })
+      .catch(error => {
+        if (!cancelled) {
+          setUsage(null);
+          setUsageError((error as Error).message || '真实用量加载失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setUsageLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const save = async () => {
@@ -580,7 +627,28 @@ function QuotaManager() {
     setEditing(false);
   };
 
-  if (!quota) return null;
+  if (quotaLoading) {
+    return (
+      <div className="card">
+        <div className="card-header">配额管理</div>
+        <div className="kpi-card">
+          <div className="kpi-label">正在读取配额数据</div>
+          <div className="kpi-sub">基础配置加载完成后会先显示，真实用量会继续独立刷新。</div>
+        </div>
+      </div>
+    );
+  }
+  if (quotaError || !quota) {
+    return (
+      <div className="card">
+        <div className="card-header">配额管理</div>
+        <div className="kpi-card">
+          <div className="kpi-label" style={{ color: 'var(--danger)' }}>配额数据加载失败</div>
+          <div className="kpi-sub">{quotaError || '服务器没有返回配额数据'}</div>
+        </div>
+      </div>
+    );
+  }
   const FIELDS = [
     { key: 'monthlyActiveSecondsLimit', label: '月活跃秒数上限', unit: '秒' },
     { key: 'weeklyRunCountLimit', label: '周运行次数上限', unit: '次' },
@@ -605,6 +673,30 @@ function QuotaManager() {
 
   return (
     <div style={{ display: 'grid', gap: 16 }}>
+      {usageLoading && (
+        <div className="card">
+          <div className="flex-between">
+            <div className="card-header" style={{ marginBottom: 0 }}>真实用量</div>
+            <span className="badge badge-info">加载中</span>
+          </div>
+          <div className="kpi-card mt-4">
+            <div className="kpi-label">正在聚合最近运行</div>
+            <div className="kpi-sub">配额配置已可查看和调整，用量统计返回后会自动显示。</div>
+          </div>
+        </div>
+      )}
+      {!usageLoading && usageError && (
+        <div className="card">
+          <div className="flex-between">
+            <div className="card-header" style={{ marginBottom: 0 }}>真实用量</div>
+            <span className="badge badge-danger">加载失败</span>
+          </div>
+          <div className="kpi-card mt-4">
+            <div className="kpi-label">最近运行统计暂不可用</div>
+            <div className="kpi-sub">{usageError}</div>
+          </div>
+        </div>
+      )}
       {usage && (
         <div className="card">
           <div className="flex-between">
@@ -700,7 +792,12 @@ function QuotaManager() {
                     <tr key={run.id}>
                       <td style={{ fontSize: '.8em' }}>{new Date(run.createdAt).toLocaleString()}</td>
                       <td style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}>{run.model || 'unknown'}</td>
-                      <td><span className={`badge ${run.status === 'success' ? 'badge-success' : 'badge-danger'}`}>{run.status}</span></td>
+                      <td>
+                        {(() => {
+                          const outcome = normalizeRunOutcome(run.status, 'provider_error');
+                          return <span className={`badge ${outcomeBadgeClass(outcome)}`} title={run.status}>{outcomeLabel(outcome)}</span>;
+                        })()}
+                      </td>
                       <td>{formatDuration(run.durationMs)}</td>
                       <td>{formatNumber(run.totalTokens)}</td>
                       <td>{formatCurrency(run.costUsd)}</td>

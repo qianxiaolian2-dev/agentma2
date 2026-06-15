@@ -14,12 +14,17 @@ import {
   authenticateToken,
   canAccessChatSession,
   createApiKey,
+  createDatasource,
   createTenantUser,
   createTeam,
+  createVisual,
+  deleteDatasource,
   deleteUser,
   deleteChatSession,
+  deleteVisual,
   forkChatSession,
   getDataLocation,
+  getDatasource,
   getMe,
   getLatestAgentRuntimeSession,
   getQuota,
@@ -27,12 +32,15 @@ import {
   getChatSession,
   getPublicSkill,
   getTenantById,
+  getVisual,
   evaluateHookRules,
   evaluatePermissionRules,
   listAgentTemplates,
   listApiKeys,
   listAuditLogs,
   listChatSessions,
+  listChatSessionSummaries,
+  listDatasources,
   listHookRules,
   listKnowledgeSources,
   listPermissionRules,
@@ -41,8 +49,10 @@ import {
   listTeamMembers,
   listTeams,
   listUsers,
+  listVisuals,
   loginUser,
   joinChatSession,
+  MAX_VISUAL_BYTES,
   createPublicSkill,
   registerUser,
   removeTeamMember,
@@ -72,6 +82,16 @@ import {
   resolvePermissionRequest,
   resolveAskUserQuestion,
 } from './server-agent.ts';
+import type { AgentEvent } from './server-agent.ts';
+import {
+  importDatasourceUpload,
+  runDatasourceQuery,
+  serializeQueryResult,
+  datasourceUploadFormat,
+  MAX_DATASOURCE_UPLOAD_BYTES,
+  DATASOURCE_UPLOAD_EXTENSIONS,
+} from './server-datasource.ts';
+import { mapResultSubtypeToOutcome, outcomeToMessageStatus, type RunOutcome } from './src/simulator/run-state.ts';
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -97,6 +117,119 @@ const deployStatus = new Map<string, { status: string; message: string; started:
 const sessionSubs = new Map<string, Set<string>>();
 const sessionSSE = new Map<string, Set<express.Response>>();
 const chatSessionSSE = new Map<string, Set<express.Response>>();
+
+type ServerOwnedRun = {
+  id: string;
+  tenantId: string;
+  ownerSub: string;
+  events: AgentEvent[];
+  subscribers: Set<express.Response>;
+  abortController: AbortController;
+  startedAt: number;
+  completedAt?: number;
+  outcome?: RunOutcome;
+  sessionId: string;
+  sessionDraft: Record<string, unknown>;
+  messagesBeforeAssistant: unknown[];
+  assistantDraftId: string;
+  assistantTimestamp: number;
+  thinking: string;
+  text: string;
+  outcomeDetail?: string;
+  cachedErrorMessage?: string;
+  sdkSessionId?: string;
+  sdkCwd?: string;
+  structuredOutput?: unknown;
+  runStats?: { costUsd?: number; durationMs?: number; inTok?: number; outTok?: number };
+};
+
+const serverRuns = new Map<string, ServerOwnedRun>();
+const SERVER_RUN_TTL_MS = 60 * 60 * 1000;
+
+function writeSse(res: express.Response, event: unknown) {
+  try {
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  } catch {}
+}
+
+function emitServerRun(run: ServerOwnedRun, event: AgentEvent) {
+  run.events.push(event);
+  for (const subscriber of run.subscribers) writeSse(subscriber, event);
+}
+
+function cleanupServerRuns() {
+  const cutoff = Date.now() - SERVER_RUN_TTL_MS;
+  for (const [runId, run] of serverRuns) {
+    if (run.completedAt && run.completedAt < cutoff) serverRuns.delete(runId);
+  }
+}
+
+function appendAssistantForServerRun(run: ServerOwnedRun, content: string, outcome: RunOutcome) {
+  return [
+    ...run.messagesBeforeAssistant,
+    {
+      id: run.assistantDraftId,
+      role: 'assistant',
+      content,
+      status: outcomeToMessageStatus(outcome),
+      outcome,
+      timestamp: run.assistantTimestamp,
+      ...(run.thinking ? { thinking: run.thinking } : {}),
+      ...(run.outcomeDetail ? { outcomeDetail: run.outcomeDetail } : {}),
+      runId: run.id,
+    },
+  ];
+}
+
+function persistServerRunMessages(run: ServerOwnedRun, messages: unknown[]) {
+  const nowMs = Date.now();
+  const draft = {
+    ...run.sessionDraft,
+    id: run.sessionId,
+    messages,
+    messageCount: messages.length,
+    sdkSessionId: run.sdkSessionId || run.sessionDraft.sdkSessionId,
+    sdkCwd: run.sdkCwd || run.sessionDraft.sdkCwd,
+    updatedAt: nowMs,
+  };
+  try {
+    const result = saveChatSession(run.tenantId, run.ownerSub, draft as any);
+    if (result.ok) emitChatSessionEvent(result.session.id, { type: 'session_updated', updatedAt: result.session.updatedAt });
+  } catch (error) {
+    console.error('[chat-run] failed to persist final message', run.id, (error as Error).message);
+  }
+}
+
+function persistServerRunPendingMessage(run: ServerOwnedRun) {
+  const existing = getChatSession(run.tenantId, run.ownerSub, run.sessionId);
+  if (existing && existing.messages.length > 0) {
+    const lastMessage = existing.messages[existing.messages.length - 1] as Record<string, unknown> | undefined;
+    const canAttachRunId = lastMessage?.id === run.assistantDraftId
+      && lastMessage.role === 'assistant'
+      && (lastMessage.status === 'pending' || lastMessage.status === 'streaming');
+    if (!canAttachRunId) return;
+    persistServerRunMessages(run, existing.messages.map((message: any) => (
+      message.id === run.assistantDraftId ? { ...message, runId: run.id } : message
+    )));
+    return;
+  }
+  const messages = [
+    ...run.messagesBeforeAssistant,
+    {
+      id: run.assistantDraftId,
+      role: 'assistant',
+      content: '',
+      status: 'pending',
+      timestamp: run.assistantTimestamp,
+      runId: run.id,
+    },
+  ];
+  persistServerRunMessages(run, messages);
+}
+
+function persistServerRunFinalMessage(run: ServerOwnedRun, content: string, outcome: RunOutcome) {
+  persistServerRunMessages(run, appendAssistantForServerRun(run, content, outcome));
+}
 
 function emitChatSessionEvent(sessionId: string, payload: Record<string, unknown>) {
   const clients = chatSessionSSE.get(sessionId);
@@ -143,6 +276,7 @@ type SkillInfoResponse = {
   learnedFromPublicSkillId?: string;
   learnedFromPublicRevision?: number;
   learnedAt?: number;
+  overwrote?: boolean;
 };
 
 type WorkspaceWikiCandidate = {
@@ -352,7 +486,7 @@ function copySkillDirSafe(sourceDir: string, destDir: string) {
 function installSkillDirToUserBackpack(
   skillFile: string,
   skillDir: string,
-  options: { nameOverride?: string } = {},
+  options: { nameOverride?: string; overwrite?: boolean } = {},
 ) {
   const skill = createInstallSkillInfo(skillFile, skillDir, options);
   const installStats = validateSkillInstallTree(skillDir);
@@ -361,11 +495,13 @@ function installSkillDirToUserBackpack(
   const userSkillsRoot = fs.realpathSync(USER_SKILLS_DIR);
   const destDir = path.join(userSkillsRoot, skill.name);
   if (!isPathInside(destDir, userSkillsRoot)) throw makeHttpError('技能安装路径非法', 400);
-  if (fs.existsSync(destDir)) throw makeHttpError(`用户背包中已存在技能 "${skill.name}"`, 409);
+  const destExists = fs.existsSync(destDir);
+  if (destExists && !options.overwrite) throw makeHttpError(`用户背包中已存在技能 "${skill.name}"`, 409);
 
   const tmpDir = path.join(userSkillsRoot, `.agentma-install-${skill.name}-${crypto.randomBytes(6).toString('hex')}`);
   try {
     copySkillDirSafe(skillDir, tmpDir);
+    if (destExists) fs.rmSync(destDir, { recursive: true, force: true });
     fs.renameSync(tmpDir, destDir);
   } catch (error) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -379,12 +515,13 @@ function installSkillDirToUserBackpack(
     installedPath: `${destDir}${path.sep}`,
     installed: true,
     installStats,
+    overwrote: destExists,
   };
 }
 
-function installWorkspaceSkill(inputPath: string, workspaceRootPath = WORKSPACE_ROOT) {
+function installWorkspaceSkill(inputPath: string, workspaceRootPath = WORKSPACE_ROOT, options: { overwrite?: boolean } = {}) {
   const { skillFile, skillDir } = resolveWorkspaceSkillPath(inputPath, workspaceRootPath);
-  return installSkillDirToUserBackpack(skillFile, skillDir);
+  return installSkillDirToUserBackpack(skillFile, skillDir, options);
 }
 
 function collectLocalSkillDirs(root: string, depth: number, found: Array<{ skillFile: string; skillDir: string }>) {
@@ -467,8 +604,68 @@ function scanLocalSkills(input: string) {
   return deduped.map(({ skillFile, skillDir }) => createLocalSkillInfo(skillFile, skillDir));
 }
 
+function parseConversationIdInput(input: string) {
+  const trimmed = input.trim();
+  if (!trimmed) return '';
+
+  const looksLikeConversationLink = /^(https?:\/\/|\/|conversations(?:[/?]|$)|\?)/i.test(trimmed);
+  if (!looksLikeConversationLink) return trimmed;
+
+  try {
+    const url = new URL(trimmed, 'https://dandelion.skin');
+    return (url.searchParams.get('conversationId') || url.searchParams.get('join') || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function normalizeHtmlText(value: string) {
+  return value
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractTitle(html: string) {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
+  const normalizedTitle = title ? normalizeHtmlText(title) : '';
+  if (normalizedTitle) return normalizedTitle.slice(0, 160);
+  const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1];
+  const normalizedH1 = h1 ? normalizeHtmlText(h1) : '';
+  return normalizedH1 ? normalizedH1.slice(0, 160) : undefined;
+}
+
+function readWorkspaceVisual(auth: any, cid: string, relPath: string) {
+  const sessionId = parseConversationIdInput(cid);
+  if (!sessionId) throw makeHttpError('need cid', 400);
+  const session = getChatSession(auth.tenantId, getChatOwnerSub(auth), sessionId);
+  if (!session) throw makeHttpError('对话不存在或无权访问', 404);
+  const sdkCwd = typeof session.sdkCwd === 'string' ? session.sdkCwd.trim() : '';
+  if (!sdkCwd) throw makeHttpError('该对话没有 workspace', 404);
+  if (!/^viz\/[A-Za-z0-9._-]+\.html$/.test(relPath)) throw makeHttpError('非法路径', 400);
+
+  const cwdInput = path.resolve(expandLocalPath(sdkCwd));
+  if (!fs.existsSync(cwdInput)) throw makeHttpError('workspace 不存在', 404);
+  const cwd = fs.realpathSync(cwdInput);
+  const file = path.resolve(cwd, relPath);
+  if (!isPathInside(file, cwd)) throw makeHttpError('路径越界', 400);
+  if (!fs.existsSync(file)) throw makeHttpError('文件不存在', 404);
+  const realFile = fs.realpathSync(file);
+  if (!isPathInside(realFile, cwd)) throw makeHttpError('路径越界', 400);
+  const stat = fs.statSync(realFile);
+  if (!stat.isFile()) throw makeHttpError('文件不存在', 404);
+  if (stat.size > MAX_VISUAL_BYTES) throw makeHttpError('文件过大', 413);
+  return { html: fs.readFileSync(realFile, 'utf8'), mtimeMs: stat.mtimeMs };
+}
+
 function resolveWorkspaceRootFromConversation(auth: any, conversationId: string) {
-  const id = conversationId.trim();
+  const id = parseConversationIdInput(conversationId);
   if (!id) throw makeHttpError('need conversationId', 400);
   const session = getChatSession(auth.tenantId, getChatOwnerSub(auth), id);
   if (!session) throw makeHttpError('对话不存在或无权访问', 404);
@@ -483,17 +680,28 @@ function resolveWorkspaceRootFromConversation(auth: any, conversationId: string)
 
 function scanWorkspaceSkillsFromConversation(auth: any, conversationId: string) {
   const workspaceRoot = resolveWorkspaceRootFromConversation(auth, conversationId);
-  return scanWorkspaceSkills('.claude/skills', workspaceRoot);
+  try {
+    return scanWorkspaceSkills('.claude/skills', workspaceRoot);
+  } catch (error) {
+    const err = error as Error & { status?: number };
+    if (err.status === 404) return [];
+    throw error;
+  }
 }
 
-function installWorkspaceSkillFromConversation(auth: any, conversationId: string, skillName: string) {
+function installWorkspaceSkillFromConversation(
+  auth: any,
+  conversationId: string,
+  skillName: string,
+  options: { overwrite?: boolean } = {},
+) {
   const name = skillName.trim();
   if (!name) throw makeHttpError('need skill name', 400);
   const workspaceRoot = resolveWorkspaceRootFromConversation(auth, conversationId);
   const candidates = scanWorkspaceSkills('.claude/skills', workspaceRoot);
   const match = candidates.find((skill) => skill.name === name);
   if (!match) throw makeHttpError(`对话 workspace 中没有找到技能 "${name}"`, 404);
-  return installWorkspaceSkill(match.sourcePath || match.path, workspaceRoot);
+  return installWorkspaceSkill(match.sourcePath || match.path, workspaceRoot, options);
 }
 
 function collectWorkspaceWikiStats(wikiDir: string) {
@@ -673,12 +881,13 @@ function importWorkspaceWikiFromConversation(auth: any, conversationId: string, 
   }
 
   const sourceName = (name.trim() || `${candidate.name.replace(/\/?wiki$/, '') || 'Workspace'} Wiki`).slice(0, 80);
-  const current = listKnowledgeSources(auth.tenantId, auth.sub, auth.role)
-    .filter((source) => auth.role === 'tenant_admin' || source.createdBy === auth.sub);
+  const actorEmail = auth.email || auth.sub;
+  const current = listKnowledgeSources(auth.tenantId, actorEmail, auth.role)
+    .filter((source) => auth.role === 'tenant_admin' || source.createdBy === actorEmail);
   const saved = replaceKnowledgeSources(auth.tenantId, [
     ...current,
-    { name: sourceName, path: resolvedUploadRoot, enabled: true, readOnly: true, createdBy: auth.sub },
-  ], auth.sub, auth.role);
+    { name: sourceName, path: resolvedUploadRoot, enabled: true, readOnly: true, createdBy: actorEmail },
+  ], actorEmail, auth.role);
   const source = saved.find((item) => item.path === fs.realpathSync.native(resolvedUploadRoot)) || saved[saved.length - 1];
   return { source, importedPath: resolvedUploadRoot, candidate, importStats };
 }
@@ -886,7 +1095,7 @@ function normalizeAgentTemplateForApi(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const template = { ...(value as Record<string, unknown>) };
 
-  for (const key of ['tools', 'mcpServers', 'eventSources', 'skills', 'knowledgeSourceIds']) {
+  for (const key of ['tools', 'mcpServers', 'eventSources', 'skills', 'knowledgeSourceIds', 'datasourceIds']) {
     if (Array.isArray(template[key])) template[key] = normalizeStringArray(template[key]) || [];
   }
 
@@ -1265,12 +1474,21 @@ app.post('/api/deploy', async (req, res) => {
 app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const { prompt, messages: inputMessages, systemPrompt, model, provider, tools: requestTools } = req.body || {};
   const subagents = normalizeSubagents(req.body?.subagents);
+  const templateId = typeof req.body?.templateId === 'string' ? req.body.templateId.trim() : '';
+  const template = templateId
+    ? listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi).find((item) => String(item.id || '') === templateId)
+    : null;
+  const sessionId = typeof req.body?.sessionId === 'string' && req.body.sessionId.trim()
+    ? req.body.sessionId.trim()
+    : `chat-${Date.now()}`;
   const resumeSdkSessionId = typeof req.body?.sdkSessionId === 'string' ? req.body.sdkSessionId.trim() : '';
   const sdkCwd = typeof req.body?.sdkCwd === 'string' ? req.body.sdkCwd.trim() : '';
   const enableFileCheckpointing = req.body?.enableFileCheckpointing === true;
   const useKnowledge = req.body?.useKnowledge === true;
   const knowledgeSourceIds = normalizeStringArray(req.body?.knowledgeSourceIds) || [];
+  const datasourceIds = normalizeStringArray(req.body?.datasourceIds ?? template?.datasourceIds) || [];
   const skills = normalizeStringArray(req.body?.skills);
+  const mcpServers = normalizeStringArray(template?.mcpServers || req.body?.mcpServers);
   const outputSchema = req.body?.outputSchema && typeof req.body.outputSchema === 'object' && !Array.isArray(req.body.outputSchema)
     ? req.body.outputSchema as Record<string, unknown>
     : undefined;
@@ -1318,6 +1536,16 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   } else {
     res.status(400).json({ error: 'need prompt or messages' }); return;
   }
+  if (sessionId) {
+    const visualPreviewPath = `/viz?cid=${encodeURIComponent(sessionId)}&path=viz/<slug>.html`;
+    effectiveSystemPrompt = [
+      effectiveSystemPrompt,
+      [
+        '[可视化预览] 用 agentma-visual skill 产出可视化时,把 HTML 写到 ./viz/<slug>.html,',
+        `并给用户这个 markdown 链接:${visualPreviewPath}`,
+      ].join('\n'),
+    ].filter(Boolean).join('\n\n');
+  }
   const selectedModel = [
     model,
     provider?.ANTHROPIC_MODEL,
@@ -1332,14 +1560,83 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
-  const emit = (e: any) => { try { res.write(`data: ${JSON.stringify(e)}\n\n`); } catch {} };
+  cleanupServerRuns();
+  const abortController = new AbortController();
+  const runId = crypto.randomUUID();
+  const ownerSub = getChatOwnerSub(req.auth);
+  const run: ServerOwnedRun = {
+    id: runId,
+    tenantId: req.auth.tenantId,
+    ownerSub,
+    events: [],
+    subscribers: new Set([res]),
+    abortController,
+    startedAt: Date.now(),
+    sessionId,
+    sessionDraft: {
+      id: sessionId,
+      templateId: templateId || String(req.body?.templateId || ''),
+      title: typeof req.body?.title === 'string' ? req.body.title : '新对话',
+      model: selectedModel,
+      sdkSessionId: resumeSdkSessionId || undefined,
+      sdkCwd: sdkCwd || undefined,
+      forkedFromSessionId: req.body?.forkedFromSessionId,
+      forkedFromTitle: req.body?.forkedFromTitle,
+      pinned: req.body?.pinned,
+      ownerSub: req.body?.ownerSub,
+      collaborationEnabled: req.body?.collaborationEnabled,
+      collaborationRole: req.body?.collaborationRole,
+      collaborationUpdatedAt: req.body?.collaborationUpdatedAt,
+      createdAt: Number(req.body?.createdAt) || Date.now(),
+    },
+    messagesBeforeAssistant: Array.isArray(inputMessages) ? inputMessages : [],
+    assistantDraftId: typeof req.body?.assistantDraftId === 'string' ? req.body.assistantDraftId : crypto.randomUUID(),
+    assistantTimestamp: Number(req.body?.assistantTimestamp) || Date.now(),
+    thinking: '',
+    text: '',
+  };
+  serverRuns.set(runId, run);
+  persistServerRunPendingMessage(run);
+  writeSse(res, { type: 'run_started', runId, sessionId });
+  req.on('close', () => {
+    run.subscribers.delete(res);
+  });
 
   const sessionAllow = new Set<string>();
+  const emit = (event: AgentEvent) => {
+    if (event.type === 'delta') {
+      if (event.thinking) run.thinking += event.text || '';
+      else run.text += event.text || '';
+    } else if (event.type === 'run_outcome') {
+      run.outcome = event.outcome;
+      run.outcomeDetail = event.subtype || event.message || run.outcomeDetail;
+    } else if (event.type === 'error') {
+      run.cachedErrorMessage = event.message;
+      run.outcome = run.outcome || 'provider_error';
+      run.outcomeDetail = run.outcomeDetail || event.message;
+    } else if (event.type === 'result') {
+      run.sdkSessionId = event.sdkSessionId;
+      run.sdkCwd = event.sdkCwd;
+      run.structuredOutput = event.structuredOutput;
+      run.runStats = {
+        costUsd: event.cost_usd,
+        durationMs: event.duration_ms,
+        inTok: event.usage?.input_tokens,
+        outTok: event.usage?.output_tokens,
+      };
+      const outcome = run.outcome || mapResultSubtypeToOutcome(event.subtype);
+      const finalContent = run.text || event.text || (run.cachedErrorMessage ? `错误: ${run.cachedErrorMessage}` : '');
+      persistServerRunFinalMessage(run, finalContent, outcome);
+      run.outcome = outcome;
+      run.completedAt = Date.now();
+    }
+    emitServerRun(run, event);
+  };
   const requestPermission = createPermissionRequester({ emit, sessionAllow, tenantId: req.auth.tenantId });
   const requestUserQuestion = createAskUserQuestionRequester({ emit, tenantId: req.auth.tenantId });
   const toolsList = Array.isArray(requestTools) ? requestTools.map((t: any) => t?.name).filter(Boolean) : undefined;
 
-  await runAgent({
+  void runAgent({
     prompt: runPrompt,
     promptImages,
     systemPrompt: effectiveSystemPrompt || undefined,
@@ -1350,11 +1647,14 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     requestTools: Array.isArray(requestTools) ? requestTools : undefined,
     subagents,
     skills,
+    mcpServers,
     cwd: sdkCwd || undefined,
+    seedDir: resolveAgentSeedDirForTemplate(req.auth.tenantId, template),
     resumeSdkSessionId: resumeSdkSessionId || undefined,
     enableFileCheckpointing: enableFileCheckpointing || undefined,
     useKnowledge: useKnowledge || knowledgeSourceIds.length > 0,
     knowledgeSourceIds,
+    datasourceIds,
     outputFormat: outputSchema ? { type: 'json_schema', schema: outputSchema } : undefined,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
@@ -1362,8 +1662,68 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     emit,
     requestPermission,
     requestUserQuestion,
+    abortController,
+  }).catch((error) => {
+    console.error('[chat-run] failed', runId, (error as Error).message);
+  }).finally(() => {
+    if (!run.completedAt) {
+      const outcome = run.outcome || (abortController.signal.aborted ? 'stopped' : 'provider_error');
+      const finalContent = run.text || (run.cachedErrorMessage ? `错误: ${run.cachedErrorMessage}` : '');
+      persistServerRunFinalMessage(run, finalContent, outcome);
+      run.outcome = outcome;
+      run.completedAt = Date.now();
+      emitServerRun(run, {
+        type: 'result',
+        subtype: outcome === 'stopped' ? 'aborted' : 'error',
+        text: finalContent,
+        usage: { input_tokens: 0, output_tokens: 0 },
+        duration_ms: Date.now() - run.startedAt,
+        cost_usd: 0,
+        model: selectedModel,
+        sdkSessionId: run.sdkSessionId,
+        sdkCwd: run.sdkCwd,
+      });
+    }
+    for (const subscriber of run.subscribers) {
+      try { subscriber.end(); } catch {}
+    }
+    run.subscribers.clear();
   });
-  res.end();
+});
+
+app.get('/api/chat/runs/:id/events', authMiddleware, (req: any, res) => {
+  const run = serverRuns.get(req.params.id);
+  if (!run || run.tenantId !== req.auth.tenantId || run.ownerSub !== getChatOwnerSub(req.auth)) {
+    res.status(404).json({ error: 'run not found' });
+    return;
+  }
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  writeSse(res, { type: 'run_started', runId: run.id, sessionId: run.sessionId });
+  for (const event of run.events) writeSse(res, event);
+  if (run.completedAt) {
+    res.end();
+    return;
+  }
+  run.subscribers.add(res);
+  req.on('close', () => {
+    run.subscribers.delete(res);
+  });
+});
+
+app.post('/api/chat/runs/:id/cancel', authMiddleware, (req: any, res) => {
+  const run = serverRuns.get(req.params.id);
+  if (!run || run.tenantId !== req.auth.tenantId || run.ownerSub !== getChatOwnerSub(req.auth)) {
+    res.status(404).json({ error: 'run not found' });
+    return;
+  }
+  if (!run.completedAt && !run.abortController.signal.aborted) {
+    run.abortController.abort();
+  }
+  res.json({ ok: true });
 });
 
 // 启动时恢复已部署的 MCP 服务器
@@ -1423,8 +1783,7 @@ function requireAdmin(req: any, res: any, next: any) {
   next();
 }
 
-function getChatOwnerSub(auth: { sub: string; authType: 'jwt' | 'api_key'; apiKeyId?: string }) {
-  if (auth.authType === 'api_key' && auth.apiKeyId) return `api_key:${auth.apiKeyId}`;
+function getChatOwnerSub(auth: { sub: string }) {
   return auth.sub;
 }
 
@@ -1498,8 +1857,8 @@ app.post('/api/auth/register', (req, res) => {
   if (!email || !password || password.length < 6) { res.status(400).json({ error: '邮箱和密码至少 6 位' }); return; }
   const result = registerUser(name || email.split('@')[0], email, password);
   if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
-  const token = signJWT({ sub: result.user.email, tenantId: result.tenantId });
-  res.json({ token, email: result.user.email, name: result.user.name, tenantId: result.tenantId, role: result.user.role });
+  const token = signJWT({ sub: result.user.id, tenantId: result.tenantId });
+  res.json({ token, id: result.user.id, username: result.user.username, email: result.user.email, name: result.user.name, tenantId: result.tenantId, role: result.user.role });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -1507,7 +1866,9 @@ app.post('/api/auth/login', (req, res) => {
   const result = loginUser(email, password);
   if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
   res.json({
-    token: signJWT({ sub: result.user.email, tenantId: result.user.tenantId }),
+    token: signJWT({ sub: result.user.id, tenantId: result.user.tenantId }),
+    id: result.user.id,
+    username: result.user.username,
     email: result.user.email,
     name: result.user.name,
     tenantId: result.user.tenantId,
@@ -1564,7 +1925,7 @@ app.patch('/api/users/:email', authMiddleware, requireAdmin, (req: any, res) => 
 });
 
 app.delete('/api/users/:email', authMiddleware, requireAdmin, (req: any, res) => {
-  if (req.params.email === req.auth.sub) { res.status(400).json({ error: '不能删除自己' }); return; }
+  if (req.params.email === req.auth.email) { res.status(400).json({ error: '不能删除自己' }); return; }
   const ok = deleteUser(req.auth.tenantId, req.params.email);
   if (!ok) { res.status(404).json({ error: 'not found' }); return; }
   audit(req.auth.tenantId, 'delete_user', req.auth.sub, 'user', `user:${req.params.email}`);
@@ -1578,7 +1939,7 @@ app.get('/api/api-keys', authMiddleware, (req: any, res) => {
 
 app.post('/api/api-keys', authMiddleware, requireAdmin, (req: any, res) => {
   if (req.auth.authType === 'api_key') { res.status(403).json({ error: 'API Key 无法创建新密钥，请使用密码登录' }); return; }
-  const key = createApiKey(req.auth.tenantId, req.auth.sub, req.body?.name || 'API Key', req.body?.scopes || []);
+  const key = createApiKey(req.auth.tenantId, req.auth.email || null, req.body?.name || 'API Key', req.body?.scopes || []);
   res.json({ ...key, rawKey: key.rawKey });
 });
 
@@ -1722,13 +2083,13 @@ app.post('/api/permission-rules/evaluate', authMiddleware, (req: any, res) => {
 
 // ═══ Knowledge Sources Routes (tenant-shared) ═══
 app.get('/api/knowledge/sources', authMiddleware, (req: any, res) => {
-  res.json(listKnowledgeSources(req.auth.tenantId, req.auth.sub, req.auth.role));
+  res.json(listKnowledgeSources(req.auth.tenantId, req.auth.email || req.auth.sub, req.auth.role));
 });
 
 app.put('/api/knowledge/sources', authMiddleware, (req: any, res) => {
   const list = Array.isArray(req.body) ? req.body : [];
   try {
-    const saved = replaceKnowledgeSources(req.auth.tenantId, list, req.auth.sub, req.auth.role);
+    const saved = replaceKnowledgeSources(req.auth.tenantId, list, req.auth.email || req.auth.sub, req.auth.role);
     audit(req.auth.tenantId, 'replace_knowledge_sources', req.auth.sub, 'user', `knowledge:${req.auth.tenantId}`, { count: saved.length });
     res.json(saved);
   } catch (error) {
@@ -1863,6 +2224,348 @@ function uploadedBodyStrings(value: unknown) {
   return [];
 }
 
+const MAX_AGENT_IMPORT_FILES = 300;
+const MAX_AGENT_IMPORT_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_AGENT_IMPORT_TOTAL_BYTES = 50 * 1024 * 1024;
+const AGENT_SEED_MARKER = '.agentma-seeded';
+const BLOCKED_AGENT_IMPORT_DIRS = new Set(['.git', 'node_modules', '.agent-home']);
+const BLOCKED_AGENT_IMPORT_BASENAMES = new Set([AGENT_SEED_MARKER]);
+const AGENT_IMPORT_NATIVE_ROOTS = new Set(['CLAUDE.md', 'CLAUDE.local.md', '.claude', '.mcp.json']);
+const DEFAULT_IMPORTED_AGENT_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'];
+
+type AgentImportCategory = 'claude' | 'agent' | 'skill' | 'settings' | 'mcp' | 'file';
+type AgentImportReport = {
+  templateId: string;
+  seedDir: string;
+  unpacked: Array<{ path: string; bytes: number; category: AgentImportCategory }>;
+  detected: { agents: string[]; skills: string[]; claudeMd: boolean; remoteMcp: string[] };
+  disabled: { hooks: string[]; stdioMcp: string[] };
+  skipped: Array<{ path: string; reason: string }>;
+  notes: string[];
+};
+
+const agentImportUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: MAX_AGENT_IMPORT_FILES,
+    fileSize: MAX_AGENT_IMPORT_FILE_BYTES,
+    fieldSize: 512 * 1024,
+    fields: 1000,
+  },
+});
+
+function parseAgentImportUpload(req: express.Request, res: express.Response, next: express.NextFunction) {
+  agentImportUpload.array('files', MAX_AGENT_IMPORT_FILES)(req, res, (error) => {
+    if (!error) {
+      next();
+      return;
+    }
+    if (error instanceof multer.MulterError) {
+      const message = error.code === 'LIMIT_FILE_SIZE'
+        ? `单个文件不能超过 ${formatUploadBytes(MAX_AGENT_IMPORT_FILE_BYTES)}`
+        : error.code === 'LIMIT_FILE_COUNT'
+          ? `单次最多导入 ${MAX_AGENT_IMPORT_FILES} 个文件`
+          : '导入文件格式无效';
+      res.status(400).json({ error: message });
+      return;
+    }
+    res.status(400).json({ error: (error as Error).message || '导入 Agent 失败' });
+  });
+}
+
+function safeAgentSeedSegment(value: string) {
+  const normalized = value.trim().replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120);
+  return normalized || crypto.createHash('sha256').update(value).digest('hex').slice(0, 16);
+}
+
+function agentSeedDir(tenantId: string, templateId: string) {
+  return path.join(getDataLocation().dataDir, 'agent-seeds', safeAgentSeedSegment(tenantId), safeAgentSeedSegment(templateId));
+}
+
+function resolveAgentSeedDirForTemplate(tenantId: string, template: Record<string, unknown> | null | undefined) {
+  const templateId = typeof template?.id === 'string' ? template.id.trim() : '';
+  if (!templateId || typeof template?.seedDir !== 'string' || !template.seedDir.trim()) return undefined;
+  const seedDir = agentSeedDir(tenantId, templateId);
+  return fs.existsSync(seedDir) ? seedDir : undefined;
+}
+
+function safeUploadedAgentImportPath(input: string) {
+  const raw = input.replace(/\\/g, '/').trim();
+  if (!raw || raw.startsWith('/') || /^[A-Za-z]:($|\/)/.test(raw) || /[\x00-\x1F\x7F]/.test(raw)) return '';
+  const parts = raw.split('/');
+  if (parts.some((part) => part === '..')) return '';
+  const normalizedParts = parts.filter((part) => part && part !== '.');
+  if (!normalizedParts.length) return '';
+  if (normalizedParts.some((part) => part.length > 160)) return '';
+  const normalized = normalizedParts.join('/');
+  if (normalized.length > 1024) return '';
+  return normalized;
+}
+
+function shouldStripAgentImportRoot(paths: string[]) {
+  if (!paths.length) return false;
+  const split = paths.map((item) => item.split('/'));
+  if (split.some((parts) => parts.length < 2)) return false;
+  const first = split[0][0];
+  if (!first || AGENT_IMPORT_NATIVE_ROOTS.has(first)) return false;
+  if (split.some((parts) => parts[0] !== first)) return false;
+  return paths.length > 1 || split.some((parts) => AGENT_IMPORT_NATIVE_ROOTS.has(parts[1]));
+}
+
+function stripAgentImportRoot(paths: string[]) {
+  return shouldStripAgentImportRoot(paths) ? paths.map((item) => item.split('/').slice(1).join('/')) : paths;
+}
+
+function importPathBlockedReason(relativePath: string) {
+  const parts = relativePath.split('/');
+  const blockedDir = parts.find((part) => BLOCKED_AGENT_IMPORT_DIRS.has(part));
+  if (blockedDir) return `blocked dir: ${blockedDir}`;
+  const blockedName = parts.find((part) => BLOCKED_AGENT_IMPORT_BASENAMES.has(part));
+  if (blockedName) return `blocked path: ${blockedName}`;
+  return '';
+}
+
+function categorizeAgentImportPath(relativePath: string): AgentImportCategory {
+  const lower = relativePath.toLowerCase();
+  if (relativePath === 'CLAUDE.md' || relativePath === 'CLAUDE.local.md' || relativePath === '.claude/CLAUDE.md') return 'claude';
+  if (/^\.claude\/agents\/[^/]+\.md$/i.test(relativePath)) return 'agent';
+  if (/^\.claude\/skills\/[^/]+\/SKILL\.md$/i.test(relativePath)) return 'skill';
+  if (lower === '.claude/settings.json' || lower === '.claude/settings.local.json') return 'settings';
+  if (lower === '.mcp.json') return 'mcp';
+  return 'file';
+}
+
+function addUniqueString(target: string[], value: string) {
+  const trimmed = value.trim();
+  if (trimmed && !target.includes(trimmed)) target.push(trimmed);
+}
+
+function detectImportedAgentName(relativePath: string, content: Buffer) {
+  if (!/^\.claude\/agents\/[^/]+\.md$/i.test(relativePath)) return '';
+  const rawName = path.basename(relativePath, path.extname(relativePath));
+  const frontmatterName = readFrontmatterValue(content.toString('utf8', 0, Math.min(content.length, MAX_SKILL_MD_BYTES)), 'name');
+  return (frontmatterName || rawName).trim();
+}
+
+function detectImportedSkillName(relativePath: string, content: Buffer) {
+  const match = relativePath.match(/^\.claude\/skills\/([^/]+)\/SKILL\.md$/i);
+  if (!match) return '';
+  const frontmatterName = readFrontmatterValue(content.toString('utf8', 0, Math.min(content.length, MAX_SKILL_MD_BYTES)), 'name');
+  return (frontmatterName || match[1]).trim();
+}
+
+function extractSettingsHooks(content: Buffer) {
+  try {
+    const parsed = JSON.parse(content.toString('utf8')) as Record<string, unknown>;
+    const hooks = parsed?.hooks;
+    if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return [];
+    return Object.keys(hooks).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function sanitizeImportedMcpJson(content: Buffer) {
+  const remoteServers: Record<string, unknown> = {};
+  const remoteNames: string[] = [];
+  const disabledStdio: string[] = [];
+  try {
+    const parsed = JSON.parse(content.toString('utf8')) as Record<string, unknown>;
+    const servers = parsed?.mcpServers;
+    if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
+      return { buffer: Buffer.from(JSON.stringify({ mcpServers: {} }, null, 2), 'utf8'), remoteNames, disabledStdio };
+    }
+    for (const [name, server] of Object.entries(servers as Record<string, unknown>)) {
+      if (!name.trim() || !server || typeof server !== 'object' || Array.isArray(server)) continue;
+      const record = server as Record<string, unknown>;
+      const hasStdio = typeof record.command === 'string' || Array.isArray(record.args) || record.transport === 'stdio';
+      const url = typeof record.url === 'string' ? record.url.trim() : '';
+      const type = typeof record.type === 'string' ? record.type.trim().toLowerCase() : '';
+      const safeServerName = /^[A-Za-z0-9._-]{1,128}$/.test(name);
+      const isRemote = Boolean(url && /^https?:\/\//i.test(url) && (!type || ['http', 'sse', 'streamable-http'].includes(type)));
+      if (hasStdio || !isRemote || !safeServerName) {
+        disabledStdio.push(name);
+        continue;
+      }
+      remoteServers[name] = record;
+      remoteNames.push(name);
+    }
+  } catch {
+    return { buffer: Buffer.from(JSON.stringify({ mcpServers: {} }, null, 2), 'utf8'), remoteNames, disabledStdio: ['<invalid .mcp.json>'] };
+  }
+  return {
+    buffer: Buffer.from(JSON.stringify({ mcpServers: remoteServers }, null, 2), 'utf8'),
+    remoteNames,
+    disabledStdio,
+  };
+}
+
+function renameImportedSettingsPath(relativePath: string) {
+  const lower = relativePath.toLowerCase();
+  if (lower === '.claude/settings.json' || lower === '.claude/settings.local.json') return `${relativePath}.imported`;
+  return relativePath;
+}
+
+function replaceDirectoryAtomic(tmpDir: string, destDir: string) {
+  const backupDir = `${destDir}.old-${Date.now()}-${crypto.randomUUID()}`;
+  let hasBackup = false;
+  try {
+    fs.mkdirSync(path.dirname(destDir), { recursive: true });
+    if (fs.existsSync(destDir)) {
+      fs.renameSync(destDir, backupDir);
+      hasBackup = true;
+    }
+    fs.renameSync(tmpDir, destDir);
+    if (hasBackup) fs.rmSync(backupDir, { recursive: true, force: true });
+  } catch (error) {
+    fs.rmSync(destDir, { recursive: true, force: true });
+    if (hasBackup && fs.existsSync(backupDir)) {
+      try { fs.renameSync(backupDir, destDir); } catch {}
+    }
+    throw error;
+  }
+}
+
+function unpackAgentImport(auth: any, templateId: string, files: Express.Multer.File[], relativePathInputs: string[]) {
+  const seedDir = agentSeedDir(auth.tenantId, templateId);
+  const report: AgentImportReport = {
+    templateId,
+    seedDir,
+    unpacked: [],
+    detected: { agents: [], skills: [], claudeMd: false, remoteMcp: [] },
+    disabled: { hooks: [], stdioMcp: [] },
+    skipped: [],
+    notes: [
+      '~/.claude(user 级)不会带入,请放到项目级 .claude/。',
+      'settings.json/settings.local.json 已重命名为 .imported,避免导入项目的 hooks 在 P4 容器层前自动执行。',
+      'stdio 型 MCP 已剥离,仅保留远程 MCP。',
+    ],
+  };
+
+  const rawPaths = files.map((file, index) => safeUploadedAgentImportPath(relativePathInputs[index] || file.originalname || ''));
+  if (rawPaths.some((item) => !item)) throw makeHttpError('导入文件路径无效', 400);
+  const normalizedPaths = stripAgentImportRoot(rawPaths);
+  const tmpDir = `${seedDir}.tmp-${Date.now()}-${crypto.randomUUID()}`;
+  const resolvedTmpDir = path.resolve(tmpDir);
+  const seenTargets = new Set<string>();
+  let totalBytes = 0;
+
+  try {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    for (const [index, file] of files.entries()) {
+      const relativePath = normalizedPaths[index];
+      if (!relativePath) throw makeHttpError('导入文件路径无效', 400);
+      const blockedReason = importPathBlockedReason(relativePath);
+      if (blockedReason) {
+        report.skipped.push({ path: relativePath, reason: blockedReason });
+        continue;
+      }
+      if (file.buffer.byteLength > MAX_AGENT_IMPORT_FILE_BYTES) {
+        throw makeHttpError(`单个文件不能超过 ${formatUploadBytes(MAX_AGENT_IMPORT_FILE_BYTES)}: ${relativePath}`, 400);
+      }
+      totalBytes += file.buffer.byteLength;
+      if (totalBytes > MAX_AGENT_IMPORT_TOTAL_BYTES) {
+        throw makeHttpError(`导入总大小不能超过 ${formatUploadBytes(MAX_AGENT_IMPORT_TOTAL_BYTES)}`, 400);
+      }
+
+      let targetRelativePath = renameImportedSettingsPath(relativePath);
+      let content = file.buffer;
+      const category = categorizeAgentImportPath(relativePath);
+      if (category === 'settings') {
+        for (const hook of extractSettingsHooks(file.buffer)) addUniqueString(report.disabled.hooks, hook);
+      }
+      if (category === 'mcp') {
+        const sanitized = sanitizeImportedMcpJson(file.buffer);
+        content = sanitized.buffer;
+        for (const name of sanitized.remoteNames) addUniqueString(report.detected.remoteMcp, name);
+        for (const name of sanitized.disabledStdio) addUniqueString(report.disabled.stdioMcp, name);
+      }
+      if (category === 'agent') addUniqueString(report.detected.agents, detectImportedAgentName(relativePath, file.buffer));
+      if (category === 'skill') addUniqueString(report.detected.skills, detectImportedSkillName(relativePath, file.buffer));
+      if (category === 'claude') report.detected.claudeMd = true;
+
+      targetRelativePath = safeUploadedAgentImportPath(targetRelativePath);
+      if (!targetRelativePath) throw makeHttpError('导入文件路径无效', 400);
+      const targetPath = path.resolve(path.join(tmpDir, targetRelativePath));
+      if (targetPath !== resolvedTmpDir && !targetPath.startsWith(resolvedTmpDir + path.sep)) {
+        throw makeHttpError('导入文件路径越界', 400);
+      }
+      if (seenTargets.has(targetPath)) throw makeHttpError(`导入文件路径重复: ${targetRelativePath}`, 400);
+      seenTargets.add(targetPath);
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, content);
+      report.unpacked.push({ path: targetRelativePath, bytes: content.byteLength, category });
+    }
+
+    if (report.unpacked.length === 0) throw makeHttpError('没有可导入的文件', 400);
+    replaceDirectoryAtomic(tmpDir, seedDir);
+  } catch (error) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    throw error;
+  }
+
+  report.detected.agents.sort();
+  report.detected.skills.sort();
+  report.detected.remoteMcp.sort();
+  report.disabled.hooks.sort();
+  report.disabled.stdioMcp.sort();
+  return report;
+}
+
+function importedAgentTemplateFromReport(existing: Record<string, unknown> | null, report: AgentImportReport, input: Record<string, unknown>) {
+  const now = Date.now();
+  const bodyName = typeof input.name === 'string' ? input.name.trim() : '';
+  const existingName = typeof existing?.name === 'string' ? existing.name.trim() : '';
+  const firstAgent = report.detected.agents[0] || '';
+  const name = (bodyName || existingName || firstAgent || 'Imported Agent').slice(0, 80);
+  const detectedTools = [
+    ...DEFAULT_IMPORTED_AGENT_TOOLS,
+    ...(report.detected.skills.length ? ['Skill'] : []),
+    ...(report.detected.agents.length ? ['Agent'] : []),
+    ...(report.detected.remoteMcp.length ? ['ListMcpResources', 'ReadMcpResource'] : []),
+  ];
+  const existingTools = Array.isArray(existing?.tools) ? normalizeStringArray(existing.tools) || [] : [];
+  const existingSkills = Array.isArray(existing?.skills) ? normalizeStringArray(existing.skills) || [] : [];
+  const existingMcp = Array.isArray(existing?.mcpServers) ? normalizeStringArray(existing.mcpServers) || [] : [];
+
+  return normalizeAgentTemplateForApi({
+    ...(existing || {}),
+    id: report.templateId,
+    name,
+    description: typeof existing?.description === 'string' && existing.description.trim()
+      ? existing.description
+      : `从本地 Claude Code 项目导入: ${report.unpacked.length} 个文件`,
+    systemPrompt: typeof existing?.systemPrompt === 'string' ? existing.systemPrompt : '',
+    model: typeof existing?.model === 'string' ? existing.model : '',
+    tools: Array.from(new Set([...existingTools, ...detectedTools])),
+    mcpServers: Array.from(new Set([...existingMcp, ...report.detected.remoteMcp])),
+    eventSources: Array.isArray(existing?.eventSources) ? existing.eventSources : [],
+    skills: Array.from(new Set([...existingSkills, ...report.detected.skills])),
+    effort: typeof existing?.effort === 'string' ? existing.effort : 'high',
+    maxTurns: Number(existing?.maxTurns) || 50,
+    permissionMode: typeof existing?.permissionMode === 'string' ? existing.permissionMode : 'default',
+    seedDir: report.seedDir,
+    createdAt: Number(existing?.createdAt) || now,
+    updatedAt: now,
+  });
+}
+
+function summarizeAgentImportReport(report: AgentImportReport) {
+  return {
+    templateId: report.templateId,
+    seedDir: report.seedDir,
+    unpacked: report.unpacked.length,
+    skipped: report.skipped.length,
+    agents: report.detected.agents,
+    skills: report.detected.skills,
+    remoteMcp: report.detected.remoteMcp,
+    disabledHooks: report.disabled.hooks,
+    disabledStdioMcp: report.disabled.stdioMcp,
+  };
+}
+
 function parseKnowledgeMultipartUpload(req: express.Request, res: express.Response, next: express.NextFunction) {
   knowledgeMultipartUpload.array('files', 500)(req, res, (error) => {
     if (!error) {
@@ -1956,12 +2659,13 @@ app.post('/api/knowledge/sources/upload', authMiddleware, parseKnowledgeMultipar
       fs.writeFileSync(file.target, file.content);
     }
 
-    const current = listKnowledgeSources(req.auth.tenantId, req.auth.sub, req.auth.role)
-      .filter((source) => req.auth.role === 'tenant_admin' || source.createdBy === req.auth.sub);
+    const actorEmail = req.auth.email || req.auth.sub;
+    const current = listKnowledgeSources(req.auth.tenantId, actorEmail, req.auth.role)
+      .filter((source) => req.auth.role === 'tenant_admin' || source.createdBy === actorEmail);
     const saved = replaceKnowledgeSources(req.auth.tenantId, [
       ...current,
-      { name: baseName.slice(0, 80), path: uploadRoot, enabled: true, readOnly: true, createdBy: req.auth.sub },
-    ], req.auth.sub, req.auth.role);
+      { name: baseName.slice(0, 80), path: uploadRoot, enabled: true, readOnly: true, createdBy: actorEmail },
+    ], actorEmail, req.auth.role);
     audit(req.auth.tenantId, 'upload_knowledge_source', req.auth.sub, 'user', `knowledge:${req.auth.tenantId}`, { count: fileCount, path: uploadRoot });
     res.json(saved);
   } catch (error) {
@@ -2010,40 +2714,330 @@ app.post('/api/knowledge/workspace/import', authMiddleware, (req: any, res) => {
   }
 });
 
+const KNOWLEDGE_GRAPH_MARKDOWN_EXTENSIONS = new Set(['.md', '.markdown']);
+const KNOWLEDGE_GRAPH_BLOCKED_DIRS = new Set(['.git', 'node_modules', 'dist', 'build', '.next', 'coverage', '.cache']);
+const MAX_KNOWLEDGE_GRAPH_FILES = 500;
+const MAX_KNOWLEDGE_GRAPH_ENTRIES = 16000;
+const MAX_KNOWLEDGE_GRAPH_FILE_BYTES = 512 * 1024;
+const KNOWLEDGE_PREVIEW_FILE_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.csv']);
+const MAX_KNOWLEDGE_PREVIEW_BYTES = 192 * 1024;
+
+type KnowledgeGraphNode = {
+  id: string;
+  label: string;
+  path?: string;
+  kind: 'file' | 'missing';
+  inbound: number;
+  outbound: number;
+  sizeBytes?: number;
+};
+
+type KnowledgeGraphEdge = {
+  source: string;
+  target: string;
+  count: number;
+};
+
+function graphRelativePath(root: string, fullPath: string) {
+  return path.relative(root, fullPath).split(path.sep).join('/');
+}
+
+function stripMarkdownExtension(value: string) {
+  return value.replace(/\.(md|markdown)$/i, '');
+}
+
+function graphKey(value: string) {
+  return stripMarkdownExtension(value)
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+/g, '/')
+    .trim()
+    .toLowerCase();
+}
+
+function graphLabelFromPath(relativePath: string) {
+  const base = stripMarkdownExtension(path.posix.basename(relativePath.replace(/\\/g, '/')));
+  return base || relativePath || '未命名';
+}
+
+function safeDecodeGraphTarget(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function collectGraphMarkdownFiles(root: string) {
+  const files: Array<{ path: string; relativePath: string; sizeBytes: number }> = [];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+  let scannedEntries = 0;
+  let truncated = false;
+
+  while (stack.length && scannedEntries < MAX_KNOWLEDGE_GRAPH_ENTRIES && files.length < MAX_KNOWLEDGE_GRAPH_FILES) {
+    const current = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      scannedEntries += 1;
+      if (scannedEntries >= MAX_KNOWLEDGE_GRAPH_ENTRIES || files.length >= MAX_KNOWLEDGE_GRAPH_FILES) {
+        truncated = true;
+        break;
+      }
+      if (entry.isDirectory()) {
+        if (current.depth >= 8 || entry.name.startsWith('.') || KNOWLEDGE_GRAPH_BLOCKED_DIRS.has(entry.name)) continue;
+        stack.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 });
+        continue;
+      }
+      if (!entry.isFile() || !KNOWLEDGE_GRAPH_MARKDOWN_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
+      const fullPath = path.join(current.dir, entry.name);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(fullPath);
+      } catch {
+        continue;
+      }
+      if (stat.size > MAX_KNOWLEDGE_GRAPH_FILE_BYTES) continue;
+      files.push({ path: fullPath, relativePath: graphRelativePath(root, fullPath), sizeBytes: stat.size });
+    }
+  }
+
+  return { files, truncated };
+}
+
+function firstMarkdownHeading(content: string) {
+  const match = content.match(/^#\s+(.+)$/m);
+  return match?.[1]
+    ?.replace(/[#*_`[\]]/g, '')
+    .trim()
+    .slice(0, 80);
+}
+
+function markdownLinkTargets(content: string) {
+  const targets: string[] = [];
+  const wikiRe = /!?\[\[([^\]\n]+)\]\]/g;
+  for (const match of content.matchAll(wikiRe)) {
+    const raw = String(match[1] || '').split('|')[0].split('#')[0].trim();
+    if (raw) targets.push(raw);
+  }
+
+  const markdownRe = /!?\[[^\]\n]*\]\(([^)\n]+)\)/g;
+  for (const match of content.matchAll(markdownRe)) {
+    let raw = String(match[1] || '').trim().replace(/^<|>$/g, '');
+    if (!raw || raw.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(raw)) continue;
+    raw = raw.split('#')[0].split('?')[0].trim();
+    if (raw) targets.push(raw);
+  }
+  return targets;
+}
+
+function graphTargetKeys(rawTarget: string, fromRelativePath: string) {
+  const decoded = safeDecodeGraphTarget(rawTarget).replace(/\\/g, '/').trim();
+  if (!decoded || decoded.startsWith('/') || /^[a-z][a-z0-9+.-]*:/i.test(decoded)) return [];
+  const cleaned = stripMarkdownExtension(decoded);
+  const fromDir = path.posix.dirname(fromRelativePath.replace(/\\/g, '/'));
+  const candidates = [cleaned];
+  if (cleaned.startsWith('.') || cleaned.includes('/')) {
+    candidates.push(path.posix.normalize(path.posix.join(fromDir, cleaned)));
+  } else if (fromDir && fromDir !== '.') {
+    candidates.push(path.posix.normalize(path.posix.join(fromDir, cleaned)));
+  }
+  return Array.from(new Set(candidates.map(graphKey).filter(Boolean)));
+}
+
+function buildNativeKnowledgeGraph(root: string, source: { id: string; name: string }) {
+  const collected = collectGraphMarkdownFiles(root);
+  const nodes = new Map<string, KnowledgeGraphNode>();
+  const aliases = new Map<string, string>();
+  const contents = new Map<string, string>();
+
+  for (const file of collected.files) {
+    let content = '';
+    try {
+      content = fs.readFileSync(file.path, 'utf8');
+    } catch {
+      continue;
+    }
+    contents.set(file.relativePath, content);
+    const heading = firstMarkdownHeading(content);
+    const label = heading || graphLabelFromPath(file.relativePath);
+    nodes.set(file.relativePath, {
+      id: file.relativePath,
+      label,
+      path: file.relativePath,
+      kind: 'file',
+      inbound: 0,
+      outbound: 0,
+      sizeBytes: file.sizeBytes,
+    });
+
+    const noExt = stripMarkdownExtension(file.relativePath);
+    const base = stripMarkdownExtension(path.posix.basename(file.relativePath));
+    for (const alias of [file.relativePath, noExt, base, heading || '']) {
+      const key = graphKey(alias);
+      if (key && !aliases.has(key)) aliases.set(key, file.relativePath);
+    }
+  }
+
+  const edges = new Map<string, KnowledgeGraphEdge>();
+  for (const file of collected.files) {
+    const content = contents.get(file.relativePath);
+    if (!content) continue;
+    const sourceNode = nodes.get(file.relativePath);
+    if (!sourceNode) continue;
+    for (const rawTarget of markdownLinkTargets(content)) {
+      const targetKeys = graphTargetKeys(rawTarget, file.relativePath);
+      if (!targetKeys.length) continue;
+      let targetId = '';
+      for (const key of targetKeys) {
+        targetId = aliases.get(key) || '';
+        if (targetId) break;
+      }
+      if (!targetId) {
+        const missingKey = targetKeys[0];
+        targetId = `missing:${missingKey}`;
+        if (!nodes.has(targetId)) {
+          const label = graphLabelFromPath(rawTarget);
+          nodes.set(targetId, { id: targetId, label, kind: 'missing', inbound: 0, outbound: 0 });
+        }
+      }
+      if (targetId === file.relativePath) continue;
+      const edgeId = `${file.relativePath}\u0000${targetId}`;
+      const existing = edges.get(edgeId);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        edges.set(edgeId, { source: file.relativePath, target: targetId, count: 1 });
+      }
+      sourceNode.outbound += 1;
+      const targetNode = nodes.get(targetId);
+      if (targetNode) targetNode.inbound += 1;
+    }
+  }
+
+  const nodeList = Array.from(nodes.values())
+    .sort((a, b) => (b.inbound + b.outbound) - (a.inbound + a.outbound) || a.label.localeCompare(b.label));
+  const edgeList = Array.from(edges.values())
+    .sort((a, b) => b.count - a.count || a.source.localeCompare(b.source));
+  return {
+    source: { id: source.id, name: source.name },
+    nodes: nodeList,
+    edges: edgeList,
+    stats: {
+      files: collected.files.length,
+      nodes: nodeList.length,
+      edges: edgeList.length,
+      missing: nodeList.filter((node) => node.kind === 'missing').length,
+      truncated: collected.truncated,
+    },
+  };
+}
+
+function resolveKnowledgeSourceForRequest(req: any) {
+  return listKnowledgeSources(req.auth.tenantId, req.auth.email || req.auth.sub, req.auth.role)
+    .find((item) => item.id === req.params.id);
+}
+
+function resolvedKnowledgeVaultPath(sourcePath: string) {
+  const vaultPath = path.resolve(sourcePath);
+  if (!fs.existsSync(vaultPath) || !fs.statSync(vaultPath).isDirectory()) {
+    throw Object.assign(new Error('知识库目录不存在或不可读'), { status: 400 });
+  }
+  return fs.realpathSync.native(vaultPath);
+}
+
+function readKnowledgePreviewFile(vaultPath: string, inputPath: string) {
+  const cleanRelativePath = String(inputPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!cleanRelativePath || cleanRelativePath.split('/').includes('..')) {
+    throw Object.assign(new Error('文件路径无效'), { status: 400 });
+  }
+  if (!KNOWLEDGE_PREVIEW_FILE_EXTENSIONS.has(path.extname(cleanRelativePath).toLowerCase())) {
+    throw Object.assign(new Error('仅支持预览 markdown、文本和 CSV 文件'), { status: 400 });
+  }
+
+  const targetPath = path.resolve(vaultPath, cleanRelativePath);
+  let realTarget: string;
+  try {
+    realTarget = fs.realpathSync.native(targetPath);
+  } catch {
+    throw Object.assign(new Error('文件不存在'), { status: 404 });
+  }
+  const relative = path.relative(vaultPath, realTarget);
+  if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw Object.assign(new Error('文件路径越界'), { status: 400 });
+  }
+
+  const stat = fs.statSync(realTarget);
+  if (!stat.isFile()) throw Object.assign(new Error('路径不是文件'), { status: 400 });
+  const bytesToRead = Math.min(stat.size, MAX_KNOWLEDGE_PREVIEW_BYTES);
+  const buffer = Buffer.alloc(bytesToRead);
+  const fd = fs.openSync(realTarget, 'r');
+  try {
+    fs.readSync(fd, buffer, 0, bytesToRead, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return {
+    path: graphRelativePath(vaultPath, realTarget),
+    name: path.basename(realTarget),
+    sizeBytes: stat.size,
+    truncated: stat.size > MAX_KNOWLEDGE_PREVIEW_BYTES,
+    content: buffer.toString('utf8'),
+  };
+}
+
 app.post('/api/knowledge/sources/:id/graph', authMiddleware, async (req: any, res) => {
   try {
-    const source = listKnowledgeSources(req.auth.tenantId, req.auth.sub, req.auth.role)
-      .find((item) => item.id === req.params.id);
+    const source = resolveKnowledgeSourceForRequest(req);
     if (!source) { res.status(404).json({ error: 'knowledge source not found' }); return; }
-    const vaultPath = path.resolve(source.path);
-    if (!fs.existsSync(vaultPath) || !fs.statSync(vaultPath).isDirectory()) {
-      res.status(400).json({ error: '知识库目录不存在或不可读' });
-      return;
-    }
+    const vaultPath = resolvedKnowledgeVaultPath(source.path);
+    const graph = buildNativeKnowledgeGraph(vaultPath, { id: source.id, name: source.name });
     const serviceUrl = String(process.env.AGENTMA_OBSIDIAN_SERVICE_URL || '').trim();
     if (!serviceUrl) {
-      res.status(400).json({ error: '未配置 AGENTMA_OBSIDIAN_SERVICE_URL' });
+      res.json({ ok: true, mode: 'native', graph });
       return;
     }
-    const endpoint = new URL('open-graph', serviceUrl.endsWith('/') ? serviceUrl : `${serviceUrl}/`);
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vaultPath, sourceId: source.id, sourceName: source.name }),
-    });
-    const text = await response.text();
-    let body: unknown = {};
-    try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
-    if (!response.ok) {
-      const message = body && typeof body === 'object' && 'error' in body
-        ? String((body as Record<string, unknown>).error || 'Obsidian service 调用失败')
-        : `Obsidian service HTTP ${response.status}`;
-      res.status(502).json({ error: message, detail: body });
-      return;
+    try {
+      const endpoint = new URL('open-graph', serviceUrl.endsWith('/') ? serviceUrl : `${serviceUrl}/`);
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ vaultPath, sourceId: source.id, sourceName: source.name }),
+      });
+      const text = await response.text();
+      let body: unknown = {};
+      try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
+      if (!response.ok) {
+        const message = body && typeof body === 'object' && 'error' in body
+          ? String((body as Record<string, unknown>).error || 'Obsidian service 调用失败')
+          : `Obsidian service HTTP ${response.status}`;
+        res.json({ ok: true, mode: 'native', graph, warning: message, service: body });
+        return;
+      }
+      res.json({ ok: true, mode: 'obsidian', service: body, graph });
+    } catch (serviceError) {
+      res.json({ ok: true, mode: 'native', graph, warning: (serviceError as Error).message || 'Obsidian service 调用失败' });
     }
-    res.json({ ok: true, service: body });
   } catch (error) {
     res.status(500).json({ error: (error as Error).message || '打开 Obsidian 图谱失败' });
+  }
+});
+
+app.post('/api/knowledge/sources/:id/file-preview', authMiddleware, (req: any, res) => {
+  try {
+    const source = resolveKnowledgeSourceForRequest(req);
+    if (!source) { res.status(404).json({ error: 'knowledge source not found' }); return; }
+    const vaultPath = resolvedKnowledgeVaultPath(source.path);
+    const filePath = typeof req.body?.path === 'string' ? req.body.path : '';
+    res.json({ ok: true, file: readKnowledgePreviewFile(vaultPath, filePath) });
+  } catch (error) {
+    const err = error as Error & { status?: number };
+    res.status(err.status || 500).json({ error: err.message || '读取知识库文件失败' });
   }
 });
 
@@ -2164,15 +3158,18 @@ app.post('/api/skills/workspace/install', authMiddleware, (req: any, res) => {
     const conversationId = typeof req.body?.conversationId === 'string' ? req.body.conversationId : '';
     const skillName = typeof req.body?.name === 'string' ? req.body.name : '';
     const inputPath = typeof req.body?.path === 'string' ? req.body.path : '';
+    const overwrite = req.body?.overwrite === true;
     const skill = conversationId.trim()
-      ? installWorkspaceSkillFromConversation(req.auth, conversationId, skillName)
-      : installWorkspaceSkill(inputPath);
+      ? installWorkspaceSkillFromConversation(req.auth, conversationId, skillName, { overwrite })
+      : installWorkspaceSkill(inputPath, WORKSPACE_ROOT, { overwrite });
     audit(req.auth.tenantId, 'install_workspace_skill', req.auth.sub, 'skill', skill.path, {
       name: skill.name,
       conversationId: conversationId.trim() || undefined,
       sourcePath: skill.sourcePath,
       installedPath: skill.installedPath,
       installStats: skill.installStats,
+      overwrite,
+      overwrote: skill.overwrote,
     });
     res.json(skill);
   } catch (error) {
@@ -2186,6 +3183,40 @@ app.get('/api/agents', authMiddleware, (req: any, res) => {
   res.json(listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi));
 });
 
+app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any, res) => {
+  try {
+    const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : [];
+    if (!files.length) { res.status(400).json({ error: '请选择要导入的项目目录' }); return; }
+
+    const currentTemplates = listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi);
+    const mode = String(req.body?.mode || 'new').trim();
+    const mergeTargetId = mode.startsWith('merge:')
+      ? mode.slice('merge:'.length).trim()
+      : mode === 'merge'
+        ? String(req.body?.templateId || '').trim()
+        : '';
+    const existing = mergeTargetId
+      ? currentTemplates.find((template) => String(template.id || '') === mergeTargetId)
+      : null;
+    if (mergeTargetId && !existing) { res.status(404).json({ error: '目标 Agent 模板不存在' }); return; }
+
+    const templateId = mergeTargetId || crypto.randomUUID();
+    const relativePaths = uploadedBodyStrings(req.body?.relativePaths);
+    const report = unpackAgentImport(req.auth, templateId, files, relativePaths);
+    const template = importedAgentTemplateFromReport(existing || null, report, req.body || {});
+    const nextTemplates = mergeTargetId
+      ? currentTemplates.map((item) => String(item.id || '') === templateId ? template : item)
+      : [template, ...currentTemplates.filter((item) => String(item.id || '') !== templateId)];
+    const saved = replaceAgentTemplates(req.auth.tenantId, nextTemplates).map(normalizeAgentTemplateForApi);
+    const savedTemplate = saved.find((item) => String(item.id || '') === templateId) || template;
+    audit(req.auth.tenantId, 'import_agent', req.auth.sub, 'agent', templateId, summarizeAgentImportReport(report));
+    res.json({ template: savedTemplate, report });
+  } catch (error) {
+    const err = error as Error & { status?: number };
+    res.status(err.status || 400).json({ error: err.message || '导入 Agent 失败' });
+  }
+});
+
 app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
   const agentId = String(req.params.id || '').trim();
   const agent = listAgentTemplates(req.auth.tenantId)
@@ -2194,17 +3225,18 @@ app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
   if (!agent) { res.status(404).json({ error: 'agent not found' }); return; }
 
   const latestSession = getLatestAgentRuntimeSession(req.auth.tenantId, getChatOwnerSub(req.auth), agentId);
-  const cwd = latestSession?.sdkCwd || path.join(os.tmpdir(), `agentma-run-${req.auth.tenantId}-{new-session}`);
+  const seedDir = latestSession ? undefined : resolveAgentSeedDirForTemplate(req.auth.tenantId, agent);
+  const cwd = latestSession?.sdkCwd || seedDir || path.join(os.tmpdir(), `agentma-run-${req.auth.tenantId}-{new-session}`);
   const files = buildClaudeMdPreviewFiles(cwd);
   const effectiveContent = buildEffectiveClaudeMdPreview(files);
-  const cwdExists = latestSession ? fs.existsSync(cwd) : false;
+  const cwdExists = fs.existsSync(cwd);
 
   res.json({
     agentId,
     agentName: typeof agent.name === 'string' ? agent.name : agentId,
     cwd,
     cwdExists,
-    cwdSource: latestSession ? 'latest_session' : 'new_session',
+    cwdSource: latestSession ? 'latest_session' : seedDir ? 'template_seed' : 'new_session',
     latestSession: latestSession ? {
       id: latestSession.id,
       title: latestSession.title,
@@ -2219,7 +3251,9 @@ app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
       '运行时显式传 settingSources=[project,local]（不含 user），SDK 只从租户 workspace 的项目级/本地级配置加载文件系统说明，不读宿主 ~/.claude。',
       latestSession
         ? '预览使用该 Agent 最近一次可访问会话的 sdkCwd。'
-        : '该 Agent 尚无带 sdkCwd 的会话；新会话会创建临时空 cwd，项目级 CLAUDE.md 通常不存在。',
+        : seedDir
+          ? '该 Agent 尚无带 sdkCwd 的会话；预览使用模板 seed 仓，新会话首跑会复制这些文件到临时 cwd。'
+          : '该 Agent 尚无带 sdkCwd 的会话；新会话会创建临时空 cwd，项目级 CLAUDE.md 通常不存在。',
       typeof agent.systemPrompt === 'string' && agent.systemPrompt.trim()
         ? 'Agent 模板的 systemPrompt 会作为独立运行时参数传入，不属于 CLAUDE.md 文件内容。'
         : '',
@@ -2229,14 +3263,181 @@ app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
 
 app.put('/api/agents', authMiddleware, (req: any, res) => {
   const list = Array.isArray(req.body) ? req.body.map(normalizeAgentTemplateForApi) : [];
+  const previous = listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi);
   const saved = replaceAgentTemplates(req.auth.tenantId, list);
+  const savedIds = new Set(saved.map((template) => String((template as Record<string, unknown>).id || '')));
+  for (const template of previous) {
+    const templateId = String(template.id || '');
+    if (!templateId || savedIds.has(templateId) || typeof template.seedDir !== 'string') continue;
+    fs.rmSync(agentSeedDir(req.auth.tenantId, templateId), { recursive: true, force: true });
+  }
   audit(req.auth.tenantId, 'replace_agents', req.auth.sub, 'user', `agents:${req.auth.tenantId}`, { count: saved.length });
   res.json(saved);
 });
 
+// ═══ Visual Artifacts Routes ═══
+app.get('/api/visuals/file', authMiddleware, (req: any, res) => {
+  try {
+    const cid = typeof req.query?.cid === 'string' ? req.query.cid : '';
+    const relPath = typeof req.query?.path === 'string' ? req.query.path : '';
+    const result = readWorkspaceVisual(req.auth, cid, relPath);
+    res.json({ ...result, title: extractTitle(result.html) });
+  } catch (error) {
+    const err = error as Error & { status?: number };
+    res.status(err.status || 500).json({ error: err.message || '读取临时可视化失败' });
+  }
+});
+
+app.post('/api/visuals', authMiddleware, (req: any, res) => {
+  try {
+    const cid = typeof req.body?.cid === 'string' ? req.body.cid : '';
+    const relPath = typeof req.body?.path === 'string' ? req.body.path : '';
+    const explicitTitle = typeof req.body?.title === 'string' && req.body.title.trim()
+      ? req.body.title.trim()
+      : undefined;
+    const { html } = readWorkspaceVisual(req.auth, cid, relPath);
+    if (Buffer.byteLength(html) > MAX_VISUAL_BYTES) throw makeHttpError('文件过大', 413);
+    const result = createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), {
+      title: explicitTitle || extractTitle(html),
+      html,
+      sourceSlug: relPath,
+    });
+    res.json(result);
+  } catch (error) {
+    const err = error as Error & { status?: number };
+    res.status(err.status || 500).json({ error: err.message || '保存可视化失败' });
+  }
+});
+
+app.get('/api/visuals', authMiddleware, (req: any, res) => {
+  res.json(listVisuals(req.auth.tenantId, getChatOwnerSub(req.auth)));
+});
+
+app.get('/api/visuals/:id', authMiddleware, (req: any, res) => {
+  const visual = getVisual(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id);
+  if (!visual) { res.status(404).json({ error: 'not found' }); return; }
+  res.json({
+    id: visual.id,
+    title: visual.title,
+    html: visual.html,
+    createdAt: visual.createdAt,
+  });
+});
+
+app.delete('/api/visuals/:id', authMiddleware, (req: any, res) => {
+  deleteVisual(req.auth.tenantId, getChatOwnerSub(req.auth), req.params.id);
+  res.json({ ok: true });
+});
+
+// ═══ 数据源(ChatBI 只读查询)═══
+const datasourceUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: MAX_DATASOURCE_UPLOAD_BYTES, fieldSize: 256 * 1024 },
+});
+
+function parseDatasourceUpload(req: any, res: any, next: any) {
+  datasourceUpload.single('file')(req, res, (error: unknown) => {
+    if (!error) { next(); return; }
+    if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+      res.status(400).json({ error: `数据源文件不能超过 ${Math.round(MAX_DATASOURCE_UPLOAD_BYTES / 1024 / 1024)}MB` });
+      return;
+    }
+    res.status(400).json({ error: (error as Error).message || '上传数据源失败' });
+  });
+}
+
+// path 是服务端内部位置,绝不回给前端。
+function datasourceToApi(source: {
+  id: string; name: string; originalFilename?: string; format: string; sizeBytes: number;
+  tables: unknown; createdBy?: string; enabled: boolean; createdAt: number; updatedAt: number;
+}) {
+  return {
+    id: source.id,
+    name: source.name,
+    originalFilename: source.originalFilename,
+    format: source.format,
+    sizeBytes: source.sizeBytes,
+    tables: source.tables,
+    createdBy: source.createdBy,
+    enabled: source.enabled,
+    createdAt: source.createdAt,
+    updatedAt: source.updatedAt,
+  };
+}
+
+app.post('/api/datasources/upload', authMiddleware, parseDatasourceUpload, async (req: any, res) => {
+  try {
+    const file = req.file as Express.Multer.File | undefined;
+    if (!file || !file.buffer?.length) { res.status(400).json({ error: '请选择要上传的数据文件' }); return; }
+    const originalName = String(file.originalname || '').trim();
+    if (!datasourceUploadFormat(originalName)) {
+      res.status(400).json({ error: `仅支持上传 ${DATASOURCE_UPLOAD_EXTENSIONS.join(' / ')} 文件` });
+      return;
+    }
+    const name = String(req.body?.name || '').trim() || path.basename(originalName, path.extname(originalName));
+    const destDir = path.join(getDataLocation().dataDir, 'datasources', req.auth.tenantId, crypto.randomUUID());
+    const imported = await importDatasourceUpload(originalName, file.buffer, destDir);
+    const created = createDatasource(req.auth.tenantId, {
+      name,
+      path: imported.dbPath,
+      originalFilename: originalName,
+      format: imported.format,
+      sizeBytes: file.buffer.length,
+      tables: imported.tables,
+      createdBy: req.auth.email || req.auth.sub,
+    });
+    audit(req.auth.tenantId, 'upload_datasource', req.auth.sub, 'user', `datasource:${created.id}`, {
+      format: imported.format,
+      sizeBytes: file.buffer.length,
+      tables: imported.tables.length,
+    });
+    res.json(datasourceToApi(created));
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || '上传数据源失败' });
+  }
+});
+
+app.get('/api/datasources', authMiddleware, (req: any, res) => {
+  res.json(listDatasources(req.auth.tenantId).map(datasourceToApi));
+});
+
+// 页面「试查询」/ smoke 用;与 agent 走的 MCP 工具共用同一套只读校验。
+app.post('/api/datasources/:id/query', authMiddleware, (req: any, res) => {
+  const source = getDatasource(req.auth.tenantId, req.params.id);
+  if (!source || !source.enabled) { res.status(404).json({ error: 'not found' }); return; }
+  try {
+    const result = runDatasourceQuery(source.path, String(req.body?.sql || ''));
+    res.type('application/json').send(serializeQueryResult(result));
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || '查询失败' });
+  }
+});
+
+app.delete('/api/datasources/:id', authMiddleware, (req: any, res) => {
+  const source = getDatasource(req.auth.tenantId, req.params.id);
+  if (!source) { res.status(404).json({ error: 'not found' }); return; }
+  if (req.auth.role !== 'tenant_admin' && source.createdBy && source.createdBy !== (req.auth.email || req.auth.sub)) {
+    res.status(403).json({ error: '只能删除自己创建的数据源' });
+    return;
+  }
+  deleteDatasource(req.auth.tenantId, req.params.id);
+  const datasourceRoot = path.resolve(getDataLocation().dataDir, 'datasources', req.auth.tenantId);
+  const sourceDir = path.dirname(path.resolve(source.path));
+  if (isPathInside(sourceDir, datasourceRoot)) {
+    fs.rmSync(sourceDir, { recursive: true, force: true });
+  }
+  audit(req.auth.tenantId, 'delete_datasource', req.auth.sub, 'user', `datasource:${req.params.id}`, {});
+  res.json({ ok: true });
+});
+
 // ═══ Chat Sessions Routes ═══
 app.get('/api/chat-sessions', authMiddleware, (req: any, res) => {
-  res.json(listChatSessions(req.auth.tenantId, getChatOwnerSub(req.auth)));
+  const ownerSub = getChatOwnerSub(req.auth);
+  if (req.query?.summary === '1') {
+    res.json(listChatSessionSummaries(req.auth.tenantId, ownerSub));
+    return;
+  }
+  res.json(listChatSessions(req.auth.tenantId, ownerSub));
 });
 
 app.get('/api/chat-sessions/:id/events', authMiddleware, (req: any, res) => {
@@ -2320,9 +3521,14 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   const { prompt, template, provider, model } = req.body || {};
   if (!prompt || typeof prompt !== 'string') { res.status(400).json({ error: 'need prompt' }); return; }
   const tmpl = template || {};
+  const storedTemplate = typeof tmpl?.id === 'string' && tmpl.id.trim()
+    ? listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi).find((item) => String(item.id || '') === tmpl.id.trim())
+    : null;
   const subagents = normalizeSubagents(tmpl?.subagents);
-  const knowledgeSourceIds = normalizeStringArray(tmpl?.knowledgeSourceIds);
+  const knowledgeSourceIds = normalizeStringArray(tmpl?.knowledgeSourceIds) || [];
+  const datasourceIds = normalizeStringArray(tmpl?.datasourceIds ?? storedTemplate?.datasourceIds) || [];
   const skills = normalizeStringArray(tmpl?.skills);
+  const mcpServers = normalizeStringArray(storedTemplate?.mcpServers || tmpl?.mcpServers);
   const selectedModel = [
     model,
     tmpl?.model,
@@ -2339,6 +3545,14 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
   const emit = (e: any) => { try { res.write(`data: ${JSON.stringify(e)}\n\n`); } catch {} };
+  const abortController = new AbortController();
+  let didEnd = false;
+  req.on('close', () => {
+    if (!didEnd && !abortController.signal.aborted) {
+      console.log('[agents/run] client disconnected, aborting run');
+      abortController.abort();
+    }
+  });
 
   const sessionAllow = new Set<string>();
   const requestPermission = createPermissionRequester({ emit, sessionAllow, tenantId: req.auth.tenantId });
@@ -2353,18 +3567,23 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
     tools: Array.isArray(tmpl?.tools) ? tmpl.tools : undefined,
     subagents,
     skills,
+    mcpServers,
     outputFormat: tmpl?.outputSchema ? { type: 'json_schema', schema: tmpl.outputSchema } : undefined,
     enableFileCheckpointing: tmpl?.enableFileCheckpointing === true || undefined,
     useKnowledge: tmpl?.useKnowledge === true || knowledgeSourceIds.length > 0,
     knowledgeSourceIds,
+    datasourceIds,
     maxTurns: Number(tmpl?.maxTurns) || 20,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
     role: req.auth.role,
+    seedDir: resolveAgentSeedDirForTemplate(req.auth.tenantId, storedTemplate || tmpl),
     emit,
     requestPermission,
     requestUserQuestion,
+    abortController,
   });
+  didEnd = true;
   res.end();
 });
 

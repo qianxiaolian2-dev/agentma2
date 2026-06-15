@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
+import { normalizeRunOutcome, outcomeBadgeClass, outcomeLabel } from '../simulator/run-state';
 
 const OTEL_ENV_VARS = [
   { key: 'CLAUDE_CODE_ENABLE_TELEMETRY', value: '1', description: '启用遥测（必须设置）' },
@@ -185,9 +186,12 @@ export default function Observability() {
                   <div className="tool-card-name" style={{ fontFamily: 'var(--font-mono)', fontSize: '.8em' }}>
                     {run.diff.model || run.resource.replace('run:', '')}
                   </div>
-                  <span className={`badge ${run.diff.status === 'success' ? 'badge-success' : 'badge-danger'}`}>
-                    {run.diff.status || '?'}
-                  </span>
+                  {(() => {
+                    const outcome = normalizeRunOutcome(run.diff.status, 'provider_error');
+                    return <span className={`badge ${outcomeBadgeClass(outcome)}`} title={run.diff.status || '?'}>
+                      {outcomeLabel(outcome)}
+                    </span>;
+                  })()}
                 </div>
                 <div className="flex gap-3 mt-1" style={{ fontSize: '.76em', color: 'var(--ink-secondary)', flexWrap: 'wrap' }}>
                   <span>时长 {formatMs(run.diff.durationMs)}</span>

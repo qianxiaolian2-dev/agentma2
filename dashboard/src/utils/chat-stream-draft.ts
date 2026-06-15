@@ -1,4 +1,5 @@
 import type { ChatMessage } from '../simulator/types';
+import { outcomeToMessageStatus, type RunOutcome } from '../simulator/run-state';
 
 export function createAssistantDraft(id: string, timestamp: number): ChatMessage {
   return { id, role: 'assistant', content: '', status: 'pending', timestamp };
@@ -11,7 +12,7 @@ export function appendAssistantDraft(baseMessages: ChatMessage[], id: string, ti
 export function updateAssistantDraft(
   messages: ChatMessage[],
   id: string,
-  patch: Partial<Pick<ChatMessage, 'content' | 'thinking' | 'status'>>,
+  patch: Partial<Pick<ChatMessage, 'content' | 'thinking' | 'status' | 'outcome' | 'outcomeDetail' | 'runId'>>,
 ): ChatMessage[] {
   return messages.map((message) => {
     if (message.id !== id) return message;
@@ -24,17 +25,24 @@ export function finalizeAssistantDraft(
   id: string,
   timestamp: number,
   content: string,
-  status: NonNullable<ChatMessage['status']>,
+  outcome: RunOutcome,
   thinking?: string,
+  outcomeDetail?: string,
+  runId?: string,
 ): ChatMessage[] {
   const assistantMessage: ChatMessage = {
     id,
     role: 'assistant',
     content,
-    status,
+    status: outcomeToMessageStatus(outcome),
+    outcome,
     timestamp,
     ...(thinking ? { thinking } : {}),
+    ...(outcomeDetail ? { outcomeDetail } : {}),
+    ...(runId ? { runId } : {}),
   };
 
-  return [...baseMessages, assistantMessage];
+  const existingIndex = baseMessages.findIndex((message) => message.id === id);
+  if (existingIndex < 0) return [...baseMessages, assistantMessage];
+  return baseMessages.map((message, index) => index === existingIndex ? assistantMessage : message);
 }

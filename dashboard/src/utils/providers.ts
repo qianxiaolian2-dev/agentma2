@@ -1,4 +1,5 @@
 import type { ProviderConfig, ProviderProfile } from '../simulator/types';
+import { getAuthHeaders } from './client-runtime';
 import { getDefaultProviderConfig } from '../simulator/mock-data';
 
 export const LS_PROVIDER = 'agentma_provider_config';
@@ -227,4 +228,16 @@ export function listProviderModels() {
     }
   }
   return Array.from(values);
+}
+
+export async function fetchProviderModels(): Promise<string[]> {
+  const response = await fetch('/api/provider-models', { headers: getAuthHeaders() });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json().catch(() => []);
+  if (!Array.isArray(data)) return [];
+  return Array.from(new Set(data.flatMap((item) => {
+    if (typeof item !== 'string') return [];
+    const model = item.trim();
+    return model && !model.includes('*') ? [model] : [];
+  })));
 }

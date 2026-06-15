@@ -11,6 +11,7 @@ const SECTIONS = [
       { path: '/conversations', label: '会话', icon: 'chat' },
       { path: '/agents', label: 'Agent 市场', icon: 'market' },
       { path: '/knowledge', label: '知识库', icon: 'book' },
+      { path: '/visuals', label: '我的可视化', icon: 'chart' },
       { path: '/skills', label: '技能背包', icon: 'spark' },
       { path: '/account', label: '账户管理', icon: 'user' },
     ],
@@ -26,6 +27,7 @@ const SECTIONS = [
       { path: '/subagents', label: '子代理管理', icon: 'agents' },
       { path: '/permissions', label: '权限系统', icon: 'shield' },
       { path: '/observability', label: '可观测性', icon: 'chart' },
+      { path: '/crawler', label: '操作后台', icon: 'tools' },
     ],
   },
 ] satisfies Array<{ title: string; items: Array<{ path: string; label: string; icon: LineIconName }> }>;
@@ -36,8 +38,8 @@ type SidebarProps = {
   onToggleCollapsed?: () => void;
 };
 
-function userInitial(email?: string) {
-  const raw = (email || 'A').trim();
+function userInitial(label?: string) {
+  const raw = (label || 'A').trim();
   return raw.slice(0, 1).toUpperCase();
 }
 
@@ -86,9 +88,9 @@ export default function Sidebar({ collapsed = false, onNavigate, onToggleCollaps
         ))}
       </div>
       <div className="sidebar-footer">
-        <span className="sidebar-user-chip">{userInitial(user?.email)}</span>
+        <span className="sidebar-user-chip">{userInitial(user?.username || user?.name || user?.email)}</span>
         <span className="sidebar-user-meta">
-          <span className="sidebar-user-name">{user?.name || 'AgentMa'}</span>
+          <span className="sidebar-user-name">{user?.username || user?.name || 'AgentMa'}</span>
           {user && <span className="sidebar-user-mail" title={user.email}>{user.email}</span>}
         </span>
         <button className="icon-btn sidebar-logout-btn" onClick={logout} title="登出" aria-label="登出">

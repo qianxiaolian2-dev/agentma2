@@ -31,6 +31,7 @@ function getPageMeta(pathname: string) {
 
 export default function Layout({ children }: { children: ReactNode }) {
   const location = useLocation();
+  const isVizPreview = location.pathname === '/viz';
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
@@ -70,7 +71,7 @@ export default function Layout({ children }: { children: ReactNode }) {
           onToggleCollapsed={toggleSidebarCollapsed}
         />
       </div>
-      <main className="main-content">
+      <main className={`main-content${isVizPreview ? ' visual-preview-main' : ''}`}>
         <header className="console-topbar">
           <div className="titleblock">
             <div className="eyebrow">

@@ -19,6 +19,8 @@ export type LineIconName =
   | 'menu'
   | 'x'
   | 'bolt'
+  | 'expand'
+  | 'collapse'
   | 'chevronLeft'
   | 'chevronRight';
 
@@ -100,6 +102,30 @@ const paths: Record<LineIconName, ReactNode> = {
   menu: <path d="M4 7h16M4 12h16M4 17h16" />,
   x: <path d="M6 6l12 12M18 6 6 18" />,
   bolt: <path d="M13 2 4 14h7l-1 8 9-12h-7z" />,
+  expand: (
+    <>
+      <path d="M8 4H4v4" />
+      <path d="M4 4l6 6" />
+      <path d="M16 4h4v4" />
+      <path d="M20 4l-6 6" />
+      <path d="M8 20H4v-4" />
+      <path d="M4 20l6-6" />
+      <path d="M16 20h4v-4" />
+      <path d="M20 20l-6-6" />
+    </>
+  ),
+  collapse: (
+    <>
+      <path d="M10 4v6H4" />
+      <path d="M4 10l6-6" />
+      <path d="M14 4v6h6" />
+      <path d="M20 10l-6-6" />
+      <path d="M10 20v-6H4" />
+      <path d="M4 14l6 6" />
+      <path d="M14 20v-6h6" />
+      <path d="M20 14l-6 6" />
+    </>
+  ),
   chevronLeft: <path d="M15 18 9 12l6-6" />,
   chevronRight: <path d="m9 18 6-6-6-6" />,
 };
