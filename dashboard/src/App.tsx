@@ -4,6 +4,7 @@ import AuthGuard from './components/AuthGuard';
 import Layout from './components/Layout';
 import Login from './pages/Login';
 import Overview from './pages/Overview';
+import DashboardStudio from './pages/DashboardStudio';
 import Playground from './pages/Playground';
 import Agents from './pages/Agents';
 import AgentChat from './pages/AgentChat';
@@ -23,6 +24,13 @@ export default function App() {
     <AuthProvider>
       <Routes>
         <Route path="/login" element={<Login />} />
+        <Route path="/dashboard-studio" element={
+          <div className="standalone-page">
+            <div className="standalone-page-inner">
+              <DashboardStudio />
+            </div>
+          </div>
+        } />
         <Route path="/*" element={
           <AuthGuard>
             <Layout>

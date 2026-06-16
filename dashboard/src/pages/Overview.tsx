@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom';
 import { SLASH_COMMANDS, MODELS, generateMockAgents, BUILT_IN_TOOLS, HOOK_EVENTS } from '../simulator/mock-data';
 
 const SECTIONS = [
+  { path: '/dashboard-studio', title: '看板工坊', desc: '上传数据集或输入指标，生成通用看板方案', icon: '🧭', color: '#2563eb' },
   { path: '/conversations', title: '会话', desc: '多轮对话，Agent 按模板配置执行任务', icon: '💬', color: '#7c3aed' },
   { path: '/agents', title: 'Agent 市场', desc: '创建和管理 Agent 模板，配置工具和能力', icon: '🤖', color: '#f59e0b' },
   { path: '/playground', title: 'Playground', desc: '实时测试 query() 流式 API', icon: '▶', color: '#2563eb' },
