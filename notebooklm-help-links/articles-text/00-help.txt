@@ -1,0 +1,28 @@
+# 应如何寻求帮助？
+
+### 开始使用 NotebookLM
+了解 NotebookLM
+在 NotebookLM 中使用对话功能
+在 NotebookLM 中创建笔记本
+为笔记本添加或探索新来源
+在 NotebookLM 中创建和添加笔记
+在 NotebookLM 中使用思维导图
+在 NotebookLM 中生成音频概览
+在 NotebookLM 中生成视频概览
+Generate Flashcards or Quizzes in NotebookLM
+在 NotebookLM 中生成信息图
+在 NotebookLM 中生成演示文稿
+在 NotebookLM 中使用公开笔记本和精选笔记本
+加入 NotebookLM 社区
+NotebookLM 移动应用入门
+Gemini 应用中的笔记本
+NotebookLM 中的隐私权和使用条款
+### 了解 Pro 版 NotebookLM
+升级 NotebookLM
+通过工作/学校 Google 账号使用 NotebookLM
+### 更改设置
+在 NotebookLM 中更改模式
+在 NotebookLM 中更改输出语言
+### 解决问题
+报告问题
+常见问题解答

@@ -1,6 +1,30 @@
 export function getStoredAuthToken(): string | null {
   if (typeof window === 'undefined') return null;
-  return localStorage.getItem('agentma_jwt') || localStorage.getItem('agentma_api_key');
+  return localStorage.getItem('agentma_jwt');
+}
+
+export function isUsingApiKeyAuth(): boolean {
+  return false;
+}
+
+export type StoredAuthUser = {
+  id?: string;
+  username?: string;
+  email: string;
+  name: string;
+  tenantId?: string;
+  role?: 'tenant_admin' | 'team_admin' | 'member';
+};
+
+export function getStoredAuthUser(): StoredAuthUser | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem('agentma_user');
+    if (!raw) return null;
+    return JSON.parse(raw) as StoredAuthUser;
+  } catch {
+    return null;
+  }
 }
 
 export function getAuthHeaders(extra: HeadersInit = {}): HeadersInit {

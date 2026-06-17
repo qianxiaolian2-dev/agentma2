@@ -1,27 +1,57 @@
+import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { SLASH_COMMANDS, MODELS, generateMockAgents, BUILT_IN_TOOLS, HOOK_EVENTS } from '../simulator/mock-data';
+import { MODELS, BUILT_IN_TOOLS, HOOK_EVENTS } from '../simulator/mock-data';
+import { useAuth } from '../contexts/AuthContext';
+import AgentMaMark from '../components/AgentMaMark';
+import LineIcon from '../components/LineIcon';
+import type { LineIconName } from '../components/LineIcon';
+import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
+import type { AgentTemplate } from '../simulator/types';
 
 const SECTIONS = [
-  { path: '/dashboard-studio', title: '看板工坊', desc: '上传数据集或输入指标，生成通用看板方案', icon: '🧭', color: '#2563eb' },
-  { path: '/conversations', title: '会话', desc: '多轮对话，Agent 按模板配置执行任务', icon: '💬', color: '#7c3aed' },
-  { path: '/agents', title: 'Agent 市场', desc: '创建和管理 Agent 模板，配置工具和能力', icon: '🤖', color: '#f59e0b' },
-  { path: '/playground', title: 'Playground', desc: '实时测试 query() 流式 API', icon: '▶', color: '#2563eb' },
-  { path: '/tools', title: '工具 & MCP', desc: `${BUILT_IN_TOOLS.length} 内置 + 自定义 MCP 工具`, icon: '🎒', color: '#d97706' },
-  { path: '/skills', title: '技能背包', desc: '管理 Agent Skills，扩展专业能力', icon: '✨', color: '#8b5cf6' },
-  { path: '/hooks', title: 'Hook 系统', desc: `${HOOK_EVENTS.length} 种事件监听`, icon: '🪝', color: '#059669' },
-  { path: '/subagents', title: '子代理管理', desc: 'AgentDefinition / Task CRUD', icon: '🤖', color: '#8b5cf6' },
-  { path: '/permissions', title: '权限系统', desc: 'setPermissionMode / canUseTool', icon: '🛡', color: '#2563eb' },
-  { path: '/observability', title: '可观测性', desc: 'OTEL 遥测 / RateLimit / StreamEvent', icon: '📊', color: '#10b981' },
-  { path: '/settings', title: '全局设置', desc: 'SdkOptions 完整配置面板', icon: '⚙', color: '#6b7280' },
-];
+  { path: '/conversations', title: '会话', desc: '多轮对话，Agent 按模板配置执行任务', icon: 'chat', color: '#7c3aed' },
+  { path: '/agents', title: 'Agent 市场', desc: '创建和管理 Agent 模板，配置工具和能力', icon: 'market', color: '#f59e0b' },
+  { path: '/playground', title: 'Playground', desc: '实时测试 query() 流式 API', icon: 'play', color: '#2563eb' },
+  { path: '/tools', title: '工具 & MCP', desc: `${BUILT_IN_TOOLS.length} 内置 + 自定义 MCP 工具`, icon: 'tools', color: '#d97706' },
+  { path: '/skills', title: '技能背包', desc: '管理 Agent Skills，扩展专业能力', icon: 'spark', color: '#8b5cf6' },
+  { path: '/hooks', title: 'Hook 系统', desc: `${HOOK_EVENTS.length} 种事件监听`, icon: 'hook', color: '#059669' },
+  { path: '/subagents', title: '子代理管理', desc: 'AgentDefinition / Task CRUD', icon: 'agents', color: '#8b5cf6' },
+  { path: '/permissions', title: '权限系统', desc: 'setPermissionMode / canUseTool', icon: 'shield', color: '#2563eb' },
+  { path: '/observability', title: '可观测性', desc: 'OTEL 遥测 / RateLimit / StreamEvent', icon: 'chart', color: '#10b981' },
+  { path: '/settings', title: '全局设置', desc: 'SdkOptions 完整配置面板', icon: 'gear', color: '#6b7280' },
+] satisfies Array<{ path: string; title: string; desc: string; icon: LineIconName; color: string }>;
 
 export default function Overview() {
-  const agents = generateMockAgents();
+  const { user, token } = useAuth();
+  const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
+  const [weeklyRuns, setWeeklyRuns] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!user?.tenantId) return;
+    let cancelled = false;
+    void bootstrapAgentTemplates(user.tenantId, false)
+      .then(list => { if (!cancelled) setTemplates(list); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [user?.tenantId]);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    void fetch('/api/quota/usage', { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.json())
+      .then(data => { if (!cancelled) setWeeklyRuns(data?.usage?.weeklyRunCount?.used ?? data?.usage?.totalRuns ?? null); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [token]);
 
   return (
     <div>
       <div className="page-header">
-        <h1>🐾 AgentMa</h1>
+        <h1 className="overview-title">
+          <AgentMaMark className="overview-title-mark" />
+          <span>AgentMa</span>
+        </h1>
         <p>Claude Agent SDK 全接口可视化面板 — 每个 SDK 接口都可触发、可观测</p>
       </div>
 
@@ -38,14 +68,14 @@ export default function Overview() {
           <div className="kpi-sub">种事件可监听</div>
         </div>
         <div className="kpi-card">
-          <div className="kpi-label">斜杠命令</div>
-          <div className="kpi-value">{SLASH_COMMANDS.length}</div>
-          <div className="kpi-sub">个 CLI 命令</div>
+          <div className="kpi-label">Agent 模板</div>
+          <div className="kpi-value">{templates.length}</div>
+          <div className="kpi-sub">个已配置模板</div>
         </div>
         <div className="kpi-card">
-          <div className="kpi-label">SDK Options</div>
-          <div className="kpi-value">50+</div>
-          <div className="kpi-sub">个可配置参数</div>
+          <div className="kpi-label">本周运行</div>
+          <div className="kpi-value">{weeklyRuns ?? '—'}</div>
+          <div className="kpi-sub">次 Agent 执行</div>
         </div>
       </div>
 
@@ -55,7 +85,9 @@ export default function Overview() {
         {SECTIONS.map(s => (
           <Link key={s.path} to={s.path} style={{ textDecoration: 'none' }}>
             <div className="tool-card" style={{ borderTop: `3px solid ${s.color}` }}>
-              <div style={{ fontSize: '1.4em', marginBottom: 6 }}>{s.icon}</div>
+              <div className="overview-module-icon" style={{ color: s.color }}>
+                <LineIcon name={s.icon} />
+              </div>
               <div className="tool-card-name" style={{ color: s.color }}>{s.title}</div>
               <div className="tool-card-desc">{s.desc}</div>
             </div>
@@ -115,15 +147,23 @@ export default function Overview() {
           </div>
         </div>
         <div className="card">
-          <div className="card-header">代理类型 — AgentInfo[]</div>
-          <div>
-            {agents.map(a => (
-              <div key={a.name} className="tool-card mb-2">
-                <div className="tool-card-name">{a.name}</div>
-                <div className="tool-card-desc">{a.description}</div>
+          <div className="card-header">Agent 模板 ({templates.length})</div>
+          {templates.length === 0 ? (
+            <div style={{ color: 'var(--ink-muted)', fontSize: '.82em', padding: '12px 0' }}>
+              暂无模板 — 在 <Link to="/agents" style={{ color: 'var(--accent)' }}>Agent 市场</Link> 创建
+            </div>
+          ) : (
+            templates.map(t => (
+              <div key={t.id} className="tool-card mb-2">
+                <div className="tool-card-name">{t.name}</div>
+                <div className="tool-card-desc">{t.description}</div>
+                <div className="flex gap-1 mt-1" style={{ flexWrap: 'wrap' }}>
+                  <span className="badge badge-muted">{t.model || 'default'}</span>
+                  <span className="badge badge-muted">{t.tools.length} tools</span>
+                </div>
               </div>
-            ))}
-          </div>
+            ))
+          )}
         </div>
       </div>
     </div>

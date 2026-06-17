@@ -1,0 +1,11 @@
+# 加入 NotebookLM 社区
+如需分享体验并提供宝贵反馈，您可以加入 Discord 服务器上的 NotebookLM 社区。您可以与其他用户交流、分享用例，并报告您发现的任何问题，帮助我们改进。
+重要提示： Safari 不支持 Discord 使用的 Web 技术。您可以改用 Google Chrome 或其他浏览器。
+如需加入服务器，请执行以下操作：
+- 前往 邀请链接 。
+- 如要加入，请选择 接受邀请 。
+提示： 请确保您已登录 Discord 账号。
+## 相关资源
+- 了解 NotebookLM
+- 报告问题或发送一般反馈
+计算机 Android iPhone 和 iPad 更多

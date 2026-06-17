@@ -3,6 +3,8 @@
 // 提取自 agent-sdk-docs-zh 文档
 // ============================================================
 
+import type { ChatMessageStatus, RunOutcome } from './run-state';
+
 // --- 权限模式 ---
 export type PermissionMode =
   | 'default'
@@ -186,6 +188,7 @@ export interface SDKMessage {
   content?: unknown[];
   result?: string;
   duration_ms?: number;
+  duration_api_ms?: number;
   total_cost_usd?: number;
   usage?: { input_tokens: number; output_tokens: number; cache_creation_tokens?: number; cache_read_tokens?: number };
   model?: string;
@@ -207,6 +210,7 @@ export interface SDKMessage {
   modelUsage?: Record<string, { input_tokens: number; output_tokens: number }>;
   permission_denials?: unknown[];
   structured_output?: unknown;
+  parent_tool_use_id?: string;
 }
 
 // --- MCP 服务器状态 ---
@@ -309,19 +313,29 @@ export interface BuiltInTool {
   description: string;
   category: 'file' | 'execution' | 'task' | 'search' | 'interaction' | 'mcp' | 'notebook' | 'agent';
   inputSchema: Record<string, unknown>;
+  annotations?: ToolAnnotations;
 }
 
 // --- 供应商/Provider 配置 (通过 options.env 传递) ---
 export interface ProviderConfig {
   ANTHROPIC_AUTH_TOKEN: string;
   ANTHROPIC_BASE_URL: string;
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: string;
-  ANTHROPIC_DEFAULT_OPUS_MODEL: string;
-  ANTHROPIC_DEFAULT_SONNET_MODEL: string;
   ANTHROPIC_MODEL: string;
-  ANTHROPIC_REASONING_MODEL: string;
-  CLAUDE_CODE_EFFORT_LEVEL: string;
-  CLAUDE_CODE_SUBAGENT_MODEL: string;
+}
+
+export interface ProviderProfile {
+  ANTHROPIC_AUTH_TOKEN: string;
+  ANTHROPIC_BASE_URL: string;
+  id: string;
+  name: string;
+  availableModels: string[];
+  enabled: boolean;
+  isDefault?: boolean;
+  createdAt?: number;
+  updatedAt?: number;
+  /** Legacy fields kept only for localStorage migration. */
+  ANTHROPIC_MODEL?: string;
+  modelPatterns?: string;
 }
 
 // --- 速率限制 ---
@@ -385,14 +399,24 @@ export interface AgentTemplate {
   systemPrompt: string;
   model: string;
   tools: string[];
+  subagents?: Record<string, AgentDefinition>;
   mcpServers: string[];
   eventSources: string[];
   skills: string[];
   effort: EffortLevel;
   maxTurns: number;
   permissionMode: PermissionMode;
-  // 供应商配置覆盖 (可选，留空则使用全局配置)
+  // Legacy: 旧模板可能仍带 Agent 级供应商覆盖；运行时优先使用账户页供应商规则。
   providerOverrides?: Partial<ProviderConfig>;
+  // 结构化输出 JSON Schema (可选)
+  outputSchema?: Record<string, unknown>;
+  // 文件检查点：编辑前快照文件，支持 /rewind 回滚
+  enableFileCheckpointing?: boolean;
+  // 知识库：允许 agent 只读访问租户配置的本地笔记目录
+  useKnowledge?: boolean;
+  knowledgeSourceIds?: string[];
+  // 导入本地 Claude Code 项目时生成的模板级 seed 仓路径。
+  seedDir?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -424,12 +448,59 @@ export interface SkillInfo {
   location: 'project' | 'user' | 'plugin';
   path: string;
   enabled: boolean;
+  sourcePath?: string;
+  installedPath?: string;
+  installed?: boolean;
+  learnedFromPublicSkillId?: string;
+  learnedFromPublicRevision?: number;
+  learnedAt?: number;
+}
+
+export interface PublicSkillInfo {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  authorSub: string;
+  authorTenantId: string;
+  revision: number;
+  publishedAt: number;
+  updatedAt: number;
 }
 
 // --- 聊天消息 ---
+export type ChatImageMimeType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+
+export interface ChatImageAttachment {
+  id: string;
+  type: 'image';
+  mediaType: ChatImageMimeType;
+  data: string;
+  name?: string;
+  size: number;
+}
+
+export interface ChatFileAttachment {
+  id: string;
+  type: 'file';
+  mediaType: string;
+  data: string;
+  name: string;
+  size: number;
+}
+
+export type ChatAttachment = ChatImageAttachment | ChatFileAttachment;
+
 export interface ChatMessage {
+  id?: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  thinking?: string;
+  status?: ChatMessageStatus;
+  outcome?: RunOutcome;
+  outcomeDetail?: string;
+  runId?: string;
+  attachments?: ChatAttachment[];
   timestamp: number;
 }
 
@@ -444,11 +515,22 @@ export interface EventSourceConfig {
 // --- 聊天会话 ---
 export interface ChatSession {
   id: string;
+  ownerSub?: string;
   templateId: string;
   pinned?: boolean;
   title: string;
   messages: ChatMessage[];
+  messageCount?: number;
   model: string;
+  sdkSessionId?: string;
+  sdkCwd?: string;
+  forkedFromSessionId?: string;
+  forkedFromTitle?: string;
+  collaborationEnabled?: boolean;
+  collaborationRole?: 'owner' | 'member';
+  collaborationUpdatedAt?: number;
+  /** 仅前端使用: 来自服务端响应的会话为 true,本地草稿没有。协作等需要服务端行存在的操作据此门控。 */
+  persisted?: boolean;
   createdAt: number;
   updatedAt: number;
 }

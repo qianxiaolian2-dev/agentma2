@@ -1,178 +1,369 @@
-import { useState, useCallback } from 'react';
-import type { HookEvent, HookCallbackMatcher } from '../simulator/types';
-import { sdkSimulator } from '../simulator/sdk-simulator';
+import { useEffect, useMemo, useState } from 'react';
 import { HOOK_EVENTS } from '../simulator/mock-data';
-import JsonViewer from '../components/common/JsonViewer';
 import StatusBadge from '../components/common/StatusBadge';
+import JsonViewer from '../components/common/JsonViewer';
+import { getAuthHeaders } from '../utils/client-runtime';
+
+type HookRuleEvent = 'PreToolUse' | 'PostToolUse' | 'Notification';
+type HookRuleAction = 'allow' | 'block' | 'context' | 'log';
+type HookDecisionAction = HookRuleAction | 'none';
+
+type HookRule = {
+  id: string;
+  eventName: HookRuleEvent;
+  matcher: string;
+  ruleContent: string;
+  action: HookRuleAction;
+  message: string;
+  enabled: boolean;
+  position: number;
+  createdAt?: number;
+  updatedAt?: number;
+};
+
+type EvaluationResult = {
+  action: HookDecisionAction;
+  reason: string;
+  output: Record<string, unknown>;
+  rule: HookRule | null;
+};
+
+type EvaluationEntry = {
+  eventName: HookRuleEvent;
+  input: Record<string, unknown>;
+  result: EvaluationResult;
+  timestamp: number;
+};
+
+const SUPPORTED_EVENTS: HookRuleEvent[] = ['PreToolUse', 'PostToolUse', 'Notification'];
+const ACTIONS: HookRuleAction[] = ['block', 'context', 'allow', 'log'];
+const DEFAULT_RULES: HookRule[] = [
+  {
+    id: crypto.randomUUID(),
+    eventName: 'PreToolUse',
+    matcher: 'Bash',
+    ruleContent: 'rm ',
+    action: 'block',
+    message: 'Blocked destructive shell command by tenant hook policy.',
+    enabled: true,
+    position: 0,
+  },
+  {
+    id: crypto.randomUUID(),
+    eventName: 'PostToolUse',
+    matcher: 'Write',
+    ruleContent: '',
+    action: 'context',
+    message: 'Write operation was recorded by a tenant PostToolUse hook.',
+    enabled: true,
+    position: 1,
+  },
+];
+
+const jsonAuthHeaders = () => getAuthHeaders({ 'Content-Type': 'application/json' });
+
+function createRule(position: number): HookRule {
+  return {
+    id: crypto.randomUUID(),
+    eventName: 'PreToolUse',
+    matcher: 'Bash',
+    ruleContent: '',
+    action: 'block',
+    message: '',
+    enabled: true,
+    position,
+  };
+}
+
+function normalizeRules(rules: HookRule[]) {
+  return rules.map((rule, index) => ({ ...rule, position: index }));
+}
+
+function actionStatus(action: HookDecisionAction) {
+  if (action === 'block') return 'error';
+  if (action === 'allow' || action === 'context' || action === 'log') return 'success';
+  return 'warning';
+}
+
+function defaultInputFor(eventName: HookRuleEvent) {
+  if (eventName === 'Notification') {
+    return '{ "hook_event_name": "Notification", "notification_type": "status", "message": "Agent is waiting" }';
+  }
+  if (eventName === 'PostToolUse') {
+    return '{ "hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": { "file_path": "/tmp/demo.txt" }, "tool_response": "ok" }';
+  }
+  return '{ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": "rm -rf /tmp/demo" } }';
+}
 
 export default function Hooks() {
-  const [configs, setConfigs] = useState<Partial<Record<HookEvent, HookCallbackMatcher[]>>>({});
-  const [logs, setLogs] = useState<Array<{ event: HookEvent; input: Record<string, unknown>; output: Record<string, unknown>; timestamp: number }>>([]);
-  const [selectedEvent, setSelectedEvent] = useState<HookEvent | null>(null);
-  const [matcherInput, setMatcherInput] = useState('');
-  const [toolTrigger, setToolTrigger] = useState('Read');
+  const [rules, setRules] = useState<HookRule[]>([]);
+  const [draftRules, setDraftRules] = useState<HookRule[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [status, setStatus] = useState('');
+  const [evalForm, setEvalForm] = useState({
+    eventName: 'PreToolUse' as HookRuleEvent,
+    input: defaultInputFor('PreToolUse'),
+  });
+  const [results, setResults] = useState<EvaluationEntry[]>([]);
 
-  const categoryColors: Record<string, string> = {
-    tool: 'var(--warning)',
-    session: 'var(--accent)',
-    agent: 'var(--info)',
-    notification: 'var(--success)',
-    config: 'var(--ink-muted)',
+  const changed = useMemo(() => JSON.stringify(rules) !== JSON.stringify(draftRules), [rules, draftRules]);
+
+  const loadRules = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const response = await fetch('/api/hook-rules', { headers: getAuthHeaders() });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '加载 Hook 规则失败');
+      const next = Array.isArray(data) ? data : [];
+      setRules(next);
+      setDraftRules(next);
+    } catch (loadError) {
+      setError((loadError as Error).message);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  // 配置 Hook
-  const addHookConfig = useCallback((event: HookEvent) => {
-    const matcher: HookCallbackMatcher = {
-      matcher: matcherInput || undefined,
-      hooks: [async (input, toolUseID) => {
-        const result = { continue: true, decision: 'approve' as const, reason: `处理 ${event}`, hookSpecificOutput: {} };
-        return result;
-      }],
-      timeout: 30000,
-    };
-    const newConfigs = { ...configs, [event]: [...(configs[event] || []), matcher] };
-    setConfigs(newConfigs);
-    sdkSimulator.configureHooks(newConfigs);
-  }, [configs, matcherInput]);
+  useEffect(() => { void loadRules(); }, []);
 
-  // 触发 Hook 并查看日志
-  const triggerAndLog = useCallback(async (event: HookEvent) => {
-    const result = await sdkSimulator.triggerHook(event, toolTrigger);
-    setLogs(prev => [{ event, ...result, timestamp: Date.now() }, ...prev]);
-  }, [toolTrigger]);
-
-  const clearLogs = () => {
-    sdkSimulator.clearHookLogs();
-    setLogs([]);
+  const updateRule = (id: string, patch: Partial<HookRule>) => {
+    setDraftRules((current) => current.map((rule) => (rule.id === id ? { ...rule, ...patch } : rule)));
   };
 
-  const removeHookConfig = (event: HookEvent, idx: number) => {
-    const updated = [...(configs[event] || [])];
-    updated.splice(idx, 1);
-    const newConfigs = { ...configs, [event]: updated };
-    if (updated.length === 0) delete newConfigs[event];
-    setConfigs(newConfigs);
-    sdkSimulator.configureHooks(newConfigs);
+  const addRule = () => {
+    setDraftRules((current) => [...current, createRule(current.length)]);
   };
+
+  const removeRule = (id: string) => {
+    setDraftRules((current) => normalizeRules(current.filter((rule) => rule.id !== id)));
+  };
+
+  const moveRule = (id: string, direction: -1 | 1) => {
+    setDraftRules((current) => {
+      const index = current.findIndex((rule) => rule.id === id);
+      const nextIndex = index + direction;
+      if (index < 0 || nextIndex < 0 || nextIndex >= current.length) return current;
+      const next = [...current];
+      [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+      return normalizeRules(next);
+    });
+  };
+
+  const saveRules = async (nextRules = draftRules) => {
+    setSaving(true);
+    setError('');
+    setStatus('');
+    try {
+      const response = await fetch('/api/hook-rules', {
+        method: 'PUT',
+        headers: jsonAuthHeaders(),
+        body: JSON.stringify(normalizeRules(nextRules)),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '保存 Hook 规则失败');
+      setRules(data);
+      setDraftRules(data);
+      setStatus('已保存，新的 agent 运行会把这些规则编译进 SDK hooks');
+    } catch (saveError) {
+      setError((saveError as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const installDefaults = () => {
+    const next = normalizeRules(DEFAULT_RULES.map((rule) => ({ ...rule, id: crypto.randomUUID() })));
+    setDraftRules(next);
+    void saveRules(next);
+  };
+
+  const evaluate = async () => {
+    setError('');
+    let input: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(evalForm.input);
+      input = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      setError('输入必须是有效的 JSON 对象');
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/hook-rules/evaluate', {
+        method: 'POST',
+        headers: jsonAuthHeaders(),
+        body: JSON.stringify({ eventName: evalForm.eventName, input }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Hook 检查失败');
+      setResults((current) => [{ eventName: evalForm.eventName, input, result, timestamp: Date.now() }, ...current]);
+    } catch (evalError) {
+      setError((evalError as Error).message);
+    }
+  };
+
+  const onEvalEventChange = (eventName: HookRuleEvent) => {
+    setEvalForm({ eventName, input: defaultInputFor(eventName) });
+  };
+
+  const supportedNames = new Set<string>(SUPPORTED_EVENTS);
 
   return (
     <div>
       <div className="page-header">
         <h1>🪝 Hook 系统</h1>
-        <p>HookCallback / HookCallbackMatcher / PreToolUse / PostToolUse / SessionStart ... 共 {HOOK_EVENTS.length} 个事件</p>
+        <p>租户级 Hook 规则已接入真实 SDK hooks；当前支持 PreToolUse / PostToolUse / Notification。</p>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
-        {/* Hook 事件列表 + 配置 */}
+      {error && <div className="card mb-4" style={{ borderColor: 'var(--danger)', background: 'var(--danger-bg)', color: 'var(--danger)' }}>{error}</div>}
+      {status && <div className="card mb-4" style={{ borderColor: 'var(--success)', background: 'var(--success-bg)', color: 'var(--success)' }}>{status}</div>}
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1.3fr) minmax(360px, .7fr)', gap: 20 }}>
         <div>
           <div className="card">
-            <div className="card-header">Hook 事件配置 — Options.hooks</div>
-            <div className="form-group">
-              <label>工具名 (用于 tool 类 hook 的 matcher)</label>
-              <input value={toolTrigger} onChange={e => setToolTrigger(e.target.value)} placeholder="Read" />
+            <div className="flex-between" style={{ alignItems: 'flex-start', gap: 12, marginBottom: 12 }}>
+              <div>
+                <div className="card-header" style={{ marginBottom: 4 }}>真实 Hook 规则</div>
+                <div className="tool-card-desc">按顺序匹配。matcher 匹配工具名或通知类型；规则内容为空表示只按事件和 matcher 匹配。</div>
+              </div>
+              <div className="flex gap-2" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                <button className="btn btn-sm" onClick={addRule}>添加规则</button>
+                <button className="btn btn-sm" onClick={installDefaults} disabled={saving}>装入默认</button>
+                <button className="btn btn-sm btn-primary" onClick={() => void saveRules()} disabled={!changed || saving}>
+                  {saving ? '保存中...' : '保存规则'}
+                </button>
+              </div>
             </div>
-            <div className="form-group">
-              <label>matcher 模式 (可选，正则)</label>
-              <input value={matcherInput} onChange={e => setMatcherInput(e.target.value)} placeholder='例如 "Read|Write"' />
-            </div>
-            <div className="table-wrap" style={{ maxHeight: 400, overflowY: 'auto' }}>
-              <table>
-                <thead>
-                  <tr><th>事件</th><th>描述</th><th>类别</th><th>配置</th><th>触发</th></tr>
-                </thead>
-                <tbody>
-                  {HOOK_EVENTS.map(ev => {
-                    const isConfigured = configs[ev.name]?.length;
-                    return (
-                      <tr key={ev.name} style={{ background: selectedEvent === ev.name ? 'var(--accent-bg)' : undefined }}>
-                        <td>
-                          <a href="#" onClick={e => { e.preventDefault(); setSelectedEvent(ev.name); }} style={{ fontFamily: 'var(--font-mono)', fontSize: '.82em', color: 'var(--accent)', textDecoration: 'none' }}>
-                            {ev.name}
-                          </a>
-                        </td>
-                        <td style={{ fontSize: '.82em' }}>{ev.description}</td>
-                        <td>
-                          <span className="badge" style={{ background: categoryColors[ev.category] + '20', color: categoryColors[ev.category] }}>
-                            {ev.category}
-                          </span>
-                        </td>
-                        <td>
-                          <button className="btn btn-sm btn-primary" onClick={() => addHookConfig(ev.name)}>
-                            添加 Hook
-                          </button>
-                          {isConfigured && <span className="badge badge-success ml-2">{isConfigured}</span>}
-                        </td>
-                        <td>
-                          <button className="btn btn-sm" onClick={() => triggerAndLog(ev.name)}>触发</button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+
+            {loading ? (
+              <div style={{ color: 'var(--ink-muted)', padding: 20, textAlign: 'center' }}>加载中...</div>
+            ) : draftRules.length === 0 ? (
+              <div style={{ color: 'var(--ink-muted)', padding: 20, textAlign: 'center' }}>还没有 Hook 规则。未配置时 agent 运行不会传入自定义 hooks。</div>
+            ) : (
+              <div style={{ display: 'grid', gap: 10 }}>
+                {draftRules.map((rule, index) => (
+                  <div key={rule.id} className="tool-card fade-in">
+                    <div className="grid-4" style={{ alignItems: 'end', gap: 10 }}>
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label>事件</label>
+                        <select value={rule.eventName} onChange={(event) => updateRule(rule.id, { eventName: event.target.value as HookRuleEvent })}>
+                          {SUPPORTED_EVENTS.map((eventName) => <option key={eventName} value={eventName}>{eventName}</option>)}
+                        </select>
+                      </div>
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label>动作</label>
+                        <select value={rule.action} onChange={(event) => updateRule(rule.id, { action: event.target.value as HookRuleAction })}>
+                          {ACTIONS.map((action) => <option key={action} value={action}>{action}</option>)}
+                        </select>
+                      </div>
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label>matcher</label>
+                        <input
+                          value={rule.matcher}
+                          onChange={(event) => updateRule(rule.id, { matcher: event.target.value })}
+                          placeholder="例如 Bash、Write、status"
+                        />
+                      </div>
+                      <div className="flex gap-2" style={{ justifyContent: 'flex-end', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <label style={{ display: 'inline-flex', gap: 6, alignItems: 'center', marginBottom: 0 }}>
+                          <input
+                            type="checkbox"
+                            checked={rule.enabled}
+                            onChange={(event) => updateRule(rule.id, { enabled: event.target.checked })}
+                            style={{ width: 'auto' }}
+                          />
+                          启用
+                        </label>
+                        <button className="btn btn-sm" onClick={() => moveRule(rule.id, -1)} disabled={index === 0}>上移</button>
+                        <button className="btn btn-sm" onClick={() => moveRule(rule.id, 1)} disabled={index === draftRules.length - 1}>下移</button>
+                        <button className="btn btn-sm btn-danger" onClick={() => removeRule(rule.id)}>删除</button>
+                      </div>
+                    </div>
+                    <div className="grid-2 mt-2">
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label>规则内容</label>
+                        <input
+                          value={rule.ruleContent}
+                          onChange={(event) => updateRule(rule.id, { ruleContent: event.target.value })}
+                          placeholder="例如 rm、/etc、error"
+                        />
+                      </div>
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label>附加消息</label>
+                        <input
+                          value={rule.message}
+                          onChange={(event) => updateRule(rule.id, { message: event.target.value })}
+                          placeholder="传给模型或日志的上下文"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
-          {/* 已配置的 Hooks */}
-          {Object.keys(configs).length > 0 && (
-            <div className="card mt-4">
-              <div className="card-header">当前 Hook 配置</div>
-              {Object.entries(configs).map(([event, matchers]) => (
-                <div key={event} className="tool-card mb-2">
-                  <div className="flex-between">
-                    <div className="tool-card-name">{event}</div>
+          <div className="card mt-4">
+            <div className="card-header">Hook 事件支持状态</div>
+            <div className="grid-3" style={{ gap: 10 }}>
+              {HOOK_EVENTS.map((event) => (
+                <div key={event.name} className="tool-card">
+                  <div className="flex-between" style={{ alignItems: 'center', gap: 8 }}>
+                    <div className="tool-card-name">{event.name}</div>
+                    <StatusBadge status={supportedNames.has(event.name) ? 'success' : 'disabled'} label={supportedNames.has(event.name) ? '已接入' : '待接入'} />
                   </div>
-                  {matchers?.map((m, i) => (
-                    <div key={i} className="flex-between mt-2" style={{ fontSize: '.8em' }}>
-                      <span style={{ color: 'var(--ink-secondary)' }}>
-                        matcher: {m.matcher || '(无)'} | timeout: {m.timeout}ms | hooks: {m.hooks.length}
-                      </span>
-                      <button className="btn btn-sm btn-danger" onClick={() => removeHookConfig(event as HookEvent, i)}>移除</button>
-                    </div>
-                  ))}
+                  <div className="tool-card-desc">{event.description}</div>
                 </div>
               ))}
             </div>
-          )}
+          </div>
         </div>
 
-        {/* Hook 触发日志 */}
         <div>
           <div className="card">
-            <div className="flex-between">
-              <div className="card-header" style={{ marginBottom: 0 }}>Hook 执行日志</div>
-              <button className="btn btn-sm" onClick={clearLogs}>清除日志</button>
+            <div className="card-header">Hook 真实检查</div>
+            <div className="form-group">
+              <label>事件</label>
+              <select value={evalForm.eventName} onChange={(event) => onEvalEventChange(event.target.value as HookRuleEvent)}>
+                {SUPPORTED_EVENTS.map((eventName) => <option key={eventName} value={eventName}>{eventName}</option>)}
+              </select>
             </div>
-            {logs.length === 0 ? (
+            <div className="form-group">
+              <label>HookInput JSON</label>
+              <textarea
+                value={evalForm.input}
+                onChange={(event) => setEvalForm({ ...evalForm, input: event.target.value })}
+                rows={8}
+                style={{ fontFamily: 'var(--font-mono)', fontSize: '.82em' }}
+              />
+            </div>
+            <button className="btn btn-primary" onClick={() => void evaluate()}>执行检查</button>
+          </div>
+
+          <div className="card mt-4">
+            <div className="card-header">Hook 决策日志</div>
+            {results.length === 0 ? (
               <div style={{ color: 'var(--ink-muted)', fontSize: '.84em', padding: 20, textAlign: 'center' }}>
-                点击「触发」按钮来测试 Hook 事件
+                点击「执行检查」查看后端 hook 规则输出
               </div>
             ) : (
-              <div style={{ maxHeight: 600, overflowY: 'auto' }}>
-                {logs.map((log, i) => (
-                  <div key={i} className="tool-card mb-2 fade-in">
+              <div style={{ maxHeight: 560, overflowY: 'auto' }}>
+                {results.map((entry) => (
+                  <div key={`${entry.timestamp}-${entry.eventName}`} className="tool-card mb-2 fade-in">
                     <div className="flex-between mb-2">
-                      <div>
-                        <span className="badge badge-info" style={{ marginRight: 8 }}>{log.event}</span>
-                        <StatusBadge status="success" label="已执行" />
+                      <div className="flex gap-2" style={{ alignItems: 'center' }}>
+                        <span className="badge badge-info">{entry.eventName}</span>
+                        <StatusBadge status={actionStatus(entry.result.action)} label={entry.result.action} />
                       </div>
                       <span style={{ fontSize: '.75em', color: 'var(--ink-muted)' }}>
-                        {new Date(log.timestamp).toLocaleTimeString()}
+                        {new Date(entry.timestamp).toLocaleTimeString()}
                       </span>
                     </div>
-                    <details>
-                      <summary style={{ cursor: 'pointer', fontSize: '.82em', color: 'var(--accent)' }}>HookInput / HookJSONOutput</summary>
-                      <div className="grid-2 mt-2" style={{ gap: 10 }}>
-                        <div>
-                          <div style={{ fontSize: '.75em', fontWeight: 600, marginBottom: 4 }}>HookInput</div>
-                          <JsonViewer data={log.input} maxHeight={200} />
-                        </div>
-                        <div>
-                          <div style={{ fontSize: '.75em', fontWeight: 600, marginBottom: 4 }}>HookJSONOutput</div>
-                          <JsonViewer data={log.output} maxHeight={200} />
-                        </div>
-                      </div>
-                    </details>
+                    <div className="tool-card-desc" style={{ marginBottom: 8 }}>{entry.result.reason}</div>
+                    <JsonViewer data={{ input: entry.input, output: entry.result.output, rule: entry.result.rule }} maxHeight={320} />
                   </div>
                 ))}
               </div>
