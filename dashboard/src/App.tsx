@@ -28,18 +28,12 @@ export default function App() {
     <AuthProvider>
       <Routes>
         <Route path="/login" element={<Login />} />
-        <Route path="/dashboard-studio" element={
-          <div className="standalone-page">
-            <div className="standalone-page-inner">
-              <DashboardStudio />
-            </div>
-          </div>
-        } />
         <Route path="/*" element={
           <AuthGuard>
             <Layout>
               <Routes>
                 <Route path="/" element={<Overview />} />
+                <Route path="/dashboard-studio" element={<DashboardStudio />} />
                 <Route path="/playground" element={<Playground />} />
                 <Route path="/agents" element={<Agents />} />
                 <Route path="/agents/:id/chat" element={<AgentChat />} />

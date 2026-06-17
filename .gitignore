@@ -25,3 +25,6 @@ spike-sdk/
 .DS_Store
 .idea/
 .vscode/
+
+# Agentma local runtime uploads/databases
+.tmp-agentma-data/

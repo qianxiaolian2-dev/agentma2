@@ -403,6 +403,7 @@ export interface AgentTemplate {
   mcpServers: string[];
   eventSources: string[];
   skills: string[];
+  datasourceIds?: string[];
   effort: EffortLevel;
   maxTurns: number;
   permissionMode: PermissionMode;

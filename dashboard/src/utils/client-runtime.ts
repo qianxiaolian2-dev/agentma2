@@ -1,5 +1,37 @@
+const LOCAL_DEV_AUTH_SEED = {
+  token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlZTE1Zjg3Zi1jODQ5LTQ0OGUtOTczNC1lNTM4ZWI1YjE3NzkiLCJ0ZW5hbnRJZCI6IjhhNDNkYTZjLTEzMzYtNDI4MC1iZWMxLTFiYzBmZTZlNzYxMCIsImV4cCI6MTc4MjI3ODk4N30.5g6DDIr-qWg6mHBPNsC1bURLlh0qraWBbwLHhdTjypY',
+  user: {
+    id: 'ee15f87f-c849-448e-9734-e538eb5b1779',
+    username: 'dash-test',
+    email: 'dash-test@example.com',
+    name: 'Dash Test',
+    tenantId: '8a43da6c-1336-4280-bec1-1bc0fe6e7610',
+    role: 'tenant_admin' as const,
+  },
+};
+
+function isLocalDevAgentma() {
+  if (typeof window === 'undefined') return false;
+  return window.location.hostname === 'localhost' && window.location.port === '3005';
+}
+
+function ensureLocalDevAuthSeed() {
+  if (!isLocalDevAgentma()) return;
+  try {
+    // dev 环境:始终用最新 seed 覆盖,避免老 token 残留导致 401
+    const stored = localStorage.getItem('agentma_jwt');
+    if (stored !== LOCAL_DEV_AUTH_SEED.token) {
+      localStorage.setItem('agentma_jwt', LOCAL_DEV_AUTH_SEED.token);
+    }
+    if (!localStorage.getItem('agentma_user')) {
+      localStorage.setItem('agentma_user', JSON.stringify(LOCAL_DEV_AUTH_SEED.user));
+    }
+  } catch {}
+}
+
 export function getStoredAuthToken(): string | null {
   if (typeof window === 'undefined') return null;
+  ensureLocalDevAuthSeed();
   return localStorage.getItem('agentma_jwt');
 }
 
@@ -18,6 +50,7 @@ export type StoredAuthUser = {
 
 export function getStoredAuthUser(): StoredAuthUser | null {
   if (typeof window === 'undefined') return null;
+  ensureLocalDevAuthSeed();
   try {
     const raw = localStorage.getItem('agentma_user');
     if (!raw) return null;

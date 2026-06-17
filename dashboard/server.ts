@@ -88,9 +88,19 @@ import {
   runDatasourceQuery,
   serializeQueryResult,
   datasourceUploadFormat,
+  validateReadOnlySql,
   MAX_DATASOURCE_UPLOAD_BYTES,
   DATASOURCE_UPLOAD_EXTENSIONS,
 } from './server-datasource.ts';
+import {
+  buildDatasetProfile,
+  buildMockLayout,
+  validateDashboardLayout,
+  widgetQuery,
+  saveDashboard,
+  loadDashboard,
+} from './server-dashboard.ts';
+import { generateLayoutByLLM, askQuestion } from './server-dashboard-llm.ts';
 import { mapResultSubtypeToOutcome, outcomeToMessageStatus, type RunOutcome } from './src/simulator/run-state.ts';
 
 const app = express();
@@ -3337,7 +3347,16 @@ const datasourceUpload = multer({
 
 function parseDatasourceUpload(req: any, res: any, next: any) {
   datasourceUpload.single('file')(req, res, (error: unknown) => {
-    if (!error) { next(); return; }
+    if (!error) {
+      // multer 把文件名按 latin-1 解码,中文会乱码;转回 utf-8
+      if (req.file?.originalname) {
+        try {
+          req.file.originalname = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+        } catch {}
+      }
+      next();
+      return;
+    }
     if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
       res.status(400).json({ error: `数据源文件不能超过 ${Math.round(MAX_DATASOURCE_UPLOAD_BYTES / 1024 / 1024)}MB` });
       return;
@@ -3428,6 +3447,134 @@ app.delete('/api/datasources/:id', authMiddleware, (req: any, res) => {
   }
   audit(req.auth.tenantId, 'delete_datasource', req.auth.sub, 'user', `datasource:${req.params.id}`, {});
   res.json({ ok: true });
+});
+
+// ═══ Dashboard Studio Routes (AI 自动看板) ═══
+// POST /api/dashboard/profile         { datasourceId, tableName? } → DatasetProfile
+// POST /api/dashboard/generate        { datasourceId, tableName?, useMock? } → DashboardLayout
+// POST /api/dashboard/widget/query    { datasourceId, widget } → 行数据
+// PUT  /api/dashboard/:id             { layout } → 保存
+// GET  /api/dashboard/:id             ?datasourceId=… → DashboardLayout
+app.post('/api/dashboard/profile', authMiddleware, (req: any, res) => {
+  const datasourceId = String(req.body?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source || !source.enabled) { res.status(404).json({ error: 'datasource not found' }); return; }
+  try {
+    const profile = buildDatasetProfile(datasourceId, source.path, req.body?.tableName);
+    res.json(profile);
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || 'profile 失败' });
+  }
+});
+
+app.post('/api/dashboard/generate', authMiddleware, async (req: any, res) => {
+  const datasourceId = String(req.body?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source || !source.enabled) { res.status(404).json({ error: 'datasource not found' }); return; }
+  const useMock = req.body?.useMock === true;
+  try {
+    const profile = buildDatasetProfile(datasourceId, source.path, req.body?.tableName);
+    if (useMock) {
+      res.json({ profile, layout: buildMockLayout(profile), source: 'mock' });
+      return;
+    }
+    const result = await generateLayoutByLLM(profile);
+    res.json({ profile, layout: result.layout, source: result.source, llmError: result.llmError });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || 'generate 失败' });
+  }
+});
+
+app.post('/api/dashboard/widget/query', authMiddleware, (req: any, res) => {
+  const datasourceId = String(req.body?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source || !source.enabled) { res.status(404).json({ error: 'datasource not found' }); return; }
+  const widget = req.body?.widget;
+  const tableName = String(req.body?.tableName || '') || source.tables?.[0]?.name;
+  if (!widget || !tableName) { res.status(400).json({ error: 'widget 或 tableName 缺失' }); return; }
+  try {
+    const result = widgetQuery(source.path, tableName, widget);
+    res.type('application/json').send(serializeQueryResult(result));
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || 'widget 查询失败' });
+  }
+});
+
+// ─── AI 问答 ─── 用户输入自然语言 → LLM 出 SQL+图+解读 → 后端跑 SQL → 返结果
+app.post('/api/dashboard/ask', authMiddleware, async (req: any, res) => {
+  const datasourceId = String(req.body?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source || !source.enabled) { res.status(404).json({ error: 'datasource not found' }); return; }
+  const question = String(req.body?.question || '').trim();
+  if (!question) { res.status(400).json({ error: '问题不能为空' }); return; }
+  const history = Array.isArray(req.body?.history) ? req.body.history : [];
+  try {
+    const profile = buildDatasetProfile(datasourceId, source.path, req.body?.tableName);
+    const ans = await askQuestion(profile, question, history);
+    if ('error' in ans) { res.status(400).json({ error: ans.error }); return; }
+
+    // 校验并执行 SQL
+    const sqlCheck = validateReadOnlySql(ans.sql);
+    if (!sqlCheck.ok) {
+      res.json({ ...ans, error: 'SQL 校验失败: ' + sqlCheck.reason, queryResult: null });
+      return;
+    }
+    let queryResult: any = null;
+    let queryError: string | null = null;
+    try {
+      queryResult = runDatasourceQuery(source.path, ans.sql);
+    } catch (e) {
+      queryError = (e as Error).message;
+    }
+    res.json({ ...ans, queryResult, queryError });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || 'ask 失败' });
+  }
+});
+
+app.put('/api/dashboard/:id', authMiddleware, (req: any, res) => {
+  const layout = req.body?.layout;
+  if (!layout || layout.version !== '1.0') { res.status(400).json({ error: 'layout 非法' }); return; }
+  const datasourceId = String(layout.meta?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source) { res.status(404).json({ error: 'datasource not found' }); return; }
+  try {
+    const profile = buildDatasetProfile(datasourceId, source.path, layout.meta?.tableName);
+    const check = validateDashboardLayout(layout, profile, { normalize: false });
+    if (!check.ok) { res.status(400).json({ error: 'layout 校验失败', details: check.errors }); return; }
+    const saved = saveDashboard(source.path, check.layout, req.params.id);
+    res.json({ id: saved.id, layout: check.layout });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || '保存失败' });
+  }
+});
+
+app.get('/api/dashboard/:id', authMiddleware, (req: any, res) => {
+  const datasourceId = String(req.query?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source) { res.status(404).json({ error: 'datasource not found' }); return; }
+  const layout = loadDashboard(source.path, req.params.id);
+  if (!layout) { res.status(404).json({ error: 'dashboard not found' }); return; }
+  res.json({ id: req.params.id, layout });
+});
+
+// ─── 重新排布看板:把 widgets 走一遍 autoLayoutFix(尊重 manualEdited)
+app.post('/api/dashboard/relayout', authMiddleware, (req: any, res) => {
+  const layout = req.body?.layout;
+  if (!layout || layout.version !== '1.0') { res.status(400).json({ error: 'layout 非法' }); return; }
+  const datasourceId = String(layout.meta?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source) { res.status(404).json({ error: 'datasource not found' }); return; }
+  try {
+    const profile = buildDatasetProfile(datasourceId, source.path, layout.meta?.tableName);
+    // 强制重排:把所有 widget 的 manualEdited 暂时清掉,过 normalize=true 的 validate
+    const widgets = layout.widgets.map((w: any) => ({ ...w, manualEdited: false }));
+    const check = validateDashboardLayout({ ...layout, widgets }, profile, { normalize: true });
+    if (!check.ok) { res.status(400).json({ error: 'layout 校验失败', details: check.errors }); return; }
+    res.json({ layout: check.layout });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || '重排失败' });
+  }
 });
 
 // ═══ Chat Sessions Routes ═══
