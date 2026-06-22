@@ -12,7 +12,8 @@ const LOCAL_DEV_AUTH_SEED = {
 
 function isLocalDevAgentma() {
   if (typeof window === 'undefined') return false;
-  return window.location.hostname === 'localhost' && window.location.port === '3005';
+  return isLoopbackHostname(window.location.hostname)
+    && (window.location.port === '3005' || window.location.port === '5173');
 }
 
 function ensureLocalDevAuthSeed() {

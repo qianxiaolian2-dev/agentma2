@@ -33,9 +33,35 @@ export interface DatasetProfile {
   generatedAt: string;
 }
 
+export interface DashboardTheme {
+  accent?: string;
+  canvasBg?: string;
+  cardBg?: string;
+  cardBorder?: string;
+  titleColor?: string;
+  kpiColor?: string;
+  palette?: string[];
+}
+
+export interface WidgetAppearance {
+  backgroundColor?: string;
+  borderColor?: string;
+  titleColor?: string;
+  valueColor?: string;
+  palette?: string[];
+}
+
+export interface WidgetOptions {
+  visualId?: string;
+  html?: string;
+  text?: string;
+  appearance?: WidgetAppearance;
+  [key: string]: unknown;
+}
+
 export type WidgetType =
   | 'line' | 'bar' | 'pie' | 'donut' | 'kpi' | 'table'
-  | 'heatmap' | 'funnel' | 'gauge' | 'scatter' | 'text';
+  | 'heatmap' | 'funnel' | 'gauge' | 'scatter' | 'text' | 'html';
 
 export interface WidgetEncoding {
   x?: { field: string; type: 'time' | 'nominal' | 'ordinal' | 'quantitative' };
@@ -64,7 +90,7 @@ export interface Widget {
     orderBy?: { field: string; dir: 'asc' | 'desc' }[];
     filters?: WidgetFilter[];
   };
-  options?: Record<string, unknown>;
+  options?: WidgetOptions;
   reasoning?: string;
   manualEdited?: boolean;
   pending?: boolean;
@@ -79,8 +105,39 @@ export interface DashboardLayout {
     tableName: string;
     cols: 12;
     rowHeight: 40;
+    theme?: DashboardTheme;
   };
   widgets: Widget[];
+}
+
+export interface DashboardSummary {
+  id: string;
+  tenantId: string;
+  ownerSub: string;
+  datasourceId: string;
+  tableName?: string;
+  name: string;
+  status: 'draft' | 'published' | 'archived';
+  latestVersionId: string;
+  latestVersionNo: number;
+  versionCount: number;
+  datasourceName?: string;
+  createdAt: number;
+  updatedAt: number;
+  legacy?: boolean;
+}
+
+export interface DashboardVersionSummary {
+  id: string;
+  dashboardId: string;
+  tenantId: string;
+  versionNo: number;
+  layoutJson: string;
+  profileSnapshotJson?: string;
+  note?: string;
+  createdBy?: string;
+  createdAt: number;
+  current: boolean;
 }
 
 export interface QueryResult {

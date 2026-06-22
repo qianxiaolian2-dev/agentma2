@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactECharts from 'echarts-for-react';
-import { askQuestion, type AskResult } from './api';
+import { chatDashboard, type AskResult } from './api';
 import { encodingToOption } from './encodingToOption';
-import type { DatasetProfile, QueryResult, Widget, WidgetType } from './types';
+import type { DashboardLayout, DatasetProfile, QueryResult, Widget, WidgetType } from './types';
 
 export interface ChatMessage {
   id: string;
@@ -12,20 +12,23 @@ export interface ChatMessage {
   suggestions?: string[];
   /** AI 回答附带的图卡 */
   answer?: AskResult;
+  autoPinned?: boolean;
   ts: number;
   loading?: boolean;
 }
 
 interface Props {
   profile: DatasetProfile | null;
+  layout?: DashboardLayout | null;
   onPinToBoard?: (widget: Widget) => void;
+  onApplyLayout?: (layout: DashboardLayout) => void;
 }
 
 /**
  * 左侧 AI 对话区:接 /api/dashboard/ask,流式收消息,
  * AI 答案带图 + 解读 + [📌 付到看板] 按钮。
  */
-export function ChatPanel({ profile, onPinToBoard }: Props) {
+export function ChatPanel({ profile, layout = null, onPinToBoard, onApplyLayout }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [pending, setPending] = useState(false);
@@ -69,11 +72,23 @@ export function ChatPanel({ profile, onPinToBoard }: Props) {
         .map((m) => ({ role: (m.role === 'ai' ? 'assistant' : 'user') as 'user' | 'assistant', content: m.text }))
         .slice(-10);
 
-      const ans = await askQuestion(profile.datasourceId, t, history, profile.tableName);
+      const result = await chatDashboard(profile.datasourceId, t, history, profile.tableName, layout);
+      if (result.mode === 'edit' && result.layout && onApplyLayout) {
+        onApplyLayout(result.layout);
+      }
+      const ans = result.answer;
+      const autoPin = result.mode === 'answer'
+        && shouldAutoPinAnswer(t)
+        && !!onPinToBoard
+        && !!ans
+        && !ans.error
+        && !!ans.queryResult;
+      if (autoPin && ans) pinAnswer(ans);
       setMessages((cur) => cur.map((m) => m.id === placeholder.id ? {
         ...m,
-        text: ans.error ? `❌ ${ans.error}` : ans.narrative,
-        answer: ans.error ? undefined : ans,
+        text: result.message || '已处理你的请求。',
+        answer: result.mode === 'answer' && ans && !ans.error ? ans : undefined,
+        autoPinned: autoPin,
         loading: false,
       } : m));
     } catch (err) {
@@ -83,7 +98,7 @@ export function ChatPanel({ profile, onPinToBoard }: Props) {
     } finally {
       setPending(false);
     }
-  }, [profile, pending, messages]);
+  }, [profile, pending, messages, layout, onApplyLayout, onPinToBoard]);
 
   const pinAnswer = (ans: AskResult) => {
     if (!onPinToBoard) return;
@@ -121,7 +136,7 @@ export function ChatPanel({ profile, onPinToBoard }: Props) {
             <div className="ds-msg-bubble">
               <div className="ds-msg-text">{m.loading ? '⏳ 正在分析…' : m.text}</div>
               {m.answer && m.answer.queryResult && (
-                <AnswerCard answer={m.answer} onPin={() => pinAnswer(m.answer!)} canPin={!!onPinToBoard} />
+                <AnswerCard answer={m.answer} onPin={() => pinAnswer(m.answer!)} canPin={!!onPinToBoard} pinned={m.autoPinned === true} />
               )}
               {m.suggestions && m.suggestions.length > 0 && (
                 <div className="ds-msg-suggestions">
@@ -154,7 +169,7 @@ export function ChatPanel({ profile, onPinToBoard }: Props) {
 }
 
 // —— 答案卡片:渲染 SQL 结果(图 + 表) + [📌 付到看板] ——
-function AnswerCard({ answer, onPin, canPin }: { answer: AskResult; onPin: () => void; canPin: boolean }) {
+function AnswerCard({ answer, onPin, canPin, pinned }: { answer: AskResult; onPin: () => void; canPin: boolean; pinned?: boolean }) {
   if (!answer.queryResult) {
     return <div className="ds-answer-error">⚠ {answer.queryError || '未拿到结果'}</div>;
   }
@@ -174,8 +189,8 @@ function AnswerCard({ answer, onPin, canPin }: { answer: AskResult; onPin: () =>
         </button>
         <pre className="ds-answer-sql">{answer.sql}</pre>
         {canPin && (
-          <button className="ds-answer-pin" onClick={onPin} title="把这个图加到右侧画布">
-            📌 付到看板
+          <button className="ds-answer-pin" onClick={onPin} title="把这个图加到右侧画布" disabled={pinned}>
+            {pinned ? '✓ 已加入看板' : '📌 付到看板'}
           </button>
         )}
       </div>
@@ -286,4 +301,9 @@ function buildSuggestions(p: DatasetProfile): string[] {
   if (p.scenario === 'workflow') list.push('每个阶段流失了多少?');
   if (dim) list.push(`各 ${dim} 的占比`);
   return list.slice(0, 4);
+}
+
+function shouldAutoPinAnswer(question: string): boolean {
+  const compact = question.replace(/\s+/g, '');
+  return /(加到看板|加入看板|放到看板|添加到看板|塞回看板|回填看板|生成.*(图|卡|指标卡)|做一[张个].*(图|卡|指标卡)|用.*(图|卡|指标卡|kpi).*展示|直接执行)/i.test(compact);
 }

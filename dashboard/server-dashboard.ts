@@ -49,10 +49,36 @@ export interface DatasetProfile {
   generatedAt: string;
 }
 
+export interface DashboardTheme {
+  accent?: string;
+  canvasBg?: string;
+  cardBg?: string;
+  cardBorder?: string;
+  titleColor?: string;
+  kpiColor?: string;
+  palette?: string[];
+}
+
+export interface WidgetAppearance {
+  backgroundColor?: string;
+  borderColor?: string;
+  titleColor?: string;
+  valueColor?: string;
+  palette?: string[];
+}
+
+export interface WidgetOptions {
+  visualId?: string;
+  html?: string;
+  text?: string;
+  appearance?: WidgetAppearance;
+  [key: string]: unknown;
+}
+
 // ─── DashboardLayout v1 (前后端通信契约) ─────────────────────────────────
 export type WidgetType =
   | 'line' | 'bar' | 'pie' | 'donut' | 'kpi' | 'table'
-  | 'heatmap' | 'funnel' | 'gauge' | 'scatter' | 'text';
+  | 'heatmap' | 'funnel' | 'gauge' | 'scatter' | 'text' | 'html';
 
 export interface WidgetEncoding {
   x?: { field: string; type: 'time' | 'nominal' | 'ordinal' | 'quantitative' };
@@ -82,7 +108,7 @@ export interface Widget {
     /** WHERE 条件,多条之间 AND */
     filters?: WidgetFilter[];
   };
-  options?: Record<string, unknown>;
+  options?: WidgetOptions;
   reasoning?: string;
   manualEdited?: boolean;
 }
@@ -96,6 +122,7 @@ export interface DashboardLayout {
     tableName: string;
     cols: 12;
     rowHeight: 40;
+    theme?: DashboardTheme;
   };
   widgets: Widget[];
 }
@@ -290,14 +317,36 @@ export function buildDatasetProfile(
 // ─── Layout 校验(JSON Schema 兜底:LLM 输出 / 手工保存前都要过)─────────
 const VALID_TYPES: WidgetType[] = [
   'line', 'bar', 'pie', 'donut', 'kpi', 'table',
-  'heatmap', 'funnel', 'gauge', 'scatter', 'text',
+  'heatmap', 'funnel', 'gauge', 'scatter', 'text', 'html',
 ];
 const MIN_SIZES: Record<WidgetType, { w: number; h: number }> = {
   line: { w: 6, h: 6 }, bar: { w: 4, h: 6 }, pie: { w: 3, h: 5 }, donut: { w: 3, h: 5 },
   kpi: { w: 3, h: 3 }, table: { w: 6, h: 5 },
   heatmap: { w: 6, h: 6 }, funnel: { w: 4, h: 6 }, gauge: { w: 3, h: 4 },
-  scatter: { w: 6, h: 6 }, text: { w: 3, h: 2 },
+  scatter: { w: 6, h: 6 }, text: { w: 3, h: 2 }, html: { w: 6, h: 7 },
 };
+
+function sanitizeTheme(raw: unknown): DashboardTheme | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const theme = raw as Record<string, unknown>;
+  const pick = (key: keyof DashboardTheme) => {
+    const value = theme[key];
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+  };
+  const palette = Array.isArray(theme.palette)
+    ? theme.palette.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).slice(0, 10)
+    : undefined;
+  const result: DashboardTheme = {
+    accent: pick('accent'),
+    canvasBg: pick('canvasBg'),
+    cardBg: pick('cardBg'),
+    cardBorder: pick('cardBorder'),
+    titleColor: pick('titleColor'),
+    kpiColor: pick('kpiColor'),
+    ...(palette && palette.length ? { palette } : {}),
+  };
+  return Object.values(result).some(Boolean) ? result : undefined;
+}
 
 export function validateDashboardLayout(
   raw: unknown,
@@ -305,6 +354,7 @@ export function validateDashboardLayout(
   options: { normalize?: boolean } = { normalize: true },
 ): { ok: true; layout: DashboardLayout } | { ok: false; errors: string[] } {
   const errors: string[] = [];
+  const normalize = options.normalize !== false;
   if (!raw || typeof raw !== 'object') return { ok: false, errors: ['layout 不是对象'] };
   const layout = raw as Partial<DashboardLayout>;
   if (layout.version !== '1.0') errors.push('version 必须为 "1.0"');
@@ -325,15 +375,22 @@ export function validateDashboardLayout(
       errors.push(`${tag}.grid 必须包含 x/y/w/h 数字`); continue;
     }
     if (grid.x < 0 || grid.y < 0 || grid.w <= 0 || grid.h <= 0) errors.push(`${tag}.grid 数值非法`);
-    if (grid.x + grid.w > 12) errors.push(`${tag}.grid 越界(x+w>12)`);
     const min = MIN_SIZES[w.type as WidgetType];
-    if (grid.w < min.w) errors.push(`${tag}.grid.w 至少 ${min.w}`);
-    if (grid.h < min.h) errors.push(`${tag}.grid.h 至少 ${min.h}`);
+    if (!normalize) {
+      if (grid.x + grid.w > 12) errors.push(`${tag}.grid 越界(x+w>12)`);
+      if (grid.w < min.w) errors.push(`${tag}.grid.w 至少 ${min.w}`);
+      if (grid.h < min.h) errors.push(`${tag}.grid.h 至少 ${min.h}`);
+    }
 
     const enc = w.data?.encoding;
-    if (enc?.x?.field && !fieldByName.has(enc.x.field)) errors.push(`${tag}.encoding.x.field "${enc.x.field}" 不存在`);
-    if (enc?.y?.field && enc.y.field !== '*' && !fieldByName.has(enc.y.field)) errors.push(`${tag}.encoding.y.field "${enc.y.field}" 不存在`);
-    if (enc?.y?.field && enc.y.field !== '*') {
+    const usesRawFieldEncoding = !w.data?.sql;
+    if (usesRawFieldEncoding && enc?.x?.field && !fieldByName.has(enc.x.field)) {
+      errors.push(`${tag}.encoding.x.field "${enc.x.field}" 不存在`);
+    }
+    if (usesRawFieldEncoding && enc?.y?.field && enc.y.field !== '*' && !fieldByName.has(enc.y.field)) {
+      errors.push(`${tag}.encoding.y.field "${enc.y.field}" 不存在`);
+    }
+    if (usesRawFieldEncoding && enc?.y?.field && enc.y.field !== '*') {
       const f = fieldByName.get(enc.y.field);
       // 非数值字段只允许 count / count_distinct / max / min
       const isNumeric = f && /^(INTEGER|REAL|NUMERIC|FLOAT|DOUBLE)$/i.test(f.type);
@@ -353,16 +410,36 @@ export function validateDashboardLayout(
       const check = validateReadOnlySql(w.data.sql);
       if (!check.ok) errors.push(`${tag}.data.sql 非法: ${check.reason}`);
     }
-    widgets.push(w as Widget);
+    widgets.push((normalize
+      ? {
+        ...w,
+        grid: {
+          ...grid,
+          x: Math.max(0, Math.round(grid.x)),
+          y: Math.max(0, Math.round(grid.y)),
+          w: Math.max(1, Math.min(12, Math.round(grid.w))),
+          h: Math.max(1, Math.round(grid.h)),
+        },
+      }
+      : w) as Widget);
   }
   if (errors.length) return { ok: false, errors };
   let fixed: Widget[] = widgets;
-  if (options.normalize !== false) {
+  if (normalize) {
     // 只对 AI 新生成的(manualEdited != true)做布局规范化,保护用户手改
     const userPinned = widgets.filter((w) => w.manualEdited);
     const aiManaged = widgets.filter((w) => !w.manualEdited);
     fixed = aiManaged.length ? [...autoLayoutFix(aiManaged), ...userPinned] : userPinned;
   }
+  const layoutErrors: string[] = [];
+  for (const [i, w] of fixed.entries()) {
+    const tag = `widgets[${i}]`;
+    const min = MIN_SIZES[w.type as WidgetType];
+    if (w.grid.x + w.grid.w > 12) layoutErrors.push(`${tag}.grid 越界(x+w>12)`);
+    if (w.grid.w < min.w) layoutErrors.push(`${tag}.grid.w 至少 ${min.w}`);
+    if (w.grid.h < min.h) layoutErrors.push(`${tag}.grid.h 至少 ${min.h}`);
+  }
+  if (layoutErrors.length) return { ok: false, errors: layoutErrors };
   return {
     ok: true,
     layout: {
@@ -374,6 +451,7 @@ export function validateDashboardLayout(
         tableName: profile.tableName,
         cols: 12,
         rowHeight: 40,
+        ...(sanitizeTheme(layout.meta?.theme) ? { theme: sanitizeTheme(layout.meta?.theme) } : {}),
       },
       widgets: fixed,
     },
@@ -395,7 +473,7 @@ function autoLayoutFix(widgets: Widget[]): Widget[] {
   const kpis = widgets.filter((w) => w.type === 'kpi' || w.type === 'gauge');
   const trends = widgets.filter((w) => w.type === 'line');
   const dists = widgets.filter((w) => ['bar', 'pie', 'donut', 'funnel', 'scatter', 'heatmap'].includes(w.type));
-  const tables = widgets.filter((w) => w.type === 'table' || w.type === 'text');
+  const tables = widgets.filter((w) => w.type === 'table' || w.type === 'text' || w.type === 'html');
 
   const placed: Widget[] = [];
   let cursorY = 0;
@@ -460,7 +538,7 @@ function autoLayoutFix(widgets: Widget[]): Widget[] {
   // 5. 表格/其他:全宽
   if (tables.length > 0) {
     for (const widget of tables) {
-      const tableH = widget.type === 'table' ? 8 : 4;
+      const tableH = widget.type === 'table' ? 8 : widget.type === 'html' ? 8 : 4;
       placed.push({
         ...widget,
         grid: { ...widget.grid, x: 0, y: cursorY, w: 12, h: tableH, minW: 6, minH: 3 },
@@ -719,4 +797,31 @@ export function loadDashboard(dbPath: string, dashboardId: string): DashboardLay
   }
 }
 
+export type LegacyDashboardSummary = {
+  id: string;
+  name: string;
+  tableName?: string;
+  createdAt: number;
+  updatedAt: number;
+};
 
+export function listLegacyDashboards(dbPath: string): LegacyDashboardSummary[] {
+  const dir = path.dirname(dbPath);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((file) => /^dashboard-.+\.json$/i.test(file))
+    .map((file) => {
+      const id = file.replace(/^dashboard-/, '').replace(/\.json$/i, '');
+      const fullPath = path.join(dir, file);
+      const stat = fs.statSync(fullPath);
+      const layout = loadDashboard(dbPath, id);
+      return {
+        id,
+        name: layout?.meta?.title?.trim() || id,
+        tableName: layout?.meta?.tableName,
+        createdAt: Number(stat.birthtimeMs || stat.mtimeMs) || Date.now(),
+        updatedAt: Number(stat.mtimeMs || stat.birthtimeMs) || Date.now(),
+      };
+    })
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}

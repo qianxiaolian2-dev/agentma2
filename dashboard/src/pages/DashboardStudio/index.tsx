@@ -2,11 +2,33 @@ import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { Canvas } from './Canvas';
 import { PropertyPanel } from './PropertyPanel';
 import { ChatPanel } from './ChatPanel';
-import { listDatasources, uploadDatasource, generateDashboard, saveLayout, relayoutDashboard } from './api';
+import { listDatasources, uploadDatasource, generateDashboard, saveLayout, relayoutDashboard, loadDashboard, profileDataset } from './api';
 import type { DashboardLayout, DatasetProfile, DatasourceSummary, Widget, WidgetType } from './types';
 import './studio.css';
 
+type PendingVisualRequest = {
+  requestId: string;
+  visualId: string;
+  title?: string;
+};
+
+type DashboardLoadRequest = {
+  requestId: string;
+  dashboardId: string;
+  datasourceId: string;
+};
+
+type DashboardStudioProps = {
+  pendingVisualRequest?: PendingVisualRequest | null;
+  onPendingVisualHandled?: (requestId: string) => void;
+  onBoardReadyChange?: (ready: boolean) => void;
+  dashboardLoadRequest?: DashboardLoadRequest | null;
+  onDashboardLoadHandled?: (requestId: string) => void;
+  onDashboardSaved?: (dashboardId: string, datasourceId: string) => void;
+};
+
 type Phase = 'idle' | 'uploading' | 'profiling' | 'generating' | 'rendering' | 'ready';
+type SaveState = 'idle' | 'pending' | 'saving' | 'saved' | 'error';
 
 const PHASE_LABEL: Record<Phase, string> = {
   idle: '',
@@ -23,9 +45,30 @@ const SCENARIO_LABEL: Record<string, string> = {
   finance: '财务分析', inventory: '库存管理', unknown: '通用看板',
 };
 
-let dashIdCounter = 1;
+function explainWorkbenchRequestError(message: string, action: 'save' | 'load') {
+  const normalized = message.toLowerCase();
+  if (normalized.includes('failed to fetch') || normalized.includes('networkerror')) {
+    return '本地 3001 后端未启动';
+  }
+  if (normalized.includes('not found') || normalized.includes('cannot get /api/dashboard')) {
+    return action === 'save'
+      ? '当前后端还不是最新代码，保存接口未就绪'
+      : '当前后端还不是最新代码，读取接口未就绪';
+  }
+  if (normalized.includes('未登录') || normalized.includes('unauthorized')) {
+    return '当前开发页没有登录态，请刷新本地开发登录态';
+  }
+  return message;
+}
 
-export default function DashboardStudio() {
+export default function DashboardStudio({
+  pendingVisualRequest = null,
+  onPendingVisualHandled,
+  onBoardReadyChange,
+  dashboardLoadRequest = null,
+  onDashboardLoadHandled,
+  onDashboardSaved,
+}: DashboardStudioProps) {
   const [datasources, setDatasources] = useState<DatasourceSummary[]>([]);
   const [activeDsId, setActiveDsId] = useState<string | null>(null);
   const [profile, setProfile] = useState<DatasetProfile | null>(null);
@@ -38,14 +81,29 @@ export default function DashboardStudio() {
   const [error, setError] = useState<string | null>(null);
   const [dashId, setDashId] = useState<string>('');
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [saveState, setSaveState] = useState<SaveState>('idle');
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const persistedLayoutKey = useRef<string>('');
 
   // 启动加载已有数据源
   useEffect(() => {
     listDatasources().then(setDatasources).catch((e) => setError(e.message));
   }, []);
+
+  const enrichLayout = useCallback((nextLayout: DashboardLayout) => ({
+    ...nextLayout,
+    widgets: nextLayout.widgets.map((w) => ({
+      ...w,
+      grid: {
+        ...w.grid,
+        minW: w.grid.minW ?? defaultMinSize(w.type).w,
+        minH: w.grid.minH ?? defaultMinSize(w.type).h,
+      },
+    })),
+  }), []);
 
   // ESC 退出预览模式
   useEffect(() => {
@@ -67,28 +125,27 @@ export default function DashboardStudio() {
       setLayoutSource(result.source);
       setLlmError(result.llmError || null);
       setPhase('rendering');
-      // 给 layout 里每个 widget 注入 minW/minH(防用户拖太小)
-      const enriched = {
-        ...result.layout,
-        widgets: result.layout.widgets.map((w) => ({
-          ...w,
-          grid: { ...w.grid, minW: w.grid.minW ?? defaultMinSize(w.type).w, minH: w.grid.minH ?? defaultMinSize(w.type).h },
-        })),
-      };
+      const enriched = enrichLayout(result.layout);
+      persistedLayoutKey.current = '';
       setLayout(enriched);
-      setDashId(`dash-${dashIdCounter++}`);
+      setDashId(crypto.randomUUID());
+      setSavedAt(null);
+      setSaveState('pending');
+      setSaveError(null);
       setPhase('ready');
     } catch (err) {
       setError((err as Error).message);
       setPhase('idle');
     }
-  }, []);
+  }, [enrichLayout]);
 
   const onSelectDatasource = useCallback((dsId: string) => {
     setActiveDsId(dsId);
     setLayout(null);
     setProfile(null);
     setSelectedId(null);
+    setSaveState('idle');
+    setSaveError(null);
     void generate(dsId);
   }, [generate]);
 
@@ -99,6 +156,8 @@ export default function DashboardStudio() {
       const ds = await uploadDatasource(file);
       setDatasources((prev) => [ds, ...prev]);
       setActiveDsId(ds.id);
+      setSaveState('idle');
+      setSaveError(null);
       await generate(ds.id);
     } catch (err) {
       setError((err as Error).message);
@@ -170,17 +229,106 @@ export default function DashboardStudio() {
     setSelectedId(id);
   }, [layout, profile]);
 
+  const addSavedVisualWidget = useCallback((visualId: string, title?: string) => {
+    if (!layout || !profile) return false;
+    const id = crypto.randomUUID();
+    const min = defaultMinSize('html');
+    const maxY = layout.widgets.reduce((m, w) => Math.max(m, w.grid.y + w.grid.h), 0);
+    const widgetTitle = title?.trim() || 'HTML 可视化';
+    const widget: Widget = {
+      id,
+      type: 'html',
+      title: widgetTitle,
+      grid: { x: 0, y: maxY, w: Math.max(min.w, 6), h: Math.max(min.h, 7), minW: min.w, minH: min.h },
+      data: {},
+      options: { visualId },
+      reasoning: '从 HTML 素材库加入',
+      manualEdited: true,
+    };
+    setLayout({ ...layout, widgets: [...layout.widgets, widget] });
+    setSelectedId(id);
+    return true;
+  }, [layout, profile]);
+
+  useEffect(() => {
+    onBoardReadyChange?.(Boolean(layout && profile));
+  }, [layout, onBoardReadyChange, profile]);
+
+  useEffect(() => {
+    if (!pendingVisualRequest || !layout || !profile) return;
+    const added = addSavedVisualWidget(pendingVisualRequest.visualId, pendingVisualRequest.title);
+    if (added) onPendingVisualHandled?.(pendingVisualRequest.requestId);
+  }, [addSavedVisualWidget, layout, onPendingVisualHandled, pendingVisualRequest, profile]);
+
+  useEffect(() => {
+    if (!dashboardLoadRequest) return;
+    let cancelled = false;
+    setPhase('rendering');
+    setError(null);
+    setSelectedId(null);
+    setPreviewMode(false);
+
+    const run = async () => {
+      try {
+        const dashboardResult = await loadDashboard(dashboardLoadRequest.dashboardId, dashboardLoadRequest.datasourceId);
+        const nextProfile = await profileDataset(
+          dashboardLoadRequest.datasourceId,
+          dashboardResult.layout.meta?.tableName,
+        );
+        if (cancelled) return;
+        const enriched = enrichLayout(dashboardResult.layout);
+        persistedLayoutKey.current = JSON.stringify(enriched);
+        setActiveDsId(dashboardLoadRequest.datasourceId);
+        setProfile(nextProfile);
+        setLayout(enriched);
+        setDashId(dashboardResult.id);
+        setSavedAt(dashboardResult.updatedAt || null);
+        setSaveState('saved');
+        setSaveError(null);
+        setLayoutSource('llm');
+        setLlmError(null);
+        setPhase('ready');
+      } catch (loadError) {
+        if (!cancelled) {
+          const message = (loadError as Error).message || '读取看板失败';
+          setError(explainWorkbenchRequestError(message, 'load'));
+          setPhase('idle');
+        }
+      } finally {
+        if (!cancelled) onDashboardLoadHandled?.(dashboardLoadRequest.requestId);
+      }
+    };
+
+    void run();
+    return () => { cancelled = true; };
+  }, [dashboardLoadRequest, enrichLayout, onDashboardLoadHandled]);
+
   // 自动保存(debounce)
   useEffect(() => {
     if (!layout || !dashId) return;
+    const nextLayoutKey = JSON.stringify(layout);
+    if (persistedLayoutKey.current === nextLayoutKey) return;
+    setSaveState('pending');
+    setSaveError(null);
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
+      setSaveState('saving');
       saveLayout(dashId, layout)
-        .then(() => setSavedAt(Date.now()))
-        .catch(() => {/* 静默,不打断编辑 */});
+        .then((result) => {
+          persistedLayoutKey.current = nextLayoutKey;
+          setSavedAt(result.updatedAt || Date.now());
+          setSaveState('saved');
+          setSaveError(null);
+          onDashboardSaved?.(result.id, layout.meta.datasourceId);
+        })
+        .catch((saveErr) => {
+          const message = explainWorkbenchRequestError((saveErr as Error).message || '自动保存失败', 'save');
+          setSaveState('error');
+          setSaveError(message);
+        });
     }, 600);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [layout, dashId]);
+  }, [layout, dashId, onDashboardSaved]);
 
   const selectedWidget = useMemo(
     () => layout?.widgets.find((w) => w.id === selectedId) || null,
@@ -208,7 +356,12 @@ export default function DashboardStudio() {
         </div>
         <div className="ds-topbar-right">
           {layout && phase === 'ready' && (
-            <span className="ds-saved">{savedAt ? `已保存 ${formatTime(savedAt)}` : '未保存'}</span>
+            <>
+              <span className={`ds-save-chip ds-save-${saveState}`} title={saveError || ''}>
+                {saveStateLabel(saveState)}
+              </span>
+              <span className="ds-saved">{saveStateDetail(saveState, savedAt, saveError)}</span>
+            </>
           )}
           {layout && <AddWidgetMenu onAdd={addWidget} />}
           {layout && (
@@ -272,7 +425,15 @@ export default function DashboardStudio() {
         ) : (
           <>
             <aside className="ds-chat-col">
-              <ChatPanel profile={profile} onPinToBoard={pinFromAi} />
+              <ChatPanel
+                profile={profile}
+                layout={layout}
+                onPinToBoard={pinFromAi}
+                onApplyLayout={(nextLayout) => {
+                  setLayout(enrichLayout(nextLayout));
+                  setSelectedId(null);
+                }}
+              />
             </aside>
             <div className="ds-canvas-col">
               <Canvas
@@ -313,7 +474,7 @@ function AddWidgetMenu({ onAdd }: { onAdd: (t: WidgetType) => void }) {
     return () => document.removeEventListener('click', onDocClick);
   }, [open]);
 
-  const types: WidgetType[] = ['kpi', 'line', 'bar', 'pie', 'donut', 'funnel', 'gauge', 'scatter', 'table'];
+  const types: WidgetType[] = ['kpi', 'line', 'bar', 'pie', 'donut', 'funnel', 'gauge', 'scatter', 'table', 'html'];
   return (
     <div className="ds-add-menu" ref={ref}>
       <button className="ds-btn" onClick={() => setOpen((v) => !v)}>
@@ -345,9 +506,28 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {  return (
         <div className="ds-empty-hint">支持 CSV / Excel / SQLite,识别字段语义后推荐图表组合</div>
         <button className="ds-btn ds-btn-primary" onClick={onUpload}>选择文件</button>
         <div className="ds-empty-hint" style={{ marginTop: 16 }}>或从顶部下拉选择已上传的数据源</div>
+        <div className="ds-empty-hint">首版生成后会自动保存到下方“我的看板”列表</div>
       </div>
     </div>
   );
+}
+
+function saveStateLabel(state: SaveState): string {
+  return {
+    idle: '自动保存待命',
+    pending: '等待自动保存',
+    saving: '自动保存中',
+    saved: '已自动保存',
+    error: '自动保存失败',
+  }[state];
+}
+
+function saveStateDetail(state: SaveState, savedAt: number | null, saveError: string | null): string {
+  if (state === 'saved' && savedAt) return `最近保存 ${formatTime(savedAt)}`;
+  if (state === 'saving') return '草稿正在写回看板对象';
+  if (state === 'pending') return '修改后约 1 秒会同步到下方看板列表';
+  if (state === 'error') return saveError || '请检查后端服务与登录态';
+  return '首版生成后会自动写入下方看板列表';
 }
 
 function defaultMinSize(type: WidgetType): { w: number; h: number } {
@@ -355,7 +535,7 @@ function defaultMinSize(type: WidgetType): { w: number; h: number } {
     line: { w: 6, h: 6 }, bar: { w: 4, h: 6 }, pie: { w: 3, h: 5 }, donut: { w: 3, h: 5 },
     kpi: { w: 3, h: 3 }, table: { w: 6, h: 5 },
     heatmap: { w: 6, h: 6 }, funnel: { w: 4, h: 6 }, gauge: { w: 3, h: 4 },
-    scatter: { w: 6, h: 6 }, text: { w: 3, h: 2 },
+    scatter: { w: 6, h: 6 }, text: { w: 3, h: 2 }, html: { w: 6, h: 7 },
   };
   return map[type];
 }
@@ -372,12 +552,12 @@ function defaultEncoding(type: WidgetType, profile: DatasetProfile): any {
 }
 
 function defaultTitle(type: WidgetType): string {
-  return ({ kpi: '指标卡', line: '趋势图', bar: '排行榜', pie: '占比', donut: '占比', funnel: '漏斗', gauge: '完成度', table: '明细', scatter: '散点', heatmap: '热力图', text: '说明' } as Record<WidgetType, string>)[type];
+  return ({ kpi: '指标卡', line: '趋势图', bar: '排行榜', pie: '占比', donut: '占比', funnel: '漏斗', gauge: '完成度', table: '明细', scatter: '散点', heatmap: '热力图', text: '说明', html: 'HTML 可视化' } as Record<WidgetType, string>)[type];
 }
 
 function chartLabel(type: WidgetType): string { return defaultTitle(type); }
 function chartIcon(type: WidgetType): string {
-  return ({ kpi: '🔢', line: '📈', bar: '📊', pie: '🥧', donut: '🍩', funnel: '🔻', gauge: '⏱', table: '📋', scatter: '✨', heatmap: '🔥', text: '📝' } as Record<WidgetType, string>)[type];
+  return ({ kpi: '🔢', line: '📈', bar: '📊', pie: '🥧', donut: '🍩', funnel: '🔻', gauge: '⏱', table: '📋', scatter: '✨', heatmap: '🔥', text: '📝', html: '📄' } as Record<WidgetType, string>)[type];
 }
 
 function phaseProgress(p: Phase): string {

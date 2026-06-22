@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactECharts from 'echarts-for-react';
-import { queryWidget } from './api';
+import { queryWidget, getSavedVisual } from './api';
 import type { QueryResult, Widget } from './types';
 import { encodingToOption } from './encodingToOption';
+import VisualFrame from '../../components/artifacts/VisualFrame';
 
 interface Props {
   widget: Widget;
@@ -14,6 +15,8 @@ interface Props {
 
 export function WidgetRenderer({ widget, datasourceId, tableName, resizeKey }: Props) {
   const [result, setResult] = useState<QueryResult | null>(null);
+  const [visualHtml, setVisualHtml] = useState<string>('');
+  const [visualError, setVisualError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const echartsRef = useRef<any>(null);
@@ -26,21 +29,53 @@ export function WidgetRenderer({ widget, datasourceId, tableName, resizeKey }: P
 
   useEffect(() => {
     let cancelled = false;
+    if (widget.type === 'html') {
+      setLoading(true);
+      setError(null);
+      setResult(null);
+      setVisualHtml('');
+      setVisualError(null);
+      const visualId = String(widget.options?.visualId || '').trim();
+      if (!visualId) {
+        setVisualHtml(String(widget.options?.html || ''));
+        setLoading(false);
+        return () => { cancelled = true; };
+      }
+      getSavedVisual(visualId)
+        .then((payload) => {
+          if (!cancelled) setVisualHtml(payload.html || '');
+        })
+        .catch((err) => {
+          if (!cancelled) setVisualError(err.message || '读取 HTML 可视化失败');
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+      return () => { cancelled = true; };
+    }
     setLoading(true);
     setError(null);
+    setResult(null);
     queryWidget(datasourceId, tableName, widget)
       .then((r) => { if (!cancelled) setResult(r); })
       .catch((err) => { if (!cancelled) setError(err.message || '查询失败'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataKey, datasourceId, tableName]);
+  }, [dataKey, datasourceId, tableName, widget.type, widget.options]);
 
   // 拖拽尺寸变化触发 echarts resize
   useEffect(() => {
     const inst = echartsRef.current?.getEchartsInstance?.();
     if (inst) requestAnimationFrame(() => inst.resize());
   }, [resizeKey]);
+
+  if (widget.type === 'html') {
+    if (visualError) return <div className="ds-widget-state ds-widget-error">HTML 读取失败: {visualError}</div>;
+    if (loading && !visualHtml) return <div className="ds-widget-state">加载中…</div>;
+    if (!visualHtml) return <div className="ds-widget-state">未配置 HTML 内容</div>;
+    return <VisualFrame html={visualHtml} />;
+  }
 
   if (error) {
     return <div className="ds-widget-state ds-widget-error">查询失败: {error}</div>;

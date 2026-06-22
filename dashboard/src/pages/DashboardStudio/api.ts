@@ -1,5 +1,37 @@
 import { getAuthHeaders } from '../../utils/client-runtime';
-import type { DashboardLayout, DatasetProfile, DatasourceSummary, QueryResult, Widget } from './types';
+import type {
+  DashboardLayout,
+  DashboardSummary,
+  DashboardVersionSummary,
+  DatasetProfile,
+  DatasourceSummary,
+  QueryResult,
+  Widget,
+} from './types';
+
+export type VisualListItem = {
+  id: string;
+  title?: string;
+  createdAt: number;
+  sizeBytes: number;
+};
+
+export type VisualPayload = {
+  id?: string;
+  title?: string;
+  html: string;
+  createdAt?: number;
+  mtimeMs?: number;
+};
+
+export type DashboardLoadPayload = {
+  id: string;
+  layout: DashboardLayout;
+  versionId?: string;
+  createdAt?: number;
+  updatedAt?: number;
+  legacy?: boolean;
+};
 
 async function jsonReq<T>(input: string, init?: RequestInit): Promise<T> {
   const res = await fetch(input, {
@@ -67,10 +99,39 @@ export async function queryWidget(
   });
 }
 
-export async function saveLayout(id: string, layout: DashboardLayout): Promise<{ id: string; layout: DashboardLayout }> {
+export async function saveLayout(id: string, layout: DashboardLayout): Promise<{
+  id: string;
+  layout: DashboardLayout;
+  versionId?: string;
+  updatedAt?: number;
+}> {
   return jsonReq(`/api/dashboard/${id}`, {
     method: 'PUT',
     body: JSON.stringify({ layout }),
+  });
+}
+
+export async function loadDashboard(id: string, datasourceId: string): Promise<DashboardLoadPayload> {
+  return jsonReq<DashboardLoadPayload>(`/api/dashboard/${encodeURIComponent(id)}?datasourceId=${encodeURIComponent(datasourceId)}`);
+}
+
+export async function listDashboards(datasourceId?: string): Promise<DashboardSummary[]> {
+  const qs = datasourceId ? `?datasourceId=${encodeURIComponent(datasourceId)}` : '';
+  return jsonReq<DashboardSummary[]>(`/api/dashboards${qs}`);
+}
+
+export async function listDashboardVersions(id: string): Promise<DashboardVersionSummary[]> {
+  return jsonReq<DashboardVersionSummary[]>(`/api/dashboards/${encodeURIComponent(id)}/versions`);
+}
+
+export async function restoreDashboardVersion(
+  dashboardId: string,
+  versionId: string,
+  note?: string,
+): Promise<{ id: string; layout: DashboardLayout; versionId: string; restoredFromVersionId: string; updatedAt: number }> {
+  return jsonReq(`/api/dashboards/${encodeURIComponent(dashboardId)}/restore/${encodeURIComponent(versionId)}`, {
+    method: 'POST',
+    body: JSON.stringify({ note }),
   });
 }
 
@@ -79,6 +140,14 @@ export async function relayoutDashboard(layout: DashboardLayout): Promise<{ layo
     method: 'POST',
     body: JSON.stringify({ layout }),
   });
+}
+
+export async function listSavedVisuals(): Promise<VisualListItem[]> {
+  return jsonReq<VisualListItem[]>('/api/visuals');
+}
+
+export async function getSavedVisual(id: string): Promise<VisualPayload> {
+  return jsonReq<VisualPayload>(`/api/visuals/${encodeURIComponent(id)}`);
 }
 
 export interface AskResult {
@@ -92,6 +161,18 @@ export interface AskResult {
   error?: string;
 }
 
+export interface DashboardEditResult {
+  layout: DashboardLayout;
+  summary: string;
+}
+
+export interface DashboardChatResult {
+  mode: 'answer' | 'edit';
+  message: string;
+  answer?: AskResult;
+  layout?: DashboardLayout;
+}
+
 export async function askQuestion(
   datasourceId: string,
   question: string,
@@ -101,5 +182,42 @@ export async function askQuestion(
   return jsonReq<AskResult>('/api/dashboard/ask', {
     method: 'POST',
     body: JSON.stringify({ datasourceId, question, history, tableName }),
+  });
+}
+
+export async function editDashboard(
+  datasourceId: string,
+  layout: DashboardLayout,
+  question: string,
+  history: Array<{ role: 'user' | 'assistant'; content: string }> = [],
+): Promise<DashboardEditResult> {
+  return jsonReq<DashboardEditResult>('/api/dashboard/edit', {
+    method: 'POST',
+    body: JSON.stringify({
+      datasourceId,
+      layout,
+      question,
+      history,
+      tableName: layout.meta.tableName,
+    }),
+  });
+}
+
+export async function chatDashboard(
+  datasourceId: string,
+  question: string,
+  history: Array<{ role: 'user' | 'assistant'; content: string }> = [],
+  tableName?: string,
+  layout?: DashboardLayout | null,
+): Promise<DashboardChatResult> {
+  return jsonReq<DashboardChatResult>('/api/dashboard/chat', {
+    method: 'POST',
+    body: JSON.stringify({
+      datasourceId,
+      question,
+      history,
+      tableName,
+      layout,
+    }),
   });
 }

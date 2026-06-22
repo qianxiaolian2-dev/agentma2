@@ -15,6 +15,9 @@ import {
   canAccessChatSession,
   createApiKey,
   createDatasource,
+  getDashboardRecord,
+  getLatestDashboardVersionRecord,
+  getDashboardVersionRecord,
   createTenantUser,
   createTeam,
   createVisual,
@@ -41,6 +44,8 @@ import {
   listChatSessions,
   listChatSessionSummaries,
   listDatasources,
+  listDashboards,
+  listDashboardVersions,
   listHookRules,
   listKnowledgeSources,
   listPermissionRules,
@@ -74,6 +79,8 @@ import {
   updateQuota,
   updateTenant,
   updateUserRole,
+  restoreDashboardVersion,
+  saveDashboardRecord,
 } from './server-store.ts';
 import {
   runAgent,
@@ -95,12 +102,13 @@ import {
 import {
   buildDatasetProfile,
   buildMockLayout,
+  listLegacyDashboards,
   validateDashboardLayout,
   widgetQuery,
   saveDashboard,
   loadDashboard,
 } from './server-dashboard.ts';
-import { generateLayoutByLLM, askQuestion } from './server-dashboard-llm.ts';
+import { generateLayoutByLLMWithProvider, askQuestionWithProvider, editDashboardByChatWithProvider } from './server-dashboard-llm.ts';
 import { mapResultSubtypeToOutcome, outcomeToMessageStatus, type RunOutcome } from './src/simulator/run-state.ts';
 
 const app = express();
@@ -1797,6 +1805,14 @@ function getChatOwnerSub(auth: { sub: string }) {
   return auth.sub;
 }
 
+function loadLegacyDashboardFile(dbPath: string, dashboardId: string) {
+  try {
+    return loadDashboard(dbPath, dashboardId);
+  } catch {
+    return null;
+  }
+}
+
 function providerField(provider: any, key: 'ANTHROPIC_AUTH_TOKEN' | 'ANTHROPIC_BASE_URL' | 'ANTHROPIC_MODEL') {
   return typeof provider?.[key] === 'string' ? provider[key].trim() : '';
 }
@@ -1860,6 +1876,27 @@ function describeBaseUrl(baseUrl: string) {
     return baseUrl || '<default>';
   }
 }
+
+function resolveDashboardProvider(tenantId: string, preferredModel = MODEL_HINTS.dashboard) {
+  const stored = resolveProviderProfileForModel(tenantId, preferredModel) || resolveProviderProfileForModel(tenantId, '');
+  const hasStoredToken = Boolean(stored?.ANTHROPIC_AUTH_TOKEN?.trim());
+  return {
+    apiKey: hasStoredToken ? stored!.ANTHROPIC_AUTH_TOKEN : (!stored ? (process.env.ANTHROPIC_API_KEY || '') : ''),
+    baseUrl: stored?.ANTHROPIC_BASE_URL || (!stored ? (process.env.ANTHROPIC_BASE_URL || '') : ''),
+    source: stored ? `profile:${stored.name}${hasStoredToken ? '' : ':missing_token'}` : 'env',
+  };
+}
+
+function shouldPreferDashboardEdit(question: string) {
+  const compact = String(question || '').replace(/\s+/g, '');
+  return /(加|新增|添加|补|插入|放|塞|来|做|搞|生成).*(指标卡|kpi|图|图表|卡|卡片|组件|模块|趋势图|柱状图|折线图|饼图|漏斗图|散点图|热力图|表格|html)/i.test(compact)
+    || /(改看板|改页面|改样式|换样式|统一|调整布局|整体布局|整体排布|整个看板布局|整个布局|重排|重新排布|重新布局|重新整理|重新调整布局|重新调整下看板布局|出边框了|出边了|超出边框|溢出去了|挤出去了|边框外面|放大|缩小|删掉|删除|移除|去掉|删了吧|删了|不要了|干掉|替换|改成|换成|并列|排一行|同一行|对齐|挪上去|放上面|放下面|靠左|靠右)/i.test(compact)
+    || /(和上面并列|和下面并列|排成一行|放同一行|跟.*对齐)/i.test(compact);
+}
+
+const MODEL_HINTS = {
+  dashboard: process.env.AGENTMA_DASHBOARD_MODEL || 'claude-haiku-4-5-20251001',
+};
 
 // ═══ Auth Routes ═══
 app.post('/api/auth/register', (req, res) => {
@@ -3478,7 +3515,7 @@ app.post('/api/dashboard/generate', authMiddleware, async (req: any, res) => {
       res.json({ profile, layout: buildMockLayout(profile), source: 'mock' });
       return;
     }
-    const result = await generateLayoutByLLM(profile);
+    const result = await generateLayoutByLLMWithProvider(profile, resolveDashboardProvider(req.auth.tenantId));
     res.json({ profile, layout: result.layout, source: result.source, llmError: result.llmError });
   } catch (error) {
     res.status(400).json({ error: (error as Error).message || 'generate 失败' });
@@ -3510,7 +3547,7 @@ app.post('/api/dashboard/ask', authMiddleware, async (req: any, res) => {
   const history = Array.isArray(req.body?.history) ? req.body.history : [];
   try {
     const profile = buildDatasetProfile(datasourceId, source.path, req.body?.tableName);
-    const ans = await askQuestion(profile, question, history);
+    const ans = await askQuestionWithProvider(profile, question, history, resolveDashboardProvider(req.auth.tenantId));
     if ('error' in ans) { res.status(400).json({ error: ans.error }); return; }
 
     // 校验并执行 SQL
@@ -3532,6 +3569,124 @@ app.post('/api/dashboard/ask', authMiddleware, async (req: any, res) => {
   }
 });
 
+app.post('/api/dashboard/chat', authMiddleware, async (req: any, res) => {
+  const datasourceId = String(req.body?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source || !source.enabled) { res.status(404).json({ error: 'datasource not found' }); return; }
+  const question = String(req.body?.question || '').trim();
+  if (!question) { res.status(400).json({ error: '问题不能为空' }); return; }
+  const history = Array.isArray(req.body?.history) ? req.body.history : [];
+  const layout = req.body?.layout;
+  try {
+    const profile = buildDatasetProfile(datasourceId, source.path, req.body?.tableName || layout?.meta?.tableName);
+    const canEdit = layout && layout.version === '1.0' && shouldPreferDashboardEdit(question);
+    if (canEdit) {
+      const currentCheck = validateDashboardLayout(layout, profile, { normalize: false });
+      const baseLayout = currentCheck.ok
+        ? currentCheck.layout
+        : (() => {
+          const repairedWidgets = Array.isArray(layout.widgets)
+            ? layout.widgets.map((widget: any) => ({ ...widget, manualEdited: false }))
+            : [];
+          const repairedCheck = validateDashboardLayout({ ...layout, widgets: repairedWidgets }, profile, { normalize: true });
+          if (!repairedCheck.ok) return null;
+          return {
+            ...repairedCheck.layout,
+            widgets: repairedCheck.layout.widgets.map((widget) => ({ ...widget, manualEdited: true })),
+          };
+        })();
+      if (baseLayout) {
+        const edited = await editDashboardByChatWithProvider(
+          profile,
+          baseLayout,
+          question,
+          history,
+          resolveDashboardProvider(req.auth.tenantId),
+        );
+        if (!('error' in edited)) {
+          res.json({
+            mode: 'edit',
+            message: edited.summary || '已按你的要求更新当前看板。',
+            layout: edited.layout,
+          });
+          return;
+        }
+      }
+    }
+
+    const ans = await askQuestionWithProvider(profile, question, history, resolveDashboardProvider(req.auth.tenantId));
+    if ('error' in ans) { res.status(400).json({ error: ans.error }); return; }
+
+    const sqlCheck = validateReadOnlySql(ans.sql);
+    if (!sqlCheck.ok) {
+      res.json({
+        mode: 'answer',
+        message: `❌ SQL 校验失败: ${sqlCheck.reason}`,
+        answer: { ...ans, error: 'SQL 校验失败: ' + sqlCheck.reason, queryResult: null },
+      });
+      return;
+    }
+
+    let queryResult: any = null;
+    let queryError: string | null = null;
+    try {
+      queryResult = runDatasourceQuery(source.path, ans.sql);
+    } catch (e) {
+      queryError = (e as Error).message;
+    }
+    res.json({
+      mode: 'answer',
+      message: ans.narrative,
+      answer: { ...ans, queryResult, queryError },
+    });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || 'chat 失败' });
+  }
+});
+
+app.post('/api/dashboard/edit', authMiddleware, async (req: any, res) => {
+  const datasourceId = String(req.body?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source || !source.enabled) { res.status(404).json({ error: 'datasource not found' }); return; }
+  const question = String(req.body?.question || '').trim();
+  if (!question) { res.status(400).json({ error: '问题不能为空' }); return; }
+  const layout = req.body?.layout;
+  if (!layout || layout.version !== '1.0') { res.status(400).json({ error: 'layout 非法' }); return; }
+  const history = Array.isArray(req.body?.history) ? req.body.history : [];
+  try {
+    const profile = buildDatasetProfile(datasourceId, source.path, req.body?.tableName || layout.meta?.tableName);
+    const currentCheck = validateDashboardLayout(layout, profile, { normalize: false });
+    const baseLayout = currentCheck.ok
+      ? currentCheck.layout
+      : (() => {
+        const repairedWidgets = Array.isArray(layout.widgets)
+          ? layout.widgets.map((widget: any) => ({ ...widget, manualEdited: false }))
+          : [];
+        const repairedCheck = validateDashboardLayout({ ...layout, widgets: repairedWidgets }, profile, { normalize: true });
+        if (!repairedCheck.ok) {
+          res.status(400).json({ error: '当前看板校验失败', details: currentCheck.errors });
+          return null;
+        }
+        return {
+          ...repairedCheck.layout,
+          widgets: repairedCheck.layout.widgets.map((widget) => ({ ...widget, manualEdited: true })),
+        };
+      })();
+    if (!baseLayout) return;
+    const ans = await editDashboardByChatWithProvider(
+      profile,
+      baseLayout,
+      question,
+      history,
+      resolveDashboardProvider(req.auth.tenantId),
+    );
+    if ('error' in ans) { res.status(400).json({ error: ans.error }); return; }
+    res.json(ans);
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || 'edit 失败' });
+  }
+});
+
 app.put('/api/dashboard/:id', authMiddleware, (req: any, res) => {
   const layout = req.body?.layout;
   if (!layout || layout.version !== '1.0') { res.status(400).json({ error: 'layout 非法' }); return; }
@@ -3542,8 +3697,22 @@ app.put('/api/dashboard/:id', authMiddleware, (req: any, res) => {
     const profile = buildDatasetProfile(datasourceId, source.path, layout.meta?.tableName);
     const check = validateDashboardLayout(layout, profile, { normalize: false });
     if (!check.ok) { res.status(400).json({ error: 'layout 校验失败', details: check.errors }); return; }
-    const saved = saveDashboard(source.path, check.layout, req.params.id);
-    res.json({ id: saved.id, layout: check.layout });
+    const ownerSub = getChatOwnerSub(req.auth);
+    const saved = saveDashboardRecord(req.auth.tenantId, ownerSub, {
+      id: req.params.id,
+      datasourceId,
+      tableName: check.layout.meta?.tableName,
+      name: String(check.layout.meta?.title || '').trim() || source.name || '未命名看板',
+      layoutJson: JSON.stringify(check.layout),
+      profileSnapshotJson: JSON.stringify(profile),
+      createdBy: req.auth.email || req.auth.sub,
+    });
+    res.json({
+      id: saved.dashboard.id,
+      layout: check.layout,
+      versionId: saved.version.id,
+      updatedAt: saved.dashboard.updatedAt,
+    });
   } catch (error) {
     res.status(400).json({ error: (error as Error).message || '保存失败' });
   }
@@ -3553,9 +3722,97 @@ app.get('/api/dashboard/:id', authMiddleware, (req: any, res) => {
   const datasourceId = String(req.query?.datasourceId || '');
   const source = getDatasource(req.auth.tenantId, datasourceId);
   if (!source) { res.status(404).json({ error: 'datasource not found' }); return; }
-  const layout = loadDashboard(source.path, req.params.id);
-  if (!layout) { res.status(404).json({ error: 'dashboard not found' }); return; }
-  res.json({ id: req.params.id, layout });
+  const ownerSub = getChatOwnerSub(req.auth);
+  const dashboard = getDashboardRecord(req.auth.tenantId, ownerSub, req.params.id);
+  if (dashboard) {
+    const version = getLatestDashboardVersionRecord(req.auth.tenantId, ownerSub, dashboard.id);
+    if (!version) { res.status(404).json({ error: 'dashboard version not found' }); return; }
+    try {
+      const layout = JSON.parse(version.layoutJson);
+      res.json({
+        id: dashboard.id,
+        layout,
+        versionId: version.id,
+        createdAt: dashboard.createdAt,
+        updatedAt: dashboard.updatedAt,
+      });
+      return;
+    } catch {
+      res.status(500).json({ error: 'dashboard layout 已损坏' });
+      return;
+    }
+  }
+
+  const legacyLayout = loadLegacyDashboardFile(source.path, req.params.id);
+  if (!legacyLayout) { res.status(404).json({ error: 'dashboard not found' }); return; }
+  res.json({ id: req.params.id, layout: legacyLayout, legacy: true });
+});
+
+app.get('/api/dashboards', authMiddleware, (req: any, res) => {
+  const ownerSub = getChatOwnerSub(req.auth);
+  const datasourceId = typeof req.query?.datasourceId === 'string' ? req.query.datasourceId : '';
+  const dbDashboards = listDashboards(req.auth.tenantId, ownerSub, { datasourceId });
+  const knownIds = new Set(dbDashboards.map((item) => item.id));
+  const legacyDashboards = listDatasources(req.auth.tenantId)
+    .filter((source) => !datasourceId || source.id === datasourceId)
+    .flatMap((source) => listLegacyDashboards(source.path).map((legacy) => ({
+      id: legacy.id,
+      tenantId: req.auth.tenantId,
+      ownerSub,
+      datasourceId: source.id,
+      tableName: legacy.tableName,
+      name: legacy.name,
+      status: 'draft' as const,
+      latestVersionId: `legacy:${legacy.id}`,
+      latestVersionNo: 1,
+      versionCount: 1,
+      datasourceName: source.name,
+      createdAt: legacy.createdAt,
+      updatedAt: legacy.updatedAt,
+      legacy: true,
+    })))
+    .filter((item) => !knownIds.has(item.id));
+  res.json([...dbDashboards, ...legacyDashboards].sort((a, b) => b.updatedAt - a.updatedAt));
+});
+
+app.get('/api/dashboards/:id/versions', authMiddleware, (req: any, res) => {
+  const ownerSub = getChatOwnerSub(req.auth);
+  const dashboard = getDashboardRecord(req.auth.tenantId, ownerSub, req.params.id);
+  if (!dashboard) {
+    const hasLegacy = listDatasources(req.auth.tenantId).some((source) => Boolean(loadLegacyDashboardFile(source.path, req.params.id)));
+    if (hasLegacy) {
+      res.json([]);
+      return;
+    }
+    res.status(404).json({ error: 'dashboard not found' });
+    return;
+  }
+  res.json(listDashboardVersions(req.auth.tenantId, ownerSub, dashboard.id));
+});
+
+app.post('/api/dashboards/:id/restore/:versionId', authMiddleware, (req: any, res) => {
+  const ownerSub = getChatOwnerSub(req.auth);
+  const dashboard = getDashboardRecord(req.auth.tenantId, ownerSub, req.params.id);
+  if (!dashboard) { res.status(404).json({ error: 'dashboard not found' }); return; }
+  const version = getDashboardVersionRecord(req.auth.tenantId, ownerSub, dashboard.id, req.params.versionId);
+  if (!version) { res.status(404).json({ error: 'dashboard version not found' }); return; }
+  const restored = restoreDashboardVersion(req.auth.tenantId, ownerSub, dashboard.id, version.id, {
+    note: typeof req.body?.note === 'string' ? req.body.note.trim() : '',
+    createdBy: req.auth.email || req.auth.sub,
+  });
+  if (!restored) { res.status(404).json({ error: 'restore failed' }); return; }
+  try {
+    const layout = JSON.parse(restored.version.layoutJson);
+    res.json({
+      id: restored.dashboard.id,
+      layout,
+      versionId: restored.version.id,
+      restoredFromVersionId: version.id,
+      updatedAt: restored.dashboard.updatedAt,
+    });
+  } catch {
+    res.status(500).json({ error: 'restored dashboard layout 已损坏' });
+  }
 });
 
 // ─── 重新排布看板:把 widgets 走一遍 autoLayoutFix(尊重 manualEdited)

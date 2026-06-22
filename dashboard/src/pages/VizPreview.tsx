@@ -166,7 +166,7 @@ export default function VizPreview() {
             <LineIcon name={isFullscreen ? 'collapse' : 'expand'} />
             {isFullscreen ? '退出全屏' : '全屏'}
           </button>
-          <Link className="btn btn-sm" to="/visuals">我的可视化</Link>
+          <Link className="btn btn-sm" to="/visuals">返回工坊</Link>
           {!isSaved && (
             <button className="btn btn-sm btn-primary" type="button" onClick={saveVisual} disabled={saving}>
               {saving ? '保存中…' : '保存'}

@@ -295,6 +295,41 @@ export type VisualRow = {
 
 export type VisualListRow = Pick<VisualRow, 'id' | 'title' | 'sizeBytes' | 'createdAt'>;
 
+export type DashboardRecord = {
+  id: string;
+  tenantId: string;
+  ownerSub: string;
+  datasourceId: string;
+  tableName?: string;
+  name: string;
+  status: 'draft' | 'published' | 'archived';
+  latestVersionId: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type DashboardVersionRecord = {
+  id: string;
+  dashboardId: string;
+  tenantId: string;
+  versionNo: number;
+  layoutJson: string;
+  profileSnapshotJson?: string;
+  note?: string;
+  createdBy?: string;
+  createdAt: number;
+};
+
+export type DashboardSummaryRecord = DashboardRecord & {
+  latestVersionNo: number;
+  versionCount: number;
+  datasourceName?: string;
+};
+
+export type DashboardVersionSummaryRecord = DashboardVersionRecord & {
+  current: boolean;
+};
+
 const LEGACY_PREFIX = 'legacy_sha256$';
 export const MAX_VISUAL_BYTES = 4 * 1024 * 1024;
 const DEFAULT_QUOTA = {
@@ -657,6 +692,35 @@ function initSchema() {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_datasources_tenant ON datasources (tenant_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS dashboards (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      owner_sub TEXT NOT NULL,
+      datasource_id TEXT NOT NULL,
+      table_name TEXT,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft',
+      latest_version_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_dashboards_owner ON dashboards (tenant_id, owner_sub, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_dashboards_datasource ON dashboards (tenant_id, datasource_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS dashboard_versions (
+      id TEXT PRIMARY KEY,
+      dashboard_id TEXT NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      version_no INTEGER NOT NULL,
+      layout_json TEXT NOT NULL,
+      profile_snapshot_json TEXT,
+      note TEXT,
+      created_by TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_versions_no ON dashboard_versions (dashboard_id, version_no);
+    CREATE INDEX IF NOT EXISTS idx_dashboard_versions_dashboard ON dashboard_versions (dashboard_id, created_at DESC);
   `);
   ensureColumn('users', 'id', 'TEXT');
   ensureColumn('users', 'username', 'TEXT');
@@ -2780,6 +2844,275 @@ export function deleteVisual(tenantId: string, ownerSub: string, id: string) {
     WHERE tenant_id = ? AND owner_sub = ? AND id = ?
   `).run(tenantId, ownerSub, id) as { changes?: number };
   return Number(result.changes || 0) > 0;
+}
+
+function mapDashboardRow(row: Record<string, unknown>): DashboardRecord {
+  return {
+    id: String(row.id),
+    tenantId: String(row.tenant_id),
+    ownerSub: String(row.owner_sub),
+    datasourceId: String(row.datasource_id),
+    tableName: row.table_name ? String(row.table_name) : undefined,
+    name: String(row.name || '未命名看板'),
+    status: (String(row.status || 'draft') as DashboardRecord['status']),
+    latestVersionId: String(row.latest_version_id),
+    createdAt: Number(row.created_at) || 0,
+    updatedAt: Number(row.updated_at) || 0,
+  };
+}
+
+function mapDashboardVersionRow(row: Record<string, unknown>): DashboardVersionRecord {
+  return {
+    id: String(row.id),
+    dashboardId: String(row.dashboard_id),
+    tenantId: String(row.tenant_id),
+    versionNo: Number(row.version_no) || 1,
+    layoutJson: String(row.layout_json || '{}'),
+    profileSnapshotJson: row.profile_snapshot_json ? String(row.profile_snapshot_json) : undefined,
+    note: row.note ? String(row.note) : undefined,
+    createdBy: row.created_by ? String(row.created_by) : undefined,
+    createdAt: Number(row.created_at) || 0,
+  };
+}
+
+function mapDashboardSummaryRow(row: Record<string, unknown>): DashboardSummaryRecord {
+  return {
+    id: String(row.id),
+    tenantId: String(row.tenant_id),
+    ownerSub: String(row.owner_sub),
+    datasourceId: String(row.datasource_id),
+    tableName: row.table_name ? String(row.table_name) : undefined,
+    name: String(row.name || '未命名看板'),
+    status: (String(row.status || 'draft') as DashboardRecord['status']),
+    latestVersionId: String(row.latest_version_id),
+    createdAt: Number(row.created_at) || 0,
+    updatedAt: Number(row.updated_at) || 0,
+    latestVersionNo: Number(row.latest_version_no) || 1,
+    versionCount: Number(row.version_count) || 1,
+    datasourceName: row.datasource_name ? String(row.datasource_name) : undefined,
+  };
+}
+
+function mapDashboardVersionSummaryRow(row: Record<string, unknown>): DashboardVersionSummaryRecord {
+  return {
+    id: String(row.id),
+    dashboardId: String(row.dashboard_id),
+    tenantId: String(row.tenant_id),
+    versionNo: Number(row.version_no) || 1,
+    layoutJson: String(row.layout_json || '{}'),
+    profileSnapshotJson: row.profile_snapshot_json ? String(row.profile_snapshot_json) : undefined,
+    note: row.note ? String(row.note) : undefined,
+    createdBy: row.created_by ? String(row.created_by) : undefined,
+    createdAt: Number(row.created_at) || 0,
+    current: Number(row.is_current) === 1,
+  };
+}
+
+export function getDashboardRecord(tenantId: string, ownerSub: string, dashboardId: string): DashboardRecord | null {
+  const row = db.prepare(`
+    SELECT id, tenant_id, owner_sub, datasource_id, table_name, name, status, latest_version_id, created_at, updated_at
+    FROM dashboards
+    WHERE tenant_id = ? AND owner_sub = ? AND id = ?
+  `).get(tenantId, ownerSub, dashboardId) as Record<string, unknown> | undefined;
+  return row ? mapDashboardRow(row) : null;
+}
+
+export function listDashboards(
+  tenantId: string,
+  ownerSub: string,
+  options?: { datasourceId?: string },
+): DashboardSummaryRecord[] {
+  const datasourceId = options?.datasourceId?.trim();
+  const rows = db.prepare(`
+    SELECT
+      d.id,
+      d.tenant_id,
+      d.owner_sub,
+      d.datasource_id,
+      d.table_name,
+      d.name,
+      d.status,
+      d.latest_version_id,
+      d.created_at,
+      d.updated_at,
+      COALESCE(v.version_no, 1) AS latest_version_no,
+      COALESCE(vc.version_count, 1) AS version_count,
+      s.name AS datasource_name
+    FROM dashboards d
+    LEFT JOIN dashboard_versions v ON v.id = d.latest_version_id
+    LEFT JOIN (
+      SELECT dashboard_id, COUNT(*) AS version_count
+      FROM dashboard_versions
+      GROUP BY dashboard_id
+    ) vc ON vc.dashboard_id = d.id
+    LEFT JOIN datasources s ON s.id = d.datasource_id AND s.tenant_id = d.tenant_id
+    WHERE d.tenant_id = ? AND d.owner_sub = ?
+      AND (? IS NULL OR d.datasource_id = ?)
+    ORDER BY d.updated_at DESC, d.created_at DESC
+  `).all(tenantId, ownerSub, datasourceId || null, datasourceId || null) as Array<Record<string, unknown>>;
+  return rows.map(mapDashboardSummaryRow);
+}
+
+export function getLatestDashboardVersionRecord(
+  tenantId: string,
+  ownerSub: string,
+  dashboardId: string,
+): DashboardVersionRecord | null {
+  const row = db.prepare(`
+    SELECT v.id, v.dashboard_id, v.tenant_id, v.version_no, v.layout_json, v.profile_snapshot_json, v.note, v.created_by, v.created_at
+    FROM dashboard_versions v
+    JOIN dashboards d ON d.id = v.dashboard_id
+    WHERE d.tenant_id = ? AND d.owner_sub = ? AND d.id = ? AND d.latest_version_id = v.id
+  `).get(tenantId, ownerSub, dashboardId) as Record<string, unknown> | undefined;
+  return row ? mapDashboardVersionRow(row) : null;
+}
+
+export function getDashboardVersionRecord(
+  tenantId: string,
+  ownerSub: string,
+  dashboardId: string,
+  versionId: string,
+): DashboardVersionRecord | null {
+  const row = db.prepare(`
+    SELECT v.id, v.dashboard_id, v.tenant_id, v.version_no, v.layout_json, v.profile_snapshot_json, v.note, v.created_by, v.created_at
+    FROM dashboard_versions v
+    JOIN dashboards d ON d.id = v.dashboard_id
+    WHERE d.tenant_id = ? AND d.owner_sub = ? AND d.id = ? AND v.id = ?
+  `).get(tenantId, ownerSub, dashboardId, versionId) as Record<string, unknown> | undefined;
+  return row ? mapDashboardVersionRow(row) : null;
+}
+
+export function listDashboardVersions(
+  tenantId: string,
+  ownerSub: string,
+  dashboardId: string,
+): DashboardVersionSummaryRecord[] {
+  const rows = db.prepare(`
+    SELECT
+      v.id,
+      v.dashboard_id,
+      v.tenant_id,
+      v.version_no,
+      v.layout_json,
+      v.profile_snapshot_json,
+      v.note,
+      v.created_by,
+      v.created_at,
+      CASE WHEN d.latest_version_id = v.id THEN 1 ELSE 0 END AS is_current
+    FROM dashboard_versions v
+    JOIN dashboards d ON d.id = v.dashboard_id
+    WHERE d.tenant_id = ? AND d.owner_sub = ? AND d.id = ?
+    ORDER BY v.version_no DESC, v.created_at DESC
+  `).all(tenantId, ownerSub, dashboardId) as Array<Record<string, unknown>>;
+  return rows.map(mapDashboardVersionSummaryRow);
+}
+
+export function saveDashboardRecord(
+  tenantId: string,
+  ownerSub: string,
+  input: {
+    id?: string;
+    datasourceId: string;
+    tableName?: string;
+    name: string;
+    layoutJson: string;
+    profileSnapshotJson?: string;
+    note?: string;
+    createdBy?: string;
+    status?: DashboardRecord['status'];
+  },
+): { dashboard: DashboardRecord; version: DashboardVersionRecord } {
+  const dashboardId = String(input.id || crypto.randomUUID());
+  const existing = input.id ? getDashboardRecord(tenantId, ownerSub, dashboardId) : null;
+  const timestamp = now();
+  const versionNo = existing
+    ? Number((db.prepare(`
+      SELECT COALESCE(MAX(version_no), 0) AS version_no
+      FROM dashboard_versions
+      WHERE dashboard_id = ?
+    `).get(dashboardId) as { version_no?: number } | undefined)?.version_no || 0) + 1
+    : 1;
+  const versionId = crypto.randomUUID();
+  const status = input.status || existing?.status || 'draft';
+  const name = String(input.name || '').trim() || '未命名看板';
+
+  db.prepare(`
+    INSERT INTO dashboard_versions (id, dashboard_id, tenant_id, version_no, layout_json, profile_snapshot_json, note, created_by, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    versionId,
+    dashboardId,
+    tenantId,
+    versionNo,
+    input.layoutJson,
+    input.profileSnapshotJson || null,
+    input.note || null,
+    input.createdBy || null,
+    timestamp,
+  );
+
+  if (existing) {
+    db.prepare(`
+      UPDATE dashboards
+      SET datasource_id = ?, table_name = ?, name = ?, status = ?, latest_version_id = ?, updated_at = ?
+      WHERE tenant_id = ? AND owner_sub = ? AND id = ?
+    `).run(
+      input.datasourceId,
+      input.tableName || null,
+      name,
+      status,
+      versionId,
+      timestamp,
+      tenantId,
+      ownerSub,
+      dashboardId,
+    );
+  } else {
+    db.prepare(`
+      INSERT INTO dashboards (id, tenant_id, owner_sub, datasource_id, table_name, name, status, latest_version_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      dashboardId,
+      tenantId,
+      ownerSub,
+      input.datasourceId,
+      input.tableName || null,
+      name,
+      status,
+      versionId,
+      timestamp,
+      timestamp,
+    );
+  }
+
+  return {
+    dashboard: getDashboardRecord(tenantId, ownerSub, dashboardId)!,
+    version: getLatestDashboardVersionRecord(tenantId, ownerSub, dashboardId)!,
+  };
+}
+
+export function restoreDashboardVersion(
+  tenantId: string,
+  ownerSub: string,
+  dashboardId: string,
+  versionId: string,
+  input?: { note?: string; createdBy?: string },
+): { dashboard: DashboardRecord; version: DashboardVersionRecord } | null {
+  const dashboard = getDashboardRecord(tenantId, ownerSub, dashboardId);
+  if (!dashboard) return null;
+  const version = getDashboardVersionRecord(tenantId, ownerSub, dashboardId, versionId);
+  if (!version) return null;
+  return saveDashboardRecord(tenantId, ownerSub, {
+    id: dashboardId,
+    datasourceId: dashboard.datasourceId,
+    tableName: dashboard.tableName,
+    name: dashboard.name,
+    layoutJson: version.layoutJson,
+    profileSnapshotJson: version.profileSnapshotJson,
+    note: input?.note || `恢复自版本 v${version.versionNo}`,
+    createdBy: input?.createdBy,
+    status: dashboard.status,
+  });
 }
 
 // ─── 数据源(ChatBI)──────────────────────────────────────────────────────────

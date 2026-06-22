@@ -1,10 +1,10 @@
-import { Routes, Route } from 'react-router-dom';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import AuthGuard from './components/AuthGuard';
 import Layout from './components/Layout';
 import Login from './pages/Login';
 import Overview from './pages/Overview';
-import DashboardStudio from './pages/DashboardStudio';
+
 import Playground from './pages/Playground';
 import Agents from './pages/Agents';
 import AgentChat from './pages/AgentChat';
@@ -33,7 +33,7 @@ export default function App() {
             <Layout>
               <Routes>
                 <Route path="/" element={<Overview />} />
-                <Route path="/dashboard-studio" element={<DashboardStudio />} />
+                <Route path="/dashboard-studio" element={<Navigate to="/visuals" replace />} />
                 <Route path="/playground" element={<Playground />} />
                 <Route path="/agents" element={<Agents />} />
                 <Route path="/agents/:id/chat" element={<AgentChat />} />

@@ -91,7 +91,9 @@ export function Canvas({ layout, selectedId, onSelect, onLayoutChange, onDelete,
               <button className="ds-widget-del" title="删除" onClick={(e) => { e.stopPropagation(); onDelete(w.id); }}>×</button>
             </div>
             <div className="ds-widget-body">
-              <WidgetRenderer widget={w} datasourceId={layout.meta.datasourceId} tableName={layout.meta.tableName} resizeKey={`${w.grid.w}x${w.grid.h}`} />
+              {w.type === 'html' && !w.options?.visualId && !w.options?.html
+                ? <div className="ds-widget-state">请选择一个已保存的 HTML 可视化</div>
+                : <WidgetRenderer widget={w} datasourceId={layout.meta.datasourceId} tableName={layout.meta.tableName} resizeKey={`${w.grid.w}x${w.grid.h}`} />}
             </div>
           </div>
         ))}

@@ -1,4 +1,6 @@
+import { useEffect, useState } from 'react';
 import type { DatasetProfile, FieldProfile, Widget, WidgetType, WidgetFilter, FilterOp } from './types';
+import { listSavedVisuals, type VisualListItem } from './api';
 
 interface Props {
   widget: Widget | null;
@@ -178,6 +180,8 @@ const TYPES: Array<{ value: WidgetType; label: string }> = [
   { value: 'gauge', label: '仪表盘' },
   { value: 'scatter', label: '散点图' },
   { value: 'table', label: '数据明细' },
+  { value: 'text', label: '说明卡片' },
+  { value: 'html', label: 'HTML 组件' },
 ];
 
 const AGGS_NUMERIC = ['sum', 'avg', 'count', 'count_distinct', 'max', 'min'] as const;
@@ -189,6 +193,19 @@ const AGG_LABEL: Record<string, string> = {
 };
 
 export function PropertyPanel({ widget, profile, onPatch }: Props) {
+  const [savedVisuals, setSavedVisuals] = useState<VisualListItem[]>([]);
+  const [visualLoading, setVisualLoading] = useState(false);
+  useEffect(() => {
+    if (widget?.type !== 'html') return;
+    let cancelled = false;
+    setVisualLoading(true);
+    listSavedVisuals()
+      .then((items) => { if (!cancelled) setSavedVisuals(items); })
+      .catch(() => { if (!cancelled) setSavedVisuals([]); })
+      .finally(() => { if (!cancelled) setVisualLoading(false); });
+    return () => { cancelled = true; };
+  }, [widget?.type]);
+
   if (!widget || !profile) {
     return (
       <div className="ds-panel-empty">
@@ -312,6 +329,27 @@ export function PropertyPanel({ widget, profile, onPatch }: Props) {
         </select>
       </div>
 
+      {widget.type === 'html' && (
+        <div className="ds-panel-section">
+          <label className="ds-panel-label">HTML 素材</label>
+          <select
+            className="ds-input"
+            value={String(widget.options?.visualId || '')}
+            onChange={(e) => onPatch(widget.id, { options: { ...widget.options, visualId: e.target.value } })}
+          >
+            <option value="">{visualLoading ? '加载素材库…' : '请选择已保存可视化'}</option>
+            {savedVisuals.map((visual) => (
+              <option key={visual.id} value={visual.id}>
+                {visual.title || visual.id}
+              </option>
+            ))}
+          </select>
+          <div className="ds-panel-hint" style={{ marginTop: 6 }}>
+            这个组件会直接复用已保存的 HTML 可视化。
+          </div>
+        </div>
+      )}
+
       {(widget.type === 'line' || widget.type === 'bar' || widget.type === 'scatter' || widget.type === 'funnel') && (
         <div className="ds-panel-section">
           <label className="ds-panel-label">
@@ -421,7 +459,7 @@ export function PropertyPanel({ widget, profile, onPatch }: Props) {
         </button>
       </div>
 
-      {widget.reasoning && (
+      {widget.reasoning && widget.type !== 'html' && (
         <div className="ds-panel-section ds-reasoning">
           <label className="ds-panel-label">AI 推荐理由</label>
           <div className="ds-reasoning-text">{widget.reasoning}</div>
