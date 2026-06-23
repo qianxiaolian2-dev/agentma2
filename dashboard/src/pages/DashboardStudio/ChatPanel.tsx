@@ -33,6 +33,7 @@ export function ChatPanel({ profile, layout = null, onPinToBoard, onApplyLayout 
   const [input, setInput] = useState('');
   const [pending, setPending] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
 
   // profile 变了 → AI 主动打招呼
   useEffect(() => {
@@ -50,10 +51,13 @@ export function ChatPanel({ profile, layout = null, onPinToBoard, onApplyLayout 
     setMessages([greet]);
   }, [profile?.datasourceId, profile?.tableName]);
 
-  // 自动滚到底
+  // 自动滚到底:用哨兵元素 scrollIntoView,不依赖具体哪个祖先是滚动容器
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages.length, messages[messages.length - 1]?.loading]);
+    const id = requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [messages]);
 
   const submit = useCallback(async (text: string) => {
     const t = text.trim();
@@ -76,6 +80,19 @@ export function ChatPanel({ profile, layout = null, onPinToBoard, onApplyLayout 
       if (result.mode === 'edit' && result.layout && onApplyLayout) {
         onApplyLayout(result.layout);
       }
+      // HTML 大屏:直接 pin 一个 html widget 到看板
+      if (result.mode === 'html' && result.htmlWidget && onPinToBoard) {
+        const hw: Widget = {
+          id: crypto.randomUUID(),
+          type: 'html',
+          title: result.htmlWidget.title,
+          grid: { x: 0, y: 999, w: 12, h: 8 },
+          data: {},
+          options: { visualId: result.htmlWidget.visualId },
+          manualEdited: true,
+        };
+        onPinToBoard(hw);
+      }
       const ans = result.answer;
       const autoPin = result.mode === 'answer'
         && shouldAutoPinAnswer(t)
@@ -88,7 +105,7 @@ export function ChatPanel({ profile, layout = null, onPinToBoard, onApplyLayout 
         ...m,
         text: result.message || '已处理你的请求。',
         answer: result.mode === 'answer' && ans && !ans.error ? ans : undefined,
-        autoPinned: autoPin,
+        autoPinned: autoPin || result.mode === 'html',
         loading: false,
       } : m));
     } catch (err) {
@@ -150,6 +167,7 @@ export function ChatPanel({ profile, layout = null, onPinToBoard, onApplyLayout 
             </div>
           </div>
         ))}
+        <div ref={bottomRef} />
       </div>
       <form className="ds-chat-input"
         onSubmit={(e) => { e.preventDefault(); submit(input); }}>

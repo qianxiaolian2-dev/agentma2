@@ -9,11 +9,13 @@ interface Props {
   widget: Widget;
   datasourceId: string;
   tableName: string;
+  /** 看板级主题(配色等),组件级 appearance 优先 */
+  theme?: import('./types').DashboardTheme;
   /** 父级尺寸变化(拖拽/resize)时主动触发图表 resize */
   resizeKey?: string;
 }
 
-export function WidgetRenderer({ widget, datasourceId, tableName, resizeKey }: Props) {
+export function WidgetRenderer({ widget, datasourceId, tableName, theme, resizeKey }: Props) {
   const [result, setResult] = useState<QueryResult | null>(null);
   const [visualHtml, setVisualHtml] = useState<string>('');
   const [visualError, setVisualError] = useState<string | null>(null);
@@ -90,6 +92,8 @@ export function WidgetRenderer({ widget, datasourceId, tableName, resizeKey }: P
     const v = result.rows[0] ? Object.values(result.rows[0])[0] : 0;
     const num = typeof v === 'number' ? v : Number(v);
     const enc = widget.data.encoding;
+    const appearance = (widget.options as any)?.appearance || {};
+    const valueColor = appearance.valueColor || theme?.kpiColor || theme?.accent;
     const aggLabel: Record<string, string> = {
       sum: '求和', avg: '平均', count: '计数', count_distinct: '去重计数',
       max: '最大', min: '最小',
@@ -104,7 +108,9 @@ export function WidgetRenderer({ widget, datasourceId, tableName, resizeKey }: P
     }
     return (
       <div className="ds-kpi">
-        <div className="ds-kpi-value">{Number.isFinite(num) ? formatNumber(num) : String(v ?? '-')}</div>
+        <div className="ds-kpi-value" style={valueColor ? { color: valueColor } : undefined}>
+          {Number.isFinite(num) ? formatNumber(num) : String(v ?? '-')}
+        </div>
         <div className="ds-kpi-label">{widget.title}</div>
         {caption && <div className="ds-kpi-caption">{caption}</div>}
       </div>
@@ -136,7 +142,7 @@ export function WidgetRenderer({ widget, datasourceId, tableName, resizeKey }: P
     return <div className="ds-text-card">{widget.title}</div>;
   }
 
-  const option = encodingToOption(widget, result);
+  const option = encodingToOption(widget, result, theme?.palette);
   return (
     <ReactECharts
       ref={echartsRef}

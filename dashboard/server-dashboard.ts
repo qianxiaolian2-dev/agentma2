@@ -518,17 +518,18 @@ function autoLayoutFix(widgets: Widget[]): Widget[] {
     }
   }
 
-  // 4. 分布行:1 张 12, 2 张 6+6, 3 张 4+4+4, 4 张 3+3+3+3, ≥5 折行
+  // 4. 分布行:1 张 12, 2 张 6+6, 3 张 4+4+4。最多 3 个一行
+  //    (bar/funnel/scatter/heatmap 最小宽 4 列,4 个一行会破最小宽校验)
   if (dists.length > 0) {
     const distH = 7;
-    const rows = chunkInto(dists, 4);
+    const rows = chunkInto(dists, 3);
     for (const row of rows) {
       const cols = row.length;
-      const w = cols === 1 ? 12 : cols === 2 ? 6 : cols === 3 ? 4 : 3;
+      const w = cols === 1 ? 12 : cols === 2 ? 6 : 4;
       row.forEach((widget, i) => {
         placed.push({
           ...widget,
-          grid: { ...widget.grid, x: i * w, y: cursorY, w, h: distH, minW: cols === 1 ? 6 : 3, minH: 5 },
+          grid: { ...widget.grid, x: i * w, y: cursorY, w, h: distH, minW: Math.min(w, 4), minH: 5 },
         });
       });
       cursorY += distH;

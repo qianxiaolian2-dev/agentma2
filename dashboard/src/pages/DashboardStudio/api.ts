@@ -167,10 +167,11 @@ export interface DashboardEditResult {
 }
 
 export interface DashboardChatResult {
-  mode: 'answer' | 'edit';
+  mode: 'answer' | 'edit' | 'html';
   message: string;
   answer?: AskResult;
   layout?: DashboardLayout;
+  htmlWidget?: { type: 'html'; title: string; visualId: string };
 }
 
 export async function askQuestion(

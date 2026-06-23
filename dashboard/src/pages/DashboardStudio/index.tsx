@@ -199,6 +199,11 @@ export default function DashboardStudio({
       };
       return { ...cur, widgets: [...cur.widgets, w] };
     });
+    // 滚到底,让用户看到刚加进来的图
+    requestAnimationFrame(() => {
+      const el = document.querySelector('.ds-canvas-col');
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    });
   }, []);
 
   const relayout = useCallback(async () => {
@@ -432,6 +437,10 @@ export default function DashboardStudio({
                 onApplyLayout={(nextLayout) => {
                   setLayout(enrichLayout(nextLayout));
                   setSelectedId(null);
+                  // 编辑后把画布滚回顶部,避免用户停在底部空白看不到改动
+                  requestAnimationFrame(() => {
+                    document.querySelector('.ds-canvas-col')?.scrollTo({ top: 0, behavior: 'smooth' });
+                  });
                 }}
               />
             </aside>

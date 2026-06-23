@@ -43,18 +43,55 @@ function buildAxisLabel(field: string | undefined, agg?: string): string {
   return `${aggLabel[agg]}(${field})`;
 }
 
-export function encodingToOption(widget: Widget, result: QueryResult): any {
+export function encodingToOption(widget: Widget, result: QueryResult, palette?: string[]): any {
   const t = widget.type;
-  const userOptions = widget.options || {};
+  const rawOptions = widget.options || {};
   const enc = widget.data.encoding || {};
+  // 配色优先级:组件 appearance.palette > 看板 theme.palette(传入) > 默认
+  const appearance = (rawOptions as any).appearance || {};
+  const colorList: string[] = (Array.isArray(appearance.palette) && appearance.palette.length)
+    ? appearance.palette
+    : (Array.isArray(palette) && palette.length ? palette : CHART_PALETTE);
+  const baseWithColor = { ...BASE, color: colorList };
+  // userOptions 里剔除非 echarts 字段,避免污染 option
+  const { appearance: _a, visualId: _v, html: _h, text: _txt, ...userOptions } = rawOptions as any;
 
   if (t === 'line' || t === 'bar' || t === 'scatter') {
     const { x, y } = pickXY(result);
     const isTime = enc.x?.type === 'time';
     const xLabel = enc.x?.field || '';
     const yLabel = buildAxisLabel(enc.y?.field, enc.y?.agg);
+    // 横向柱状图(条形图):options.orient='horizontal' 时交换 x/y 轴
+    const horizontal = t === 'bar' && (rawOptions as any).orient === 'horizontal';
+    if (horizontal) {
+      return {
+        ...baseWithColor,
+        grid: { left: 80, right: 24, top: 36, bottom: 36, containLabel: true },
+        xAxis: {
+          type: 'value',
+          name: yLabel,
+          nameLocation: 'middle', nameGap: 24,
+          nameTextStyle: { color: '#666', fontSize: 11 },
+          axisLabel: { color: '#666', fontSize: 11 },
+        },
+        yAxis: {
+          type: 'category',
+          data: x,
+          inverse: true,  // 第一名在最上面
+          name: xLabel,
+          axisLabel: { color: '#666', fontSize: 11 },
+        },
+        series: [{
+          type: 'bar',
+          name: yLabel,
+          data: y,
+          itemStyle: { borderRadius: [0, 3, 3, 0] },
+        }],
+        ...userOptions,
+      };
+    }
     return {
-      ...BASE,
+      ...baseWithColor,
       xAxis: {
         type: isTime ? 'time' : 'category',
         data: isTime ? undefined : x,
@@ -89,7 +126,7 @@ export function encodingToOption(widget: Widget, result: QueryResult): any {
     const { x, y } = pickXY(result);
     const data = x.map((name, i) => ({ name: String(name ?? ''), value: y[i] }));
     return {
-      ...BASE,
+      ...baseWithColor,
       tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
       legend: {
         type: 'scroll', orient: 'horizontal',
@@ -119,7 +156,7 @@ export function encodingToOption(widget: Widget, result: QueryResult): any {
   if (t === 'funnel') {
     const { x, y } = pickXY(result);
     return {
-      ...BASE,
+      ...baseWithColor,
       tooltip: { trigger: 'item', formatter: '{b}: {c}' },
       series: [{
         type: 'funnel',
@@ -136,7 +173,7 @@ export function encodingToOption(widget: Widget, result: QueryResult): any {
     const value = result.rows[0] ? Number(Object.values(result.rows[0])[0]) : 0;
     const yLabel = buildAxisLabel(enc.y?.field, enc.y?.agg);
     return {
-      ...BASE,
+      ...baseWithColor,
       series: [{
         type: 'gauge',
         progress: { show: true, width: 18 },
@@ -154,7 +191,7 @@ export function encodingToOption(widget: Widget, result: QueryResult): any {
     const ys = Array.from(new Set(result.rows.map((r) => r.y_value as any))) as any[];
     const cell = result.columns.includes('value') ? 'value' : (result.columns[2] || 'y_value');
     return {
-      ...BASE,
+      ...baseWithColor,
       tooltip: { position: 'top' },
       xAxis: { type: 'category', data: xs.map(String), splitArea: { show: true } },
       yAxis: { type: 'category', data: ys.map(String), splitArea: { show: true } },
@@ -169,5 +206,5 @@ export function encodingToOption(widget: Widget, result: QueryResult): any {
     };
   }
 
-  return { ...BASE };
+  return { ...baseWithColor };
 }

@@ -60,10 +60,17 @@ export function Canvas({ layout, selectedId, onSelect, onLayoutChange, onDelete,
     if (changed) onLayoutChange({ ...layout, widgets: nextWidgets });
   };
 
+  const theme = layout.meta.theme;
+
   return (
-    <div className="ds-canvas-wrap" ref={wrapRef} onClick={(e) => {
-      if (e.target === e.currentTarget) onSelect(null);
-    }}>
+    <div
+      className="ds-canvas-wrap"
+      ref={wrapRef}
+      style={theme?.canvasBg ? { background: theme.canvasBg } : undefined}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onSelect(null);
+      }}
+    >
       <GridLayout
         className="ds-grid"
         layout={rglLayout}
@@ -79,24 +86,34 @@ export function Canvas({ layout, selectedId, onSelect, onLayoutChange, onDelete,
         isDraggable={!readOnly}
         isResizable={!readOnly}
       >
-        {layout.widgets.map((w) => (
-          <div
-            key={w.id}
-            className={`ds-widget ${selectedId === w.id ? 'ds-widget-selected' : ''}`}
-            onClick={(e) => { e.stopPropagation(); onSelect(w.id); }}
-          >
-            <div className="ds-widget-header">
-              <span className="ds-widget-handle" title="拖拽">⠿</span>
-              <span className="ds-widget-title">{w.title}</span>
-              <button className="ds-widget-del" title="删除" onClick={(e) => { e.stopPropagation(); onDelete(w.id); }}>×</button>
+        {layout.widgets.map((w) => {
+          const appearance = (w.options as any)?.appearance || {};
+          const cardStyle: React.CSSProperties = {};
+          const bg = appearance.backgroundColor || theme?.cardBg;
+          const border = appearance.borderColor || theme?.cardBorder;
+          if (bg) cardStyle.background = bg;
+          if (border) cardStyle.borderColor = border;
+          const titleColor = appearance.titleColor || theme?.titleColor;
+          return (
+            <div
+              key={w.id}
+              className={`ds-widget ${selectedId === w.id ? 'ds-widget-selected' : ''}`}
+              style={cardStyle}
+              onClick={(e) => { e.stopPropagation(); onSelect(w.id); }}
+            >
+              <div className="ds-widget-header">
+                <span className="ds-widget-handle" title="拖拽">⠿</span>
+                <span className="ds-widget-title" style={titleColor ? { color: titleColor } : undefined}>{w.title}</span>
+                <button className="ds-widget-del" title="删除" onClick={(e) => { e.stopPropagation(); onDelete(w.id); }}>×</button>
+              </div>
+              <div className="ds-widget-body">
+                {w.type === 'html' && !w.options?.visualId && !w.options?.html
+                  ? <div className="ds-widget-state">请选择一个已保存的 HTML 可视化</div>
+                  : <WidgetRenderer widget={w} datasourceId={layout.meta.datasourceId} tableName={layout.meta.tableName} theme={theme} resizeKey={`${w.grid.w}x${w.grid.h}`} />}
+              </div>
             </div>
-            <div className="ds-widget-body">
-              {w.type === 'html' && !w.options?.visualId && !w.options?.html
-                ? <div className="ds-widget-state">请选择一个已保存的 HTML 可视化</div>
-                : <WidgetRenderer widget={w} datasourceId={layout.meta.datasourceId} tableName={layout.meta.tableName} resizeKey={`${w.grid.w}x${w.grid.h}`} />}
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </GridLayout>
       <div style={{ display: 'none' }}>{resizeKey}</div>
     </div>

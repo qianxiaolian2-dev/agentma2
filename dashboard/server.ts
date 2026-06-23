@@ -108,7 +108,7 @@ import {
   saveDashboard,
   loadDashboard,
 } from './server-dashboard.ts';
-import { generateLayoutByLLMWithProvider, askQuestionWithProvider, editDashboardByChatWithProvider } from './server-dashboard-llm.ts';
+import { generateLayoutByLLMWithProvider, askQuestionWithProvider, editDashboardByChatWithProvider, generateHtmlVisual, classifyChatIntent, summarizeQueryResult } from './server-dashboard-llm.ts';
 import { mapResultSubtypeToOutcome, outcomeToMessageStatus, type RunOutcome } from './src/simulator/run-state.ts';
 
 const app = express();
@@ -1887,11 +1887,33 @@ function resolveDashboardProvider(tenantId: string, preferredModel = MODEL_HINTS
   };
 }
 
+// 是否要走"AI 自由生成 HTML 大屏"。明确说大屏/HTML/炫酷自由排版才触发,
+// 避免抢掉普通的图表生成/编辑/问答。
+function shouldGenerateHtmlVisual(question: string) {
+  const compact = String(question || '').replace(/\s+/g, '');
+  return /(大屏|数据大屏|可视化大屏|html可视化|html页面|html大屏|自由排版|图文混排|海报|信息图|infographic|做个网页|生成网页|炫酷.*(可视化|大屏|页面)|高级.*(大屏|海报|信息图))/i.test(compact);
+}
+
 function shouldPreferDashboardEdit(question: string) {
   const compact = String(question || '').replace(/\s+/g, '');
-  return /(加|新增|添加|补|插入|放|塞|来|做|搞|生成).*(指标卡|kpi|图|图表|卡|卡片|组件|模块|趋势图|柱状图|折线图|饼图|漏斗图|散点图|热力图|表格|html)/i.test(compact)
-    || /(改看板|改页面|改样式|换样式|统一|调整布局|整体布局|整体排布|整个看板布局|整个布局|重排|重新排布|重新布局|重新整理|重新调整布局|重新调整下看板布局|出边框了|出边了|超出边框|溢出去了|挤出去了|边框外面|放大|缩小|删掉|删除|移除|去掉|删了吧|删了|不要了|干掉|替换|改成|换成|并列|排一行|同一行|对齐|挪上去|放上面|放下面|靠左|靠右)/i.test(compact)
-    || /(和上面并列|和下面并列|排成一行|放同一行|跟.*对齐)/i.test(compact);
+
+  // 1) 明确的"改看板"动词/对象 → 一定是 edit
+  const explicitEdit = /(加|新增|添加|补|插入|放|塞|来|做|搞|生成).*(指标卡|kpi|图|图表|卡|卡片|组件|模块|趋势图|柱状图|折线图|饼图|环形图|漏斗图|散点图|热力图|仪表盘|表格|html)/i.test(compact)
+    || /(改看板|改页面|改样式|换样式|调样式|美化|好看|高级|统一|风格|主题|配色|颜色|换色|变色|底色|背景色|字体|字号|字大|字小|加粗|边框|圆角|阴影|间距|留白)/i.test(compact)
+    || /(调整布局|整体布局|整体排布|整个看板布局|整个布局|重排|重新排布|重新布局|重新整理|重新调整|布局乱|挤在一起|太挤)/i.test(compact)
+    || /(出边框|出边了|超出边框|溢出|挤出去|边框外面|放大|缩小|大一点|小一点|宽一点|窄一点|高一点|矮一点|太小|太大|太宽|太窄)/i.test(compact)
+    || /(删掉|删除|移除|去掉|删了吧|删了|不要了|干掉|隐藏)/i.test(compact)
+    || /(替换|改成|换成|改为|换为|变成)/i.test(compact)
+    || /(并列|排一行|同一行|对齐|挪上去|挪下去|放上面|放下面|放前面|放后面|靠左|靠右|置顶|移到)/i.test(compact)
+    || /(标题|改名|重命名|换个名)/i.test(compact);
+  if (explicitEdit) return true;
+
+  // 2) 明确的"问数据"信号 → 不是 edit(交给问答)
+  const looksLikeQuery = /(多少|几个|哪个|哪些|是什么|怎么样|如何|占比|比例|趋势|对比|排名|排行|top|最高|最低|最多|最少|平均|总共|合计|统计|分析一下|看看|查一下|算一下|为什么|分布)/i.test(compact);
+  if (looksLikeQuery) return false;
+
+  // 3) 其余短指令(且当前有看板)默认当编辑,避免"换个颜色吧"这种漏判
+  return compact.length <= 20;
 }
 
 const MODEL_HINTS = {
@@ -3569,6 +3591,27 @@ app.post('/api/dashboard/ask', authMiddleware, async (req: any, res) => {
   }
 });
 
+app.post('/api/dashboard/generate-html', authMiddleware, async (req: any, res) => {
+  const datasourceId = String(req.body?.datasourceId || '');
+  const source = getDatasource(req.auth.tenantId, datasourceId);
+  if (!source || !source.enabled) { res.status(404).json({ error: 'datasource not found' }); return; }
+  const question = String(req.body?.question || '').trim();
+  if (!question) { res.status(400).json({ error: '问题不能为空' }); return; }
+  try {
+    const profile = buildDatasetProfile(datasourceId, source.path, req.body?.tableName);
+    const runSql = (sql: string) => runDatasourceQuery(source.path, sql);
+    const result = await generateHtmlVisual(profile, question, runSql, resolveDashboardProvider(req.auth.tenantId));
+    if ('error' in result) { res.status(400).json({ error: result.error }); return; }
+    const saved = createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), {
+      title: result.title,
+      html: result.html,
+    });
+    res.json({ visualId: saved.id, title: result.title });
+  } catch (error) {
+    res.status(400).json({ error: (error as Error).message || 'generate-html 失败' });
+  }
+});
+
 app.post('/api/dashboard/chat', authMiddleware, async (req: any, res) => {
   const datasourceId = String(req.body?.datasourceId || '');
   const source = getDatasource(req.auth.tenantId, datasourceId);
@@ -3579,7 +3622,41 @@ app.post('/api/dashboard/chat', authMiddleware, async (req: any, res) => {
   const layout = req.body?.layout;
   try {
     const profile = buildDatasetProfile(datasourceId, source.path, req.body?.tableName || layout?.meta?.tableName);
-    const canEdit = layout && layout.version === '1.0' && shouldPreferDashboardEdit(question);
+
+    // 意图分类:正则强信号优先,否则用 LLM 判断(能处理跨轮指代/模糊措辞)
+    const provider = resolveDashboardProvider(req.auth.tenantId);
+    const hasLayout = layout && layout.version === '1.0';
+    let intent: 'edit' | 'query' | 'html' | 'chat';
+    if (shouldGenerateHtmlVisual(question)) {
+      intent = 'html';
+    } else if (hasLayout && shouldPreferDashboardEdit(question)) {
+      intent = 'edit';
+    } else {
+      intent = await classifyChatIntent(question, history, !!hasLayout, provider);
+      // 没有看板时 edit 无意义,降级成 query
+      if (intent === 'edit' && !hasLayout) intent = 'query';
+    }
+
+    // 1) HTML 大屏
+    if (intent === 'html') {
+      const runSql = (sql: string) => runDatasourceQuery(source.path, sql);
+      const htmlResult = await generateHtmlVisual(profile, question, runSql, provider);
+      if (!('error' in htmlResult)) {
+        const saved = createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), {
+          title: htmlResult.title,
+          html: htmlResult.html,
+        });
+        res.json({
+          mode: 'html',
+          message: `已生成「${htmlResult.title}」HTML 可视化,点"付到看板"加入。`,
+          htmlWidget: { type: 'html', title: htmlResult.title, visualId: saved.id },
+        });
+        return;
+      }
+      // 失败继续走常规
+    }
+
+    const canEdit = intent === 'edit' && hasLayout;
     if (canEdit) {
       const currentCheck = validateDashboardLayout(layout, profile, { normalize: false });
       const baseLayout = currentCheck.ok
@@ -3634,10 +3711,16 @@ app.post('/api/dashboard/chat', authMiddleware, async (req: any, res) => {
     } catch (e) {
       queryError = (e as Error).message;
     }
+    // 拿到真实结果后,让 LLM 写一句带真数字的结论(失败回落到原 narrative)
+    let finalMessage = ans.narrative;
+    if (queryResult && Array.isArray(queryResult.rows) && queryResult.rows.length) {
+      const real = await summarizeQueryResult(question, ans.sql, queryResult.rows, resolveDashboardProvider(req.auth.tenantId));
+      if (real) finalMessage = real;
+    }
     res.json({
       mode: 'answer',
-      message: ans.narrative,
-      answer: { ...ans, queryResult, queryError },
+      message: finalMessage,
+      answer: { ...ans, narrative: finalMessage, queryResult, queryError },
     });
   } catch (error) {
     res.status(400).json({ error: (error as Error).message || 'chat 失败' });

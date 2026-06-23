@@ -412,6 +412,7 @@ const EDIT_TOOL = {
                 visualId: { type: 'string' },
                 html: { type: 'string' },
                 text: { type: 'string' },
+                orient: { type: 'string', enum: ['horizontal', 'vertical'], description: '柱状图方向,horizontal=横向条形图' },
                 appearance: {
                   type: 'object',
                   properties: {
@@ -452,8 +453,9 @@ const EDIT_SYSTEM = `你是可视化工坊里的看板编排师。你会收到:
 6. 如果用户要求“去掉重复/删掉某个卡/把 KPI 放前面/把趋势图放大”，你要直接改 widgets。
 7. 所有保留下来的 widget.id 必须稳定，不要重建全量 id。新增组件才生成新 id，建议用 edit-1/edit-2 这种。
 8. 如果改成 text 组件，可以把文案放到 options.text。
-9. reasoning 要简短说明这次修改意图，保留或更新都可以。
-10. 输出的布局必须尽量满足现有网格规则，x+w<=12。
+9. 横向柱状图(条形图):保持 type='bar',在该组件 options 里设 orient='horizontal'(改回纵向就设 orient='vertical' 或删掉 orient)。
+10. reasoning 要简短说明这次修改意图，保留或更新都可以。
+11. 输出的布局必须尽量满足现有网格规则，x+w<=12。
 
 【风格指引】
 - 当前产品是暖米色、深棕线框、卡片感明显的控制台，不要输出冷蓝 BI 套皮。
@@ -576,7 +578,13 @@ function buildGenericAddWidgetEdit(
   question: string,
 ): DashboardEditAnswer | null {
   const compact = question.replace(/\s+/g, '');
-  const wantsAdd = /(加|新增|添加|补|插入|放|塞|来|做|搞|生成)/i.test(compact);
+  // 布局/移动类意图,不是新增 —— 交给 LLM 处理
+  if (/(放一排|放一行|排一排|排一行|排成一行|一排|同一行|并列|对齐|放上面|放下面|放前面|放后面|挪|移到|靠左|靠右|置顶|布局|重排)/i.test(compact)) {
+    return null;
+  }
+  // 只有明确的"新增/添加/做一个"才算新增,"放/塞/来"这种太泛,排除
+  const wantsAdd = /(新增|添加|增加|加一个|加个|加一张|加张|补一个|补个|插入一个|做一个|做个|生成一个|生成个|来一个|来个)/i.test(compact)
+    || /^(加|添加|新增)/i.test(compact);
   const type = inferWidgetType(compact);
   if (!wantsAdd || !type) return null;
   if (/(成单率|转化率|成交率)/i.test(compact) && type === 'kpi') return null;
@@ -756,6 +764,195 @@ export async function askQuestion(
   history: AskHistoryMsg[] = [],
 ): Promise<AskAnswer | { error: string }> {
   return askQuestionWithProvider(profile, question, history, null);
+}
+
+// ─── 拿到真实 SQL 结果后,让 LLM 写一句带真实数字的结论 ─────────────────
+export async function summarizeQueryResult(
+  question: string,
+  sql: string,
+  rows: any[],
+  provider?: { apiKey?: string; baseUrl?: string } | null,
+): Promise<string | null> {
+  const client = pickClient(provider);
+  if (!client) return null;
+  // 结果太大就截断,只给前 30 行
+  const sample = JSON.stringify(rows.slice(0, 30));
+  const sys = `你是数据分析师。基于查询的真实结果,用一句话(最多 60 字,中文)回答用户的问题。
+要求:
+- 必须用结果里的真实数字,不要编造。
+- 说人话,直接给结论(谁最高/多少/什么趋势/有无异常),不要复述 SQL。
+- 不要用"根据数据""查询结果显示"这种废话开头。`;
+  const userMsg = `用户问题: ${question}
+真实结果(JSON): ${sample}
+请给出一句话结论。`;
+  try {
+    const res = await client.messages.create({
+      model: MODEL,
+      max_tokens: 200,
+      system: sys,
+      messages: [{ role: 'user', content: userMsg }],
+    });
+    const text = res.content.filter((b) => b.type === 'text').map((b) => (b as any).text).join('').trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+// ─── 意图分类:用一次极小的 LLM 调用判断用户这句话想干嘛 ───────────────
+// 比堆正则可靠,尤其能处理跨轮指代("替换现在的趋势图")和模糊措辞。
+export type ChatIntent = 'edit' | 'query' | 'html' | 'chat';
+
+const INTENT_TOOL = {
+  name: 'classify_intent',
+  description: '判断用户这句话对当前数据看板的操作意图',
+  input_schema: {
+    type: 'object' as const,
+    required: ['intent'],
+    properties: {
+      intent: {
+        type: 'string',
+        enum: ['edit', 'query', 'html', 'chat'],
+        description: [
+          'edit=修改现有看板(增删改图表/改类型/改字段/改布局/改样式/换配色/对齐/替换某个图等)',
+          'query=只是问数据/要一个新分析结果(哪个最高/多少/趋势/对比/占比)',
+          'html=要自由生成一个 HTML 大屏/海报/图文混排页面',
+          'chat=跟数据看板无关的闲聊',
+        ].join('; '),
+      },
+    },
+  },
+};
+
+export async function classifyChatIntent(
+  question: string,
+  history: AskHistoryMsg[],
+  hasLayout: boolean,
+  provider?: { apiKey?: string; baseUrl?: string } | null,
+): Promise<ChatIntent> {
+  const client = pickClient(provider);
+  if (!client) return 'query';
+  const sys = `你是看板助手的意图分类器。结合最近对话,判断用户最新一句话的操作意图。
+当前${hasLayout ? '已经有一个看板' : '还没有看板'}。
+注意:
+- "替换/换成/改成/删掉/加一个/放一排/对齐/换颜色/字大点/标题改一下" 等都是 edit。
+- "那你替换现在的趋势图吗""把它删了""换个图表类型" 这种基于上文指代的也是 edit。
+- 只有纯粹问数字/排名/趋势且不要求动看板时才是 query。
+只调用 classify_intent。`;
+  const recent = history.slice(-6).map((m) => `${m.role === 'user' ? '用户' : 'AI'}: ${m.content}`).join('\n');
+  const userMsg = `${recent ? `最近对话:\n${recent}\n\n` : ''}用户最新输入: ${question}`;
+  try {
+    const res = await client.messages.create({
+      model: MODEL,
+      max_tokens: 100,
+      system: sys,
+      tools: [INTENT_TOOL as any],
+      tool_choice: { type: 'tool', name: 'classify_intent' },
+      messages: [{ role: 'user', content: userMsg }],
+    });
+    for (const block of res.content) {
+      if (block.type === 'tool_use' && block.name === 'classify_intent') {
+        const intent = (block.input as any)?.intent;
+        if (intent === 'edit' || intent === 'query' || intent === 'html' || intent === 'chat') return intent;
+      }
+    }
+  } catch { /* 失败回落 query */ }
+  return 'query';
+}
+
+// ─── AI 自由生成 HTML 可视化(大屏/复杂图表)─────────────────────────────
+const HTML_VISUAL_SYSTEM = `你是数据可视化大屏设计师。基于用户提供的数据画像和真实样本数据,生成一个完整、自包含、可直接渲染的 HTML 片段。
+
+【硬规则】
+1. 只输出 HTML 代码本身,不要 markdown 代码围栏,不要任何解释文字。
+2. 必须是完整可独立运行的 HTML(含 <style>,如需图表用内联 SVG 或纯 CSS,不要引用外部 JS/CDN,因为运行环境可能离线)。
+3. 用提供的【真实样本数据】,不要编造数字。数据不够就如实展示已有的。
+4. 自适应容器宽高,根元素用 width:100%; height:100%; 不要固定像素尺寸。
+5. 配色走暖米色/深棕线框的高级控制台风格,或用户指定的风格。
+6. 中文排版,字体用系统默认 sans-serif。
+
+【适合场景】
+- 用户要"大屏""炫酷""卡片墙""排版好看的报告""图文混排"这类自由布局时,你比固定图表组件更合适。
+- 可以组合多个数字卡 + 进度条 + 简易图形 + 文字解读。`;
+
+export interface HtmlVisualResult {
+  title: string;
+  html: string;
+}
+
+/** 给 LLM 喂真实样本:对推荐指标/维度跑几条聚合,拼成精简数据集 */
+function buildHtmlSampleData(
+  profile: DatasetProfile,
+  runSql: (sql: string) => any,
+): string {
+  const lines: string[] = [`表名: ${profile.tableName}, 总行数: ${profile.rowCount}`];
+  const q = (n: string) => `"${n.replace(/"/g, '""')}"`;
+  const T = q(profile.tableName);
+  const metric = profile.suggestedMetrics[0];
+  const dims = profile.suggestedDimensions.slice(0, 2);
+  const time = profile.timeFields[0];
+  const tries: Array<{ label: string; sql: string }> = [];
+  // 关键 KPI
+  if (metric) tries.push({ label: `总${metric}`, sql: `SELECT SUM(${q(metric)}) AS v FROM ${T}` });
+  tries.push({ label: '记录数', sql: `SELECT COUNT(*) AS v FROM ${T}` });
+  // 维度 TopN
+  for (const d of dims) {
+    const yexpr = metric ? `SUM(${q(metric)})` : 'COUNT(*)';
+    tries.push({ label: `${d} Top5`, sql: `SELECT ${q(d)} AS k, ${yexpr} AS v FROM ${T} WHERE ${q(d)} IS NOT NULL GROUP BY ${q(d)} ORDER BY v DESC LIMIT 5` });
+  }
+  // 时间趋势
+  if (time && metric) tries.push({ label: `${metric}趋势`, sql: `SELECT ${q(time)} AS k, SUM(${q(metric)}) AS v FROM ${T} WHERE ${q(time)} IS NOT NULL GROUP BY ${q(time)} ORDER BY k LIMIT 20` });
+  for (const t of tries) {
+    try {
+      const r = runSql(t.sql);
+      lines.push(`${t.label}: ${JSON.stringify(r.rows)}`);
+    } catch { /* skip */ }
+  }
+  return lines.join('\n');
+}
+
+export async function generateHtmlVisual(
+  profile: DatasetProfile,
+  question: string,
+  runSql: (sql: string) => any,
+  provider?: { apiKey?: string; baseUrl?: string } | null,
+): Promise<HtmlVisualResult | { error: string }> {
+  const client = pickClient(provider);
+  if (!client) return { error: 'LLM 未配置 ANTHROPIC_API_KEY' };
+
+  const sampleData = buildHtmlSampleData(profile, runSql);
+  const userMsg = `数据画像字段:
+${profile.fields.map((f) => `- ${f.name} (${f.type}, ${f.role})`).join('\n')}
+
+【真实样本数据】
+${sampleData}
+
+用户要求: ${question}
+
+请直接输出完整 HTML(不要 markdown 围栏)。`;
+
+  try {
+    const res = await client.messages.create({
+      model: MODEL,
+      max_tokens: 4096,
+      system: HTML_VISUAL_SYSTEM,
+      messages: [{ role: 'user', content: userMsg }],
+    });
+    let html = res.content
+      .filter((b) => b.type === 'text')
+      .map((b) => (b as { text: string }).text)
+      .join('\n')
+      .trim();
+    // 去掉可能的 markdown 围栏
+    html = html.replace(/^```html?\s*/i, '').replace(/```\s*$/i, '').trim();
+    if (!html || !/[<][a-z!]/i.test(html)) return { error: 'AI 未生成有效 HTML' };
+    // 提取标题
+    const titleMatch = html.match(/<title>([^<]+)<\/title>/i) || html.match(/<h1[^>]*>([^<]+)<\/h1>/i);
+    const title = titleMatch ? titleMatch[1].trim().slice(0, 40) : `${profile.tableName} 可视化`;
+    return { title, html };
+  } catch (err) {
+    return { error: (err as Error).message };
+  }
 }
 
 export async function askQuestionWithProvider(
