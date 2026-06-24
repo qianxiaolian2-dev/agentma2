@@ -46,6 +46,14 @@ function fromForm(form: SubagentForm): AgentDefinition {
   };
 }
 
+function userAgentActor(user: { email?: string; id?: string } | null) {
+  return user?.email || user?.id || '';
+}
+
+function canManageTemplate(user: { email?: string; id?: string; role?: string } | null, template: AgentTemplate) {
+  return user?.role === 'tenant_admin' || Boolean(userAgentActor(user) && template.createdBy === userAgentActor(user));
+}
+
 export default function Subagents() {
   const { user } = useAuth();
   const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
@@ -69,14 +77,17 @@ export default function Subagents() {
     return () => { cancelled = true; };
   }, [user?.tenantId, user?.role]);
 
-  useEffect(() => {
-    if (selectedTemplateId || templates.length === 0) return;
-    setSelectedTemplateId(templates[0].id);
-  }, [templates, selectedTemplateId]);
+  const editableTemplates = useMemo(
+    () => templates.filter((template) => canManageTemplate(user || null, template)),
+    [templates, user],
+  );
+  const activeTemplateId = selectedTemplateId && editableTemplates.some((template) => template.id === selectedTemplateId)
+    ? selectedTemplateId
+    : editableTemplates[0]?.id || '';
 
   const selectedTemplate = useMemo(
-    () => templates.find((template) => template.id === selectedTemplateId) || null,
-    [templates, selectedTemplateId],
+    () => editableTemplates.find((template) => template.id === activeTemplateId) || null,
+    [editableTemplates, activeTemplateId],
   );
 
   const subagentEntries = Object.entries(selectedTemplate?.subagents || {});
@@ -160,10 +171,15 @@ export default function Subagents() {
           <div className="card">
             <div className="form-group">
               <label>Agent 模板</label>
-              <select value={selectedTemplateId} onChange={e => { setSelectedTemplateId(e.target.value); handleNewSubagent(); }}>
-                {templates.length === 0 && <option value="">暂无 Agent 模板</option>}
-                {templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}
+              <select value={activeTemplateId} onChange={e => { setSelectedTemplateId(e.target.value); handleNewSubagent(); }}>
+                {editableTemplates.length === 0 && <option value="">暂无可编辑 Agent 模板</option>}
+                {editableTemplates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}
               </select>
+              {templates.length > editableTemplates.length && (
+                <div style={{ marginTop: 6, color: 'var(--ink-muted)', fontSize: '.74em' }}>
+                  公共 Agent 只能克隆或对话，不能在这里直接编辑子代理。
+                </div>
+              )}
             </div>
 
             <div className="flex-between" style={{ marginBottom: 12 }}>

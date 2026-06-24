@@ -3217,7 +3217,7 @@ export function resolveProviderProfileForModel(tenantId: string, model: string):
   return usable.find(profile => profile.isDefault) || usable[0] || null;
 }
 
-// ═══ Agent Templates (tenant-shared) ═══
+// ═══ Agent Templates (personal + published per tenant) ═══
 db.exec(`
   CREATE TABLE IF NOT EXISTS agent_templates (
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -3229,31 +3229,132 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_agent_templates_tenant ON agent_templates (tenant_id, updated_at DESC);
 `);
 
-export function listAgentTemplates(tenantId: string) {
+function parseAgentTemplateJson(dataJson: string) {
+  try {
+    const parsed = JSON.parse(dataJson);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isDeletedAgentTemplate(template: Record<string, unknown>) {
+  return Boolean(Number(template.deletedAt));
+}
+
+function isPublishedAgentTemplate(template: Record<string, unknown>) {
+  return Boolean(Number(template.publishedAt)) && !Number(template.archivedAt) && !isDeletedAgentTemplate(template);
+}
+
+function agentTemplateCreatedBy(template: Record<string, unknown>) {
+  return typeof template.createdBy === 'string' ? template.createdBy : '';
+}
+
+function canManageAgentTemplate(template: Record<string, unknown>, actorSub?: string | null, actorRole?: Role | null) {
+  if (!actorSub || actorRole === 'tenant_admin') return true;
+  return agentTemplateCreatedBy(template) === actorSub;
+}
+
+function canSeeAgentTemplate(template: Record<string, unknown>, actorSub?: string | null, actorRole?: Role | null) {
+  if (isDeletedAgentTemplate(template)) return false;
+  if (!actorSub || actorRole === 'tenant_admin') return true;
+  return agentTemplateCreatedBy(template) === actorSub || isPublishedAgentTemplate(template);
+}
+
+function normalizeStoredAgentTemplate(
+  tenantId: string,
+  template: Record<string, unknown>,
+  actorSub: string | null | undefined,
+  existing: Record<string, unknown> | null,
+  timestamp: number,
+) {
+  const id = String(template.id || existing?.id || crypto.randomUUID());
+  const createdAt = Number(existing?.createdAt) || Number(template.createdAt) || timestamp;
+  const updatedAt = Number(template.updatedAt) || timestamp;
+  const archivedAt = Number(template.archivedAt) || null;
+  const deletedAt = Number(template.deletedAt) || null;
+  const publishedAt = archivedAt || deletedAt ? null : Number(template.publishedAt) || null;
+  const existingCreatedBy = typeof existing?.createdBy === 'string' && existing.createdBy.trim()
+    ? existing.createdBy
+    : null;
+  const createdBy = existing
+    ? existingCreatedBy ?? actorSub ?? null
+    : actorSub ?? (typeof template.createdBy === 'string' ? template.createdBy : null);
+  return {
+    ...template,
+    id,
+    tenantId,
+    createdBy,
+    publishedAt,
+    archivedAt,
+    deletedAt,
+    createdAt,
+    updatedAt,
+  };
+}
+
+export function listAgentTemplates(tenantId: string, viewerSub?: string | null, viewerRole?: Role | null) {
   const rows = db.prepare(`
     SELECT data_json FROM agent_templates WHERE tenant_id = ? ORDER BY updated_at DESC
   `).all(tenantId) as Array<{ data_json: string }>;
   return rows
-    .map((r) => { try { return JSON.parse(r.data_json); } catch { return null; } })
-    .filter((t): t is Record<string, unknown> => t !== null);
+    .map((r) => parseAgentTemplateJson(r.data_json))
+    .filter((t): t is Record<string, unknown> => Boolean(t && canSeeAgentTemplate(t, viewerSub, viewerRole)));
 }
 
-export function replaceAgentTemplates(tenantId: string, templates: Array<Record<string, unknown>>) {
+export function replaceAgentTemplates(
+  tenantId: string,
+  templates: Array<Record<string, unknown>>,
+  actorSub?: string | null,
+  actorRole?: Role | null,
+) {
+  const timestamp = now();
+  const existingRows = db.prepare(`
+    SELECT id, data_json FROM agent_templates WHERE tenant_id = ?
+  `).all(tenantId) as Array<{ id: string; data_json: string }>;
+  const existing = new Map<string, Record<string, unknown>>();
+  for (const row of existingRows) {
+    const parsed = parseAgentTemplateJson(row.data_json);
+    if (parsed) existing.set(row.id, { ...parsed, id: String(parsed.id || row.id) });
+  }
+  const incoming = new Map<string, Record<string, unknown>>();
+  for (const raw of templates) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const id = String(raw.id || crypto.randomUUID());
+    const previous = existing.get(id) || null;
+    if (previous && !canManageAgentTemplate(previous, actorSub, actorRole)) continue;
+    incoming.set(id, normalizeStoredAgentTemplate(tenantId, { ...raw, id }, actorSub, previous, timestamp));
+  }
+  const merged = new Map<string, Record<string, unknown>>();
+  for (const [id, previous] of existing.entries()) {
+    if (incoming.has(id)) {
+      merged.set(id, incoming.get(id)!);
+      continue;
+    }
+    if (!canManageAgentTemplate(previous, actorSub, actorRole)) {
+      merged.set(id, previous);
+    }
+  }
+  for (const [id, template] of incoming.entries()) {
+    merged.set(id, template);
+  }
+
   db.exec('BEGIN');
   try {
     db.prepare('DELETE FROM agent_templates WHERE tenant_id = ?').run(tenantId);
     const insert = db.prepare('INSERT INTO agent_templates (tenant_id, id, data_json, updated_at) VALUES (?, ?, ?, ?)');
-    for (const t of templates) {
-      const id = String((t as any)?.id || crypto.randomUUID());
-      const updatedAt = Number((t as any)?.updatedAt) || now();
-      insert.run(tenantId, id, JSON.stringify({ ...t, id }), updatedAt);
+    for (const [id, template] of merged.entries()) {
+      const updatedAt = Number(template.updatedAt) || timestamp;
+      insert.run(tenantId, id, JSON.stringify(template), updatedAt);
     }
     db.exec('COMMIT');
   } catch (error) {
     db.exec('ROLLBACK');
     throw error;
   }
-  return listAgentTemplates(tenantId);
+  return listAgentTemplates(tenantId, actorSub, actorRole);
 }
 
 // ═══ Agent Runs (real SDK execution metering) ═══

@@ -25,6 +25,9 @@ import { mapResultSubtypeToOutcome, type RunOutcome } from './src/simulator/run-
 export const MODEL_PRICES: Record<string, { in: number; out: number }> = {
   'deepseek-chat':     { in: 0.27, out: 1.10 },
   'deepseek-reasoner': { in: 0.55, out: 2.19 },
+  // OpenAI（经 Anthropic→OpenAI 翻译网关接入）。
+  // ⚠️ 下列单价为占位，上线前必须用 OpenAI 官方定价（USD / 百万 token）替换，否则计费失真。
+  'gpt-5.5':           { in: 0, out: 0 },
 };
 export function estimateCostUsd(model: string, inputTokens: number, outputTokens: number) {
   const p = MODEL_PRICES[model];

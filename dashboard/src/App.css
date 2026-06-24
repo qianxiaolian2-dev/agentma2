@@ -474,6 +474,109 @@ label {
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 .pulse { animation: pulse 1.5s infinite; }
 
+/* ── Mascot runner — 手绘小人等待动画 ───────────────────────── */
+.mascot-runner {
+  --mr-h: 88px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 0 4px;
+  color: var(--ink-muted, #6b2419);
+  user-select: none;
+}
+.mascot-runner__stage {
+  position: relative;
+  width: min(240px, 64vw);
+  height: var(--mr-h);
+}
+.mascot-runner__runner {
+  position: absolute;
+  left: 50%;
+  bottom: 11px;
+  width: calc(var(--mr-h) * 0.60);
+  height: calc(var(--mr-h) * 0.78);
+  transform: translateX(-50%);
+}
+.mascot-runner__body {
+  display: block;
+  width: 100%;
+  height: 100%;
+  transform-origin: 50% 100%;
+  color: currentColor;
+  animation: mr-hop 0.6s cubic-bezier(.3,.66,.4,1) infinite, mr-wobble 1.2s ease-in-out infinite;
+}
+.mascot-runner__body svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.mascot-runner__shadow {
+  position: absolute;
+  left: 50%;
+  bottom: -3px;
+  width: 64%;
+  height: 9px;
+  transform: translateX(-50%);
+  background: radial-gradient(closest-side, currentColor, transparent 75%);
+  opacity: .22;
+  filter: blur(.5px);
+  animation: mr-shadow 0.6s cubic-bezier(.3,.66,.4,1) infinite;
+}
+.mascot-runner__ground {
+  position: absolute;
+  left: -24px;
+  right: -24px;
+  bottom: 10px;
+  height: 2px;
+  background: repeating-linear-gradient(90deg, currentColor 0 11px, transparent 11px 24px);
+  opacity: .26;
+  animation: mr-ground 0.34s linear infinite;
+}
+.mascot-runner__caption {
+  font-family: "Caveat", "Bradley Hand", "Segoe Print", cursive;
+  font-size: 1.5rem;
+  line-height: 1;
+  letter-spacing: .01em;
+  opacity: .9;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 1px;
+}
+.mascot-runner__word { animation: mr-word .34s ease both; }
+.mascot-runner__dots i {
+  font-style: normal;
+  opacity: .2;
+  animation: mr-dot 1.2s infinite;
+}
+.mascot-runner__dots i:nth-child(2) { animation-delay: .2s; }
+.mascot-runner__dots i:nth-child(3) { animation-delay: .4s; }
+
+@keyframes mr-hop {
+  0%   { transform: translateY(0)     scaleX(1.05) scaleY(.92); }
+  16%  { transform: translateY(-7%)   scaleX(.97)  scaleY(1.06); }
+  50%  { transform: translateY(-48%)  scaleX(.99)  scaleY(1.02); }
+  84%  { transform: translateY(-7%)   scaleX(.98)  scaleY(1.04); }
+  100% { transform: translateY(0)     scaleX(1.05) scaleY(.92); }
+}
+@keyframes mr-wobble {
+  0%, 100% { rotate: -5deg; }
+  50%      { rotate: 5deg; }
+}
+@keyframes mr-shadow {
+  0%, 100% { transform: translateX(-50%) scale(1);   opacity: .24; }
+  50%      { transform: translateX(-50%) scale(.55); opacity: .08; }
+}
+@keyframes mr-ground { to { background-position-x: -24px; } }
+@keyframes mr-dot { 0%, 80%, 100% { opacity: .2; } 40% { opacity: 1; } }
+@keyframes mr-word { from { opacity: 0; transform: translateY(3px) rotate(-2deg); } to { opacity: .9; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .mascot-runner__body,
+  .mascot-runner__shadow,
+  .mascot-runner__ground,
+  .mascot-runner__word,
+  .mascot-runner__dots i { animation: none; }
+  .mascot-runner__body { rotate: -3deg; }
+  .mascot-runner__dots i { opacity: .6; }
+}
+
 /* Chat bubbles */
 .chat-container {
   display: flex; flex-direction: column;
@@ -992,6 +1095,14 @@ label {
 }
 
 .agent-card-name { font-weight: 700; font-size: .95em; }
+.agent-card-owner {
+  margin-top: 2px;
+  font-size: .7em;
+  color: var(--ink-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .agent-card-actions {
   display: inline-flex;
   align-items: center;
@@ -1023,6 +1134,32 @@ label {
 }
 .agent-card-desc { font-size: .8em; color: var(--ink-secondary); margin-top: 4px; line-height: 1.5; }
 .agent-card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+
+.agents-market-sections {
+  display: grid;
+  gap: 18px;
+}
+
+.agents-market-section {
+  display: grid;
+  gap: 10px;
+}
+
+.agents-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.agents-empty-panel {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 22px;
+  color: var(--ink-muted);
+  text-align: center;
+  background: var(--bg-card);
+}
 
 .agents-list-toolbar {
   display: flex;
@@ -2912,4 +3049,142 @@ tr:hover td {
     letter-spacing: 0.14em;
     white-space: normal;
   }
+}
+
+/* ===== Cosmic 3D 作用域(仅登录页 + 总览页) ===== */
+.cosmic-route {
+  --bg: transparent;
+  --bg-card: rgba(18, 22, 40, .55);
+  --bg-hover: rgba(255, 255, 255, .06);
+  --ink: #f5f5f4;
+  --ink-secondary: #c7c9d1;
+  --ink-muted: #8b8fa3;
+  --border: rgba(255, 255, 255, .12);
+  background:
+    radial-gradient(120% 120% at 50% 30%, #141a33 0%, #0b1020 45%, #05060d 100%);
+}
+
+.cosmic-route .login-card,
+.cosmic-route .kpi-card,
+.cosmic-route .tool-card,
+.cosmic-route .card {
+  background: var(--bg-card);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-color: var(--border);
+}
+
+/* 登录页:深空底铺满,内容浮层 */
+.cosmic-route.login-page {
+  background:
+    radial-gradient(120% 120% at 50% 30%, #141a33 0%, #0b1020 45%, #05060d 100%);
+}
+.cosmic-route .login-shell { position: relative; z-index: 1; perspective: 1000px; }
+.cosmic-route .login-card { transform-style: preserve-3d; will-change: transform; }
+.cosmic-route .login-card input {
+  background: rgba(255, 255, 255, .06);
+  color: var(--ink);
+  border-color: var(--border);
+}
+.cosmic-route .login-card input::placeholder { color: var(--ink-muted); }
+
+/* 主按钮:在深色作用域内用 accent 蓝(覆盖站点的深色药丸按钮样式) */
+.cosmic-route .btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.cosmic-route .btn-primary:hover { background: var(--accent-hover); }
+.cosmic-route .login-word { filter: drop-shadow(0 0 12px rgba(120, 150, 255, .5)); }
+.cosmic-route .login-tag { color: var(--ink-secondary); }
+
+/* 总览:画布锁在内容面板内,深空底铺满面板 */
+.main-content.cosmic {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 120% at 50% 20%, #141a33 0%, #0b1020 45%, #05060d 100%);
+}
+.main-content.cosmic .console-topbar { position: relative; z-index: 1; background: transparent; }
+.cosmic-overview { perspective: 1600px; }
+.cosmic-overview > .cosmic-content { position: relative; z-index: 1; }
+
+/* 功能宇宙 */
+.universe-wrap { position: relative; margin-bottom: 24px; }
+.universe-stage {
+  position: relative;
+  width: 100%;
+  height: min(64vh, 620px);
+  min-height: 420px;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: radial-gradient(120% 120% at 50% 40%, rgba(20, 26, 51, .45), rgba(5, 6, 13, .15));
+}
+.universe-labels { position: absolute; inset: 0; pointer-events: none; }
+
+/* 星图目录风标签:细引线 + 编号 + 手写名,不用毛玻璃 */
+.planet-tag {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  transform-origin: bottom center;
+}
+.planet-tag::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 1px;
+  height: 26px;
+  background: linear-gradient(var(--c), transparent);
+}
+.planet-tag-code {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: .22em;
+  color: var(--ink-muted);
+  line-height: 1;
+}
+.planet-tag-name {
+  font-family: var(--font-hand);
+  font-size: 19px;
+  line-height: 1.1;
+  color: var(--c);
+  white-space: nowrap;
+  border-bottom: 1.5px solid color-mix(in srgb, var(--c) 60%, transparent);
+  padding-bottom: 1px;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, .55);
+}
+.planet-tag-desc {
+  display: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--ink-secondary);
+  max-width: 190px;
+  white-space: normal;
+  margin-top: 3px;
+}
+.planet-tag.is-hover { z-index: 3; }
+.planet-tag.is-hover .planet-tag-name { text-shadow: 0 0 12px var(--c); }
+.planet-tag.is-hover .planet-tag-desc { display: block; }
+.universe-hint {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 12px;
+  color: var(--ink-muted);
+  pointer-events: none;
 }

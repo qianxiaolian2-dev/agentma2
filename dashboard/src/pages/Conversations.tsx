@@ -16,6 +16,7 @@ import { findPendingRunMessage, observeServerRun } from '../utils/chat-run-event
 import { fetchProviderModels, listProviderModels, loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
+import MascotRunner from '../components/MascotRunner';
 import ChatModelPicker from '../components/ChatModelPicker';
 import {
   deriveRunPhase,
@@ -1740,8 +1741,8 @@ export default function Conversations() {
               {isSessionDetailLoading && !isStreaming && (
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--ink-muted)' }}>
                   <div style={{ textAlign: 'center' }}>
-                    <div style={{ fontWeight: 700 }}>正在读取历史消息...</div>
-                    <div style={{ fontSize: '.82em', maxWidth: 300, marginTop: 4 }}>历史列表已可操作，完整消息会话加载完成后自动显示。</div>
+                    <MascotRunner caption="正在翻历史" height={104} />
+                    <div style={{ fontSize: '.82em', maxWidth: 300, marginTop: 6 }}>历史列表已可操作，完整消息会话加载完成后自动显示。</div>
                   </div>
                 </div>
               )}

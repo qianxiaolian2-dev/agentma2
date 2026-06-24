@@ -3,6 +3,7 @@ import type { MouseEvent } from 'react';
 import type { ChatAttachment, ChatMessage, ChatImageAttachment } from '../simulator/types';
 import { renderMarkdown } from '../utils/render-markdown';
 import { normalizeMessageOutcome, outcomeBadgeClass, outcomeColor, outcomeLabel } from '../simulator/run-state';
+import MascotRunner from './MascotRunner';
 
 type Props = {
   message: ChatMessage;
@@ -115,6 +116,14 @@ function ChatMessageBubble({ message }: Props) {
       }, 1500);
     });
   };
+
+  if (isPending) {
+    return (
+      <div className="chat-msg assistant" style={{ position: 'relative' }}>
+        <MascotRunner height={80} />
+      </div>
+    );
+  }
 
   return (
     <div

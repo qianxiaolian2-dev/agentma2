@@ -97,6 +97,10 @@ function normalizeAgentTemplate(value: unknown): AgentTemplate | null {
     useKnowledge: raw.useKnowledge === true ? true : undefined,
     knowledgeSourceIds: normalizeStringArray(raw.knowledgeSourceIds),
     seedDir: typeof raw.seedDir === 'string' && raw.seedDir.trim() ? raw.seedDir : undefined,
+    createdBy: typeof raw.createdBy === 'string' && raw.createdBy.trim() ? raw.createdBy : null,
+    publishedAt: Number(raw.publishedAt) || null,
+    archivedAt: Number(raw.archivedAt) || null,
+    deletedAt: Number(raw.deletedAt) || null,
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
   };

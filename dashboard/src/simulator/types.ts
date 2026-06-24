@@ -417,6 +417,10 @@ export interface AgentTemplate {
   knowledgeSourceIds?: string[];
   // 导入本地 Claude Code 项目时生成的模板级 seed 仓路径。
   seedDir?: string;
+  createdBy?: string | null;
+  publishedAt?: number | null;
+  archivedAt?: number | null;
+  deletedAt?: number | null;
   createdAt: number;
   updatedAt: number;
 }

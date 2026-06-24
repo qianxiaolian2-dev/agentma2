@@ -131,6 +131,10 @@ function cloneTemplate(source: AgentTemplate, templates: AgentTemplate[]): Agent
     ...cloned,
     id: getCloneTemplateId(templates, now),
     name: getCloneTemplateName(source.name, templates),
+    createdBy: undefined,
+    publishedAt: null,
+    archivedAt: null,
+    deletedAt: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -146,6 +150,14 @@ const TOOL_CATEGORIES = [
   { name: 'notebook', label: 'Notebook', tools: ['NotebookEdit'] },
 ];
 const KNOWLEDGE_TOOLS = ['Read', 'Grep', 'Glob'];
+
+function userAgentActor(user: { email?: string; id?: string } | null) {
+  return user?.email || user?.id || '';
+}
+
+function isPublishedAgent(template: AgentTemplate) {
+  return Boolean(template.publishedAt) && !template.archivedAt && !template.deletedAt;
+}
 
 type ModelPickerProps = {
   value: string;
@@ -303,6 +315,12 @@ export default function Agents() {
   const selectedModel = form.model.trim();
   const selectedModelAvailable = selectedModel ? availableModelSet.has(selectedModel) : false;
   const providerMatch = selectedModelAvailable ? resolveProviderForModel(selectedModel) : null;
+  const actor = userAgentActor(user || null);
+  const canManageTemplate = (template: AgentTemplate) => user?.role === 'tenant_admin' || Boolean(actor && template.createdBy === actor);
+  const publicTemplates = templates.filter(template => isPublishedAgent(template));
+  const mineTemplates = templates.filter(template => canManageTemplate(template));
+  const visibleTemplateIds = new Set([...publicTemplates, ...mineTemplates].map(template => template.id));
+  const hiddenTemplateCount = templates.length - visibleTemplateIds.size;
 
   useEffect(() => {
     fetch('/api/events/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'list' }) })
@@ -482,6 +500,10 @@ export default function Agents() {
       id: form.id || `agent-${now}`,
       name: form.name.trim(),
       model: selectedModel,
+      createdBy: form.createdBy || actor || null,
+      publishedAt: form.publishedAt || null,
+      archivedAt: form.archivedAt || null,
+      deletedAt: form.deletedAt || null,
       knowledgeSourceIds: selectedKnowledgeIds,
       useKnowledge: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge || undefined,
       providerOverrides: undefined,
@@ -509,8 +531,58 @@ export default function Agents() {
     }
   };
 
+  const handlePublish = async (source: AgentTemplate) => {
+    if (!user?.tenantId || !canManageTemplate(source)) return;
+    const published: AgentTemplate = {
+      ...source,
+      createdBy: source.createdBy || actor || null,
+      publishedAt: Date.now(),
+      archivedAt: null,
+      deletedAt: null,
+      updatedAt: Date.now(),
+    };
+    const nextTemplates = templates.map(template => template.id === source.id ? published : template);
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      setTemplates(persisted);
+      setForm(current => current.id === source.id ? (persisted.find(template => template.id === source.id) || published) : current);
+      setError('');
+    } catch (saveError) {
+      setError((saveError as Error).message || '发布 Agent 失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleUnpublish = async (source: AgentTemplate) => {
+    if (!user?.tenantId || !canManageTemplate(source)) return;
+    const unpublished: AgentTemplate = {
+      ...source,
+      publishedAt: null,
+      updatedAt: Date.now(),
+    };
+    const nextTemplates = templates.map(template => template.id === source.id ? unpublished : template);
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      setTemplates(persisted);
+      setForm(current => current.id === source.id ? (persisted.find(template => template.id === source.id) || unpublished) : current);
+      setError('');
+    } catch (saveError) {
+      setError((saveError as Error).message || '撤回 Agent 失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   const handleDelete = async (id: string) => {
     if (!user?.tenantId) return;
+    const target = templates.find(template => template.id === id);
+    if (target && !canManageTemplate(target)) {
+      setError('只能删除自己创建的 Agent');
+      return;
+    }
     const nextTemplates = templates.filter(t => t.id !== id);
     setIsSaving(true);
     try {
@@ -704,6 +776,113 @@ export default function Agents() {
     return `${Math.round((bytes || 0) / 1024)} KB`;
   };
 
+  const renderTemplateCard = (t: AgentTemplate, scope: 'public' | 'mine') => {
+    const manageable = canManageTemplate(t);
+    const published = isPublishedAgent(t);
+    const ownerLabel = t.createdBy
+      ? (t.createdBy === actor ? '你创建' : `创建人 ${t.createdBy}`)
+      : '创建人未知';
+    return (
+      <div
+        key={`${scope}-${t.id}`}
+        className={`agent-card ${form.id === t.id ? 'selected' : ''}`}
+        onClick={() => manageable ? handleSelect(t) : undefined}
+        style={{ cursor: manageable ? 'pointer' : 'default' }}
+      >
+        <div className="agent-card-head">
+          <div style={{ minWidth: 0 }}>
+            <div className="agent-card-name">{t.name}</div>
+            <div className="agent-card-owner">{ownerLabel}</div>
+          </div>
+          <div className="agent-card-actions">
+            <span className="agent-card-date">
+              {new Date(t.updatedAt).toLocaleDateString()}
+            </span>
+            <button
+              type="button"
+              className="btn btn-sm agent-card-preview-btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                void openClaudeMdPreview(t);
+              }}
+              disabled={isSaving || !t.id}
+              title={`预览 ${t.name} 运行时生效的 CLAUDE.md`}
+            >
+              CLAUDE.md
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm agent-card-clone-btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                void handleClone(t);
+              }}
+              disabled={isSaving || !t.id}
+              title={`克隆 ${t.name} 为新 Agent 模板`}
+            >
+              克隆
+            </button>
+            {manageable && (
+              <>
+                {published ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleUnpublish(t);
+                    }}
+                    disabled={isSaving || !t.id}
+                  >
+                    撤回
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handlePublish(t);
+                    }}
+                    disabled={isSaving || !t.id}
+                  >
+                    发布
+                  </button>
+                )}
+              </>
+            )}
+            <button
+              type="button"
+              className="btn btn-sm btn-primary agent-card-chat-btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                startChat(t.id);
+              }}
+              disabled={isSaving || !t.id}
+              title={`和 ${t.name} 开始对话`}
+            >
+              开始对话
+            </button>
+          </div>
+        </div>
+        <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
+        <div className="agent-card-tags">
+          <span className="badge badge-muted">{t.model}</span>
+          <span className={`badge ${published ? 'badge-success' : 'badge-muted'}`}>{published ? '公共' : '个人'}</span>
+          {manageable ? <span className="badge badge-info">可编辑</span> : <span className="badge badge-muted">只读</span>}
+          {t.seedDir && <span className="badge badge-warning">本地项目 seed</span>}
+          {((t.knowledgeSourceIds || []).length > 0 || t.useKnowledge) && (
+            <span className="badge badge-success">
+              知识库×{(t.knowledgeSourceIds || []).length || liveKnowledgeSources.filter(source => source.enabled).length || '全部'}
+            </span>
+          )}
+          {t.tools.slice(0, 3).map(tool => <span key={tool} className="badge badge-info">{tool}</span>)}
+          {t.tools.length > 3 && <span className="badge badge-muted">+{t.tools.length - 3}</span>}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div>
       <div className="page-header">
@@ -751,71 +930,45 @@ export default function Agents() {
               暂无 Agent，点击上方按钮创建
             </div>
           ) : (
-            <div className="agents-list-grid">
-              {templates.map(t => (
-                <div
-                  key={t.id}
-                  className={`agent-card ${form.id === t.id ? 'selected' : ''}`}
-                  onClick={() => handleSelect(t)}
-                >
-                  <div className="agent-card-head">
-                    <div className="agent-card-name">{t.name}</div>
-                    <div className="agent-card-actions">
-                      <span className="agent-card-date">
-                        {new Date(t.updatedAt).toLocaleDateString()}
-                      </span>
-                      <button
-                        type="button"
-                        className="btn btn-sm agent-card-preview-btn"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void openClaudeMdPreview(t);
-                        }}
-                        disabled={isSaving || !t.id}
-                        title={`预览 ${t.name} 运行时生效的 CLAUDE.md`}
-                      >
-                        CLAUDE.md
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm agent-card-clone-btn"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void handleClone(t);
-                        }}
-                        disabled={isSaving || !t.id}
-                        title={`克隆 ${t.name} 为新 Agent 模板`}
-                      >
-                        克隆
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-primary agent-card-chat-btn"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          startChat(t.id);
-                        }}
-                        disabled={isSaving || !t.id}
-                        title={`和 ${t.name} 开始对话`}
-                      >
-                        开始对话
-                      </button>
-                    </div>
-                  </div>
-                  <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
-                  <div className="agent-card-tags">
-                    <span className="badge badge-muted">{t.model}</span>
-                    {t.seedDir && <span className="badge badge-warning">本地项目 seed</span>}
-                    {((t.knowledgeSourceIds || []).length > 0 || t.useKnowledge) && (
-                      <span className="badge badge-success">
-                        知识库×{(t.knowledgeSourceIds || []).length || liveKnowledgeSources.filter(source => source.enabled).length || '全部'}
-                      </span>
-                    )}
-                    {t.tools.slice(0, 3).map(tool => <span key={tool} className="badge badge-info">{tool}</span>)}
-                    {t.tools.length > 3 && <span className="badge badge-muted">+{t.tools.length - 3}</span>}
+            <div className="agents-market-sections">
+              <section className="agents-market-section">
+                <div className="agents-section-head">
+                  <div>
+                    <div className="card-header" style={{ marginBottom: 3 }}>公共 Agent</div>
+                    <div className="tool-card-desc">已发布 {publicTemplates.length} 个，租户内成员都可以看到并使用。</div>
                   </div>
                 </div>
-              ))}
+                {publicTemplates.length === 0 ? (
+                  <div className="agents-empty-panel">
+                    还没有公共 Agent。可以从“我的 Agent”发布一个。
+                  </div>
+                ) : (
+                  <div className="agents-list-grid">
+                    {publicTemplates.map(template => renderTemplateCard(template, 'public'))}
+                  </div>
+                )}
+              </section>
+
+              <section className="agents-market-section">
+                <div className="agents-section-head">
+                  <div>
+                    <div className="card-header" style={{ marginBottom: 3 }}>我的 Agent</div>
+                    <div className="tool-card-desc">
+                      已拥有 {mineTemplates.length} 个。未发布的 Agent 只有创建人可见；发布后会出现在公共 Agent 中。
+                      {hiddenTemplateCount > 0 ? ` 另有 ${hiddenTemplateCount} 个不可编辑的公共项仅显示在上方。` : ''}
+                    </div>
+                  </div>
+                </div>
+                {mineTemplates.length === 0 ? (
+                  <div className="agents-empty-panel">
+                    暂无个人 Agent，点击上方按钮创建或克隆公共 Agent。
+                  </div>
+                ) : (
+                  <div className="agents-list-grid">
+                    {mineTemplates.map(template => renderTemplateCard(template, 'mine'))}
+                  </div>
+                )}
+              </section>
             </div>
           )}
         </div>

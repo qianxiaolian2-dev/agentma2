@@ -83,6 +83,7 @@ import {
   resolveAskUserQuestion,
 } from './server-agent.ts';
 import type { AgentEvent } from './server-agent.ts';
+import type { Role } from './server-store.ts';
 import {
   importDatasourceUpload,
   runDatasourceQuery,
@@ -1115,6 +1116,26 @@ function normalizeAgentTemplateForApi(value: unknown): Record<string, unknown> {
   return template;
 }
 
+function agentTemplateActor(auth: { sub: string; email?: string }) {
+  return auth.email || auth.sub;
+}
+
+type AgentTemplateAuth = { tenantId: string; sub: string; email?: string; role?: Role | null };
+
+function listVisibleAgentTemplates(auth: AgentTemplateAuth) {
+  return listAgentTemplates(auth.tenantId, agentTemplateActor(auth), auth.role).map(normalizeAgentTemplateForApi);
+}
+
+function getVisibleAgentTemplate(auth: AgentTemplateAuth, templateId: string) {
+  const id = templateId.trim();
+  if (!id) return null;
+  return listVisibleAgentTemplates(auth).find((template) => String(template.id || '') === id) || null;
+}
+
+function canManageAgentTemplate(auth: { sub: string; email?: string; role?: Role | null }, template: Record<string, unknown>) {
+  return auth.role === 'tenant_admin' || String(template.createdBy || '') === agentTemplateActor(auth);
+}
+
 type ClaudeMdPreviewSource = 'user' | 'project' | 'local';
 type ClaudeMdPreviewFile = {
   source: ClaudeMdPreviewSource;
@@ -1475,9 +1496,8 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const { prompt, messages: inputMessages, systemPrompt, model, provider, tools: requestTools } = req.body || {};
   const subagents = normalizeSubagents(req.body?.subagents);
   const templateId = typeof req.body?.templateId === 'string' ? req.body.templateId.trim() : '';
-  const template = templateId
-    ? listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi).find((item) => String(item.id || '') === templateId)
-    : null;
+  const template = templateId ? getVisibleAgentTemplate(req.auth, templateId) : null;
+  if (templateId && !template) { res.status(404).json({ error: 'agent not found' }); return; }
   const sessionId = typeof req.body?.sessionId === 'string' && req.body.sessionId.trim()
     ? req.body.sessionId.trim()
     : `chat-${Date.now()}`;
@@ -3178,9 +3198,9 @@ app.post('/api/skills/workspace/install', authMiddleware, (req: any, res) => {
   }
 });
 
-// ═══ Agent Templates Routes (tenant-shared) ═══
+// ═══ Agent Templates Routes (personal + published) ═══
 app.get('/api/agents', authMiddleware, (req: any, res) => {
-  res.json(listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi));
+  res.json(listVisibleAgentTemplates(req.auth));
 });
 
 app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any, res) => {
@@ -3188,7 +3208,7 @@ app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any
     const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : [];
     if (!files.length) { res.status(400).json({ error: '请选择要导入的项目目录' }); return; }
 
-    const currentTemplates = listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi);
+    const currentTemplates = listVisibleAgentTemplates(req.auth);
     const mode = String(req.body?.mode || 'new').trim();
     const mergeTargetId = mode.startsWith('merge:')
       ? mode.slice('merge:'.length).trim()
@@ -3207,7 +3227,7 @@ app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any
     const nextTemplates = mergeTargetId
       ? currentTemplates.map((item) => String(item.id || '') === templateId ? template : item)
       : [template, ...currentTemplates.filter((item) => String(item.id || '') !== templateId)];
-    const saved = replaceAgentTemplates(req.auth.tenantId, nextTemplates).map(normalizeAgentTemplateForApi);
+    const saved = replaceAgentTemplates(req.auth.tenantId, nextTemplates, agentTemplateActor(req.auth), req.auth.role).map(normalizeAgentTemplateForApi);
     const savedTemplate = saved.find((item) => String(item.id || '') === templateId) || template;
     audit(req.auth.tenantId, 'import_agent', req.auth.sub, 'agent', templateId, summarizeAgentImportReport(report));
     res.json({ template: savedTemplate, report });
@@ -3219,9 +3239,7 @@ app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any
 
 app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
   const agentId = String(req.params.id || '').trim();
-  const agent = listAgentTemplates(req.auth.tenantId)
-    .map(normalizeAgentTemplateForApi)
-    .find((template) => String(template.id || '') === agentId);
+  const agent = getVisibleAgentTemplate(req.auth, agentId);
   if (!agent) { res.status(404).json({ error: 'agent not found' }); return; }
 
   const latestSession = getLatestAgentRuntimeSession(req.auth.tenantId, getChatOwnerSub(req.auth), agentId);
@@ -3263,16 +3281,18 @@ app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
 
 app.put('/api/agents', authMiddleware, (req: any, res) => {
   const list = Array.isArray(req.body) ? req.body.map(normalizeAgentTemplateForApi) : [];
+  const actor = agentTemplateActor(req.auth);
   const previous = listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi);
-  const saved = replaceAgentTemplates(req.auth.tenantId, list);
-  const savedIds = new Set(saved.map((template) => String((template as Record<string, unknown>).id || '')));
+  const saved = replaceAgentTemplates(req.auth.tenantId, list, actor, req.auth.role);
+  const allAfterSave = listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi);
+  const savedIds = new Set(allAfterSave.map((template) => String((template as Record<string, unknown>).id || '')));
   for (const template of previous) {
     const templateId = String(template.id || '');
-    if (!templateId || savedIds.has(templateId) || typeof template.seedDir !== 'string') continue;
+    if (!templateId || savedIds.has(templateId) || !canManageAgentTemplate(req.auth, template) || typeof template.seedDir !== 'string') continue;
     fs.rmSync(agentSeedDir(req.auth.tenantId, templateId), { recursive: true, force: true });
   }
   audit(req.auth.tenantId, 'replace_agents', req.auth.sub, 'user', `agents:${req.auth.tenantId}`, { count: saved.length });
-  res.json(saved);
+  res.json(saved.map(normalizeAgentTemplateForApi));
 });
 
 // ═══ Visual Artifacts Routes ═══
@@ -3522,8 +3542,12 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   if (!prompt || typeof prompt !== 'string') { res.status(400).json({ error: 'need prompt' }); return; }
   const tmpl = template || {};
   const storedTemplate = typeof tmpl?.id === 'string' && tmpl.id.trim()
-    ? listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi).find((item) => String(item.id || '') === tmpl.id.trim())
+    ? getVisibleAgentTemplate(req.auth, tmpl.id.trim())
     : null;
+  if (typeof tmpl?.id === 'string' && tmpl.id.trim() && !storedTemplate) {
+    res.status(404).json({ error: 'agent not found' });
+    return;
+  }
   const subagents = normalizeSubagents(tmpl?.subagents);
   const knowledgeSourceIds = normalizeStringArray(tmpl?.knowledgeSourceIds) || [];
   const datasourceIds = normalizeStringArray(tmpl?.datasourceIds ?? storedTemplate?.datasourceIds) || [];
