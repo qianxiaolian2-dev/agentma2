@@ -193,7 +193,7 @@ export async function bootstrapAgentTemplates(tenantId: string, allowLegacyImpor
 function createVizAgentSystemPrompt(existingPrompt?: string) {
   const basePrompt = (existingPrompt || [
     '你是 AgentMa 的可视化助手。',
-    '当用户要求图表、看板、报告页、结构化表格、流程图或可视化摘要时,优先使用 agentma-visual skill。',
+    '当用户要求图表、看板、报告页、结构化表格、流程图或可视化摘要时,用 Write 工具生成自包含的 HTML 页面。',
     '把 HTML 写到当前会话 workspace 的 ./viz/<slug>.html,然后给出服务端注入的预览链接。',
     'HTML 必须自包含,不要引用外部资源;需要交互时使用内联脚本。',
     '回复要简洁,说明临时预览未保存时可能失效,预览页可点击保存。',
@@ -210,7 +210,7 @@ function createVizAgentSystemPrompt(existingPrompt?: string) {
     '思维导图只能在首次渲染和用户明确点击“居中/适配”按钮时自动 fit;其它交互不要调用 fit/resetZoom/autoScale。',
     '思维导图默认折叠态必须只显示中心主题和一级分支;实现时可把一级分支节点设为 collapsed,但不能隐藏一级分支本身。',
     '紧凑只能减少空白,不能牺牲具体信息;节点至少保留标题和一行说明。',
-    '生成可视化时不要在正文输出 HTML 或长篇过程;先完成 Skill/Write,最后只给预览链接和简短说明。',
+    '生成可视化时不要在正文输出 HTML 或长篇过程;先用 Write 写文件,最后只给预览链接和简短说明。',
     '交付链接前尽量做 smoke:默认/全展开节点与连线数量匹配、无节点重叠、无缺坐标、截图非空且关键文本不被裁切;失败先自修。',
   ].join('\n');
 
@@ -229,7 +229,7 @@ function createVizAgentTemplate(model: string): AgentTemplate {
     subagents: {},
     mcpServers: [],
     eventSources: [],
-    skills: ['agentma-visual'],
+    skills: [],
     effort: 'high',
     maxTurns: 50,
     permissionMode: 'default',
@@ -241,7 +241,7 @@ function createVizAgentTemplate(model: string): AgentTemplate {
 
 function upgradeVizAgentTemplate(template: AgentTemplate): AgentTemplate {
   const systemPrompt = createVizAgentSystemPrompt(template.systemPrompt);
-  const skills = mergeStringArrays(template.skills, ['agentma-visual']);
+  const skills = [];  // 不再依赖 agentma-visual skill
   const tools = mergeStringArrays(template.tools, VIZ_AGENT_REQUIRED_TOOLS);
 
   if (

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { Link } from 'react-router-dom';
 import { Canvas } from './Canvas';
 import { PropertyPanel } from './PropertyPanel';
 import { ChatPanel } from './ChatPanel';
@@ -344,7 +345,7 @@ export default function DashboardStudio({
     <div className={`ds-root ${previewMode ? 'ds-preview-mode' : ''}`}>
       <header className="ds-topbar">
         <div className="ds-topbar-left">
-          <h2 className="ds-title">{layout?.meta.title || '看板工坊'}</h2>
+          <h2 className="ds-title">{layout?.meta.title || '版本工作台'}</h2>
           {profile && (
             <span className="ds-scenario-tag">
               {SCENARIO_LABEL[profile.scenario] || profile.scenario}
@@ -389,11 +390,11 @@ export default function DashboardStudio({
             value={activeDsId || ''}
             onChange={(e) => e.target.value && onSelectDatasource(e.target.value)}
           >
-            <option value="">选择数据源…</option>
+            <option value="">补选数据源…</option>
             {datasources.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
           </select>
-          <button className="ds-btn ds-btn-primary" onClick={() => fileInputRef.current?.click()}>
-            ⬆ 上传 CSV/Excel
+          <button className="ds-btn" onClick={() => fileInputRef.current?.click()}>
+            ⬆ 补传 CSV/Excel
           </button>
           <input
             ref={fileInputRef}
@@ -507,15 +508,19 @@ function AddWidgetMenu({ onAdd }: { onAdd: (t: WidgetType) => void }) {
   );
 }
 
-function EmptyState({ onUpload }: { onUpload: () => void }) {  return (
+function EmptyState({ onUpload }: { onUpload: () => void }) {
+  return (
     <div className="ds-empty">
       <div className="ds-empty-card">
         <div className="ds-empty-emoji">📊</div>
-        <div className="ds-empty-title">上传数据,AI 自动生成专属看板</div>
-        <div className="ds-empty-hint">支持 CSV / Excel / SQLite,识别字段语义后推荐图表组合</div>
-        <button className="ds-btn ds-btn-primary" onClick={onUpload}>选择文件</button>
-        <div className="ds-empty-hint" style={{ marginTop: 16 }}>或从顶部下拉选择已上传的数据源</div>
-        <div className="ds-empty-hint">首版生成后会自动保存到下方“我的看板”列表</div>
+        <div className="ds-empty-title">会话先定方案,工坊再做版本化落地</div>
+        <div className="ds-empty-hint">模型选择、业务文件上传、Agent 和技能调用优先放在会话里完成。</div>
+        <div className="ds-empty-actions">
+          <Link className="ds-btn ds-btn-primary" to="/conversations">去会话上传并设计</Link>
+          <button className="ds-btn" onClick={onUpload}>补传数据文件</button>
+        </div>
+        <div className="ds-empty-note">当前如果要进入可拖拽编辑，仍需要选择已有数据源，或在这里补传 CSV / Excel / SQLite 生成数据源。</div>
+        <div className="ds-empty-hint">首版生成后会自动保存到下方“看板版本仓库”</div>
       </div>
     </div>
   );

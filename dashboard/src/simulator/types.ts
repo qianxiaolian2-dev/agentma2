@@ -525,6 +525,7 @@ export interface ChatSession {
   model: string;
   sdkSessionId?: string;
   sdkCwd?: string;
+  sourceVisualId?: string;
   forkedFromSessionId?: string;
   forkedFromTitle?: string;
   collaborationEnabled?: boolean;

@@ -21,6 +21,8 @@
     "smoke:permission-rules": "node scripts/smoke-permission-rules.mjs",
     "smoke:skills-public": "node scripts/smoke-skills-public.mjs",
     "smoke:visuals": "node scripts/smoke-visuals.mjs",
+    "e2e:visual-update": "node scripts/e2e-visual-update.mjs",
+    "e2e:visual-fallback": "node scripts/e2e-visual-fallback.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"

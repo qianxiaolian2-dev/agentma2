@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { ClipboardEvent } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig, ChatAttachment, ChatImageMimeType } from '../simulator/types';
+import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig, ChatAttachment, ChatFileAttachment, ChatImageMimeType } from '../simulator/types';
 import { initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
-import { getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
+import { describeApiFetchError, getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
 import { PermissionPromptList, type PermissionRequest } from '../components/PermissionPrompt';
 import { AskUserQuestionPromptList, type AskUserQuestionRequest } from '../components/AskUserQuestionPrompt';
 import { useAuth } from '../contexts/AuthContext';
@@ -51,6 +51,7 @@ import {
   setChatSessionCollaboration,
   subscribeChatSessionEvents,
 } from '../utils/chat-sessions';
+import { getSavedVisual } from './DashboardStudio/api';
 
 // MCP 服务状态指示灯（自动 ping 端点）
 function McpStatusDot({ server, endpoint }: { server: string; endpoint: string }) {
@@ -127,6 +128,53 @@ function formatShortId(value?: string | null) {
   return value ? value.slice(0, 5) : '-';
 }
 
+function utf8ToBase64(value: string) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function sanitizeVisualFileName(title?: string) {
+  const normalized = (title || 'saved-visual')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+  return `${normalized || 'saved-visual'}.html`;
+}
+
+type ResumeVisualContext = {
+  visualId: string;
+  title: string;
+  workspacePath: string;
+  attachment: ChatFileAttachment;
+};
+
+function slugifyVisualFileName(title?: string) {
+  return (title || 'saved-visual')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'saved-visual';
+}
+
+function buildResumeVisualPrompt(context: ResumeVisualContext, userRequest: string) {
+  return [
+    '请基于随消息附带的已保存 HTML 页面继续修改。',
+    `当前基线页面：${context.title || '未命名页面'}`,
+    `当前基线文件：${context.attachment.name}`,
+    `工作区内已写入同一份基线文件：./${context.workspacePath}`,
+    '注意：这里的“现有项目”就是这份已保存 HTML 页面，不是旧会话的历史工作目录。',
+    '先直接阅读 ./baseline 下这份 HTML，理解现有布局、模块和样式，然后基于它改版，并把新的 HTML 写到 ./viz/<slug>.html。',
+    '不要通过 pwd、ls、find、grep 去寻找旧项目路径；这次运行使用的是新的临时工作区。',
+    userRequest ? `[本轮修改要求]\n${userRequest}` : '如果用户暂时没有补充要求，先概述你理解到的现有页面结构，再询问要改哪一部分。',
+  ].join('\n\n');
+}
+
 function compareChatSessions(a: ChatSession, b: ChatSession) {
   if (a.pinned && !b.pinned) return -1;
   if (!a.pinned && b.pinned) return 1;
@@ -140,7 +188,8 @@ function getSessionsForAgent(sessions: ChatSession[], agentId: string) {
 }
 
 function canResumeSessionForAgent(session: ChatSession | null | undefined, agent: AgentTemplate | null | undefined) {
-  if (!session?.sdkSessionId || !agent) return false;
+  if (!session || !agent) return false;
+  if (!session.sdkSessionId && !session.sdkCwd) return false;
   return session.templateId === agent.id;
 }
 
@@ -166,10 +215,12 @@ export default function Conversations() {
   const requestedConversationId = searchParams.get('conversationId') || '';
   const requestedSessionId = searchParams.get('sdkSessionId') || searchParams.get('sessionId') || '';
   const requestedDraft = searchParams.get('draft') || '';
+  const requestedVisualId = searchParams.get('visualId') || '';
   const { user } = useAuth();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [sessionsError, setSessionsError] = useState('');
+  const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
   const [selectedAgentId, setSelectedAgentId] = useState('');
   const [modelOptions, setModelOptions] = useState<string[]>(() => listProviderModels());
@@ -193,6 +244,8 @@ export default function Conversations() {
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState('');
   const [showScrollBottom, setShowScrollBottom] = useState(false);
+  const [resumeVisualError, setResumeVisualError] = useState('');
+  const [resumeVisualContext, setResumeVisualContext] = useState<ResumeVisualContext | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -210,7 +263,8 @@ export default function Conversations() {
   const isSessionDetailLoading = Boolean(activeSessionId && loadingSessionId === activeSessionId);
   const modelContextKey = `${selectedAgentId || ''}:${activeSessionId || 'new'}`;
   const selectedModel = selectedModelOverride?.contextKey === modelContextKey ? selectedModelOverride.model : '';
-  const effectiveModel = selectedModel || activeSession?.model || currentAgent?.model || '';
+  const fallbackModel = modelOptions[0] || '';
+  const effectiveModel = selectedModel || activeSession?.model || currentAgent?.model || fallbackModel;
   const pendingRunMessage = useMemo(() => findPendingRunMessage(messages), [messages]);
   const focusChatInput = useCallback(() => {
     requestAnimationFrame(() => {
@@ -232,6 +286,25 @@ export default function Conversations() {
   const persistRef = useRef<((msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => Promise<string>) | null>(null);
   const appliedDraftRef = useRef('');
   const appliedConversationRequestRef = useRef('');
+  const appliedVisualRequestRef = useRef('');
+
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const res = await fetch('/api/health');
+        if (!cancelled) setServerStatus(res.ok ? 'online' : 'offline');
+      } catch {
+        if (!cancelled) setServerStatus('offline');
+      }
+    };
+    void check();
+    const timer = setInterval(() => void check(), 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     if (!user?.tenantId) return;
@@ -322,6 +395,8 @@ export default function Conversations() {
     setPendingQuestions([]);
     setAgentTasks([]);
     setSessionLoadError('');
+    setResumeVisualError('');
+    setResumeVisualContext(null);
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
@@ -372,7 +447,7 @@ export default function Conversations() {
     const agent = currentAgent;
     const currentMsgs = messages;
     const active = sessions.find((session) => session.id === activeSessionId);
-    const autoModel = selectedModel || active?.model || agent.model;
+    const autoModel = selectedModel || active?.model || agent.model || fallbackModel;
     const prov = resolveProviderForModel(autoModel).provider;
 
     setIsStreaming(true);
@@ -462,6 +537,7 @@ export default function Conversations() {
           providerProfiles: loadProviderProfiles(),
           templateId: agent.id,
           sessionId: activeSessionId || undefined,
+          sourceVisualId: active?.sourceVisualId,
           tools: buildRequestToolsForAgent(agent),
           mcpServers: agent.mcpServers || [],
           subagents: agent.subagents,
@@ -599,7 +675,7 @@ export default function Conversations() {
       }
     }
     finishRun();
-  }, [currentAgent, isStreaming, activeSessionId, messages, sessions, selectedModel]);
+  }, [currentAgent, isStreaming, activeSessionId, messages, sessions, selectedModel, fallbackModel]);
 
   // 订阅 EventSource — 当 MCP 服务器部署后，自动桥接 bot 事件到当前会话
   useEffect(() => {
@@ -679,7 +755,7 @@ export default function Conversations() {
         if (!cancelled) setSessions(savedSessions);
       } catch (error) {
         console.error('failed to load chat sessions', error);
-        if (!cancelled) setSessionsError((error as Error).message || '历史对话加载失败');
+        if (!cancelled) setSessionsError(describeApiFetchError(error));
       } finally {
         if (!cancelled) setSessionsLoading(false);
       }
@@ -739,6 +815,8 @@ export default function Conversations() {
     sessionLoadSeqRef.current += 1;
     setLoadingSessionId('');
     setSessionLoadError('');
+    setResumeVisualError('');
+    setResumeVisualContext(null);
     setActiveSessionId(null);
     setMessages([]);
     setPendingQuestions([]);
@@ -751,6 +829,91 @@ export default function Conversations() {
     next.delete('draft');
     setSearchParams(next, { replace: true });
   }, [requestedDraft, searchParams, setSearchParams]);
+
+  useEffect(() => {
+    if (!requestedVisualId) {
+      appliedVisualRequestRef.current = '';
+      return;
+    }
+    if (appliedVisualRequestRef.current === requestedVisualId) return;
+    appliedVisualRequestRef.current = requestedVisualId;
+    let cancelled = false;
+    let completed = false;
+
+    // 注意：本 effect 只依赖 requestedVisualId。
+    // 之前把 searchParams 放进依赖数组会导致：加载 visual 期间（await getSavedVisual 未返回时），
+    // 其它 effect 触发重渲染改变了 searchParams 引用 → 本 effect 被 cleanup（cancelled=true）→
+    // fetch 返回后命中 `if (cancelled) return` 直接退出 → resumeVisualContext 永远设不上 →
+    // 发送时 sourceVisualId 丢失 → 保存变成「新增」而非「覆盖」。
+    // 这里用 setSearchParams 的函数式更新移除 visualId，从而无需把 searchParams 列为依赖。
+    void (async () => {
+      setResumeVisualError('');
+      try {
+        const visual = await getSavedVisual(requestedVisualId);
+        if (cancelled) return;
+        completed = true;
+        sessionLoadSeqRef.current += 1;
+        setLoadingSessionId('');
+        setSessionLoadError('');
+        setActiveSessionId(null);
+        setMessages([]);
+        setPendingPermissions([]);
+        setPendingQuestions([]);
+        setAgentTasks([]);
+        setStructuredOutput(null);
+        setRunStats(null);
+        const fileName = sanitizeVisualFileName(visual.title);
+        setResumeVisualContext({
+          visualId: requestedVisualId,
+          title: visual.title?.trim() || '未命名页面',
+          workspacePath: `baseline/${slugifyVisualFileName(visual.title)}.html`,
+          attachment: {
+            id: crypto.randomUUID(),
+            type: 'file',
+            mediaType: 'text/html',
+            data: utf8ToBase64(visual.html),
+            name: fileName,
+            size: new TextEncoder().encode(visual.html).byteLength,
+          },
+        });
+        setAttachments([]);
+        setAttachmentError('');
+        setInput([
+          `基于《${visual.title?.trim() || '未命名页面'}》继续修改。`,
+          '直接告诉我这轮要改什么，比如：加时间趋势图、改成左右布局、替换主色、补一个指标卡。',
+        ].filter(Boolean).join('\n'));
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
+        syncConversationUrl(null);
+        setSearchParams((prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete('visualId');
+          return next;
+        }, { replace: true });
+      } catch (error) {
+        if (cancelled) return;
+        completed = true;
+        setResumeVisualError((error as Error).message || '读取已保存页面失败');
+        setResumeVisualContext(null);
+        setSearchParams((prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete('visualId');
+          return next;
+        }, { replace: true });
+      }
+    })();
+
+    // StrictMode（开发模式）会 mount→cleanup→mount 双调用本 effect。
+    // 若 fetch 尚未完成就被 cleanup，必须回滚 appliedVisualRequestRef，
+    // 否则第二次 mount 命中守卫直接 return，而第一次的 fetch 又被 cancelled 丢弃，
+    // 导致 resumeVisualContext 永远设不上、sourceVisualId 丢失。
+    return () => {
+      cancelled = true;
+      if (!completed && appliedVisualRequestRef.current === requestedVisualId) {
+        appliedVisualRequestRef.current = '';
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestedVisualId]);
 
   const updateScrollBottomVisibility = useCallback(() => {
     const el = messagesRef.current;
@@ -787,7 +950,7 @@ export default function Conversations() {
     const now = Date.now();
     const id = sid || `chat-${Date.now()}`;
     const existing = sid ? sessions.find((session) => session.id === sid) : undefined;
-    const currentModel = selectedModel || existing?.model || currentAgent?.model || '';
+    const currentModel = selectedModel || existing?.model || currentAgent?.model || fallbackModel;
     const canReuseExistingSdkSession = canResumeSessionForAgent(existing, currentAgent);
     const draft: ChatSession = {
       id,
@@ -798,6 +961,7 @@ export default function Conversations() {
       model: currentModel,
       sdkSessionId: canReuseExistingSdkSession ? existing?.sdkSessionId : sdkSessionId,
       sdkCwd: (canReuseExistingSdkSession ? existing?.sdkCwd : undefined) || sdkCwd,
+      sourceVisualId: resumeVisualContext?.visualId || existing?.sourceVisualId,
       forkedFromSessionId: existing?.forkedFromSessionId,
       forkedFromTitle: existing?.forkedFromTitle,
       pinned: existing?.pinned,
@@ -826,7 +990,7 @@ export default function Conversations() {
       syncConversationUrl(draft);
       return id;
     }
-  }, [selectedAgentId, currentAgent, sessions, syncConversationUrl, selectedModel]);
+  }, [selectedAgentId, currentAgent, sessions, syncConversationUrl, selectedModel, fallbackModel, resumeVisualContext]);
 
   // 把 persistSession 存到 ref 供 doAutoReply 使用
   persistRef.current = persistSession;
@@ -837,6 +1001,8 @@ export default function Conversations() {
     sessionLoadSeqRef.current += 1;
     setLoadingSessionId('');
     setSessionLoadError('');
+    setResumeVisualError('');
+    setResumeVisualContext(null);
     setActiveSessionId(null);
     setMessages([]);
     setPendingQuestions([]);
@@ -866,6 +1032,8 @@ export default function Conversations() {
     setLoadingSessionId('');
     setSessionLoadError('');
     setSelectedAgentId(agentId);
+    setResumeVisualError('');
+    setResumeVisualContext(null);
     setSessionSearch('');
     setPendingQuestions([]);
     setPendingPermissions([]);
@@ -1186,16 +1354,24 @@ export default function Conversations() {
 
   // 发送消息
   const handleSend = useCallback(async () => {
-    const content = input.trim();
-    const messageAttachments = attachments;
-    if ((!content && messageAttachments.length === 0) || isStreaming || isSessionDetailLoading || !currentAgent) return;
+    const typedContent = input.trim();
+    const contextAttachment = resumeVisualContext?.attachment;
+    const messageAttachments = contextAttachment ? [contextAttachment, ...attachments] : attachments;
+    const usedResumeVisualContext = Boolean(resumeVisualContext);
+    const workspaceBootstrapFiles = resumeVisualContext ? [{
+      path: resumeVisualContext.workspacePath,
+      mediaType: resumeVisualContext.attachment.mediaType,
+      data: resumeVisualContext.attachment.data,
+    }] : [];
+    const visibleContent = typedContent || (resumeVisualContext ? `继续修改《${resumeVisualContext.title}》` : '');
+    if ((!visibleContent && messageAttachments.length === 0) || isStreaming || isSessionDetailLoading || !currentAgent) return;
 
-    const sendModel = selectedModel || activeSession?.model || currentAgent.model;
+    const sendModel = selectedModel || activeSession?.model || currentAgent.model || fallbackModel;
     provider.current = resolveProviderForModel(sendModel).provider;
 
     const userMsg: ChatMessage = {
       role: 'user',
-      content,
+      content: visibleContent,
       timestamp: Date.now(),
       ...(messageAttachments.length ? { attachments: messageAttachments } : {}),
     };
@@ -1265,6 +1441,9 @@ export default function Conversations() {
       setMessages(finalMsgs);
       const sid = await persistSession(finalMsgs, requestSessionId, sdkSessionId, sdkCwd);
       if (sid) setActiveSessionId(sid);
+      if (usedResumeVisualContext && sdkCwd) {
+        setResumeVisualContext(null);
+      }
     };
 
     const controller = new AbortController();
@@ -1282,7 +1461,9 @@ export default function Conversations() {
           title: createChatSessionTitle(newMsgs, active?.title),
           messages: newMsgs.map((m, index) => ({
             role: m.role,
-            content: m.content,
+            content: index === newMsgs.length - 1 && m.role === 'user' && resumeVisualContext
+              ? buildResumeVisualPrompt(resumeVisualContext, typedContent)
+              : m.content,
             attachments: index === newMsgs.length - 1 ? m.attachments : undefined,
             timestamp: m.timestamp,
             id: m.id,
@@ -1297,6 +1478,8 @@ export default function Conversations() {
           providerProfiles: loadProviderProfiles(),
           templateId: currentAgent.id,
           sessionId: requestSessionId,
+          sourceVisualId: resumeVisualContext?.visualId || active?.sourceVisualId,
+          workspaceBootstrapFiles,
           tools: buildRequestToolsForAgent(currentAgent),
           mcpServers: currentAgent.mcpServers || [],
           subagents: currentAgent.subagents,
@@ -1430,12 +1613,12 @@ export default function Conversations() {
       if ((e as Error).name === 'AbortError') {
         await persistFinalMessage(text, 'stopped', undefined, undefined, 'AbortError');
       } else {
-        const message = (e as Error).message;
+        const message = describeApiFetchError(e);
         await persistFinalMessage(`连接失败: ${message}`, 'provider_error', undefined, undefined, message);
       }
     }
     finishRun();
-  }, [input, attachments, isStreaming, isSessionDetailLoading, currentAgent, messages, activeSessionId, persistSession, sessions, selectedModel, activeSession?.model]);
+  }, [input, attachments, resumeVisualContext, isStreaming, isSessionDetailLoading, currentAgent, messages, activeSessionId, persistSession, sessions, selectedModel, activeSession?.model, fallbackModel]);
 
   const handleStop = useCallback(() => {
     abortRef.current?.abort();
@@ -1715,6 +1898,35 @@ export default function Conversations() {
               <button className="btn btn-sm" onClick={() => navigate('/agents')}>Agent 市场</button>
             </div>
 
+            {resumeVisualError && (
+              <div
+                className="card"
+                style={{
+                  margin: '12px 16px 0',
+                  background: 'var(--warning-bg)',
+                  borderColor: 'var(--warning)',
+                  color: 'var(--ink)',
+                }}
+              >
+                继续修改上下文载入失败：{resumeVisualError}
+              </div>
+            )}
+
+            {serverStatus !== 'online' && (
+              <div
+                className="card"
+                style={{
+                  margin: '12px 16px 0',
+                  background: 'var(--warning-bg)',
+                  borderColor: 'var(--warning)',
+                  color: 'var(--ink)',
+                }}
+              >
+                后端 {serverStatus === 'checking' ? '检测中...' : '✗ 离线'}
+                {serverStatus === 'offline' && '，当前 5173 页面会把 /api 代理到 http://localhost:3001。请先运行 npm run server。'}
+              </div>
+            )}
+
             {/* 消息列表 */}
             <div className="conversation-messages" ref={messagesRef} onScroll={updateScrollBottomVisibility}>
               {/* Bot 实时事件 */}
@@ -1832,6 +2044,33 @@ export default function Conversations() {
             {/* 输入区域 */}
             <div className="conversation-composer">
               <div className="chat-input-area" style={{ padding: 0, borderTop: 'none' }}>
+                {resumeVisualContext && (
+                  <div
+                    style={{
+                      margin: '0 0 8px',
+                      padding: '10px 12px',
+                      border: '1.5px solid var(--accent)',
+                      borderRadius: 12,
+                      background: 'var(--accent-bg)',
+                      color: 'var(--ink)',
+                    }}
+                  >
+                    <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                      当前基于已保存页面继续修改：{resumeVisualContext.title}
+                    </div>
+                    <div style={{ fontSize: '.8em', color: 'var(--ink-secondary)', lineHeight: 1.6 }}>
+                      这份 HTML 会在发送时自动带给模型，不需要你重复解释“基于哪个页面改”。
+                    </div>
+                    <div className="flex gap-2" style={{ marginTop: 8, flexWrap: 'wrap' }}>
+                      <button className="btn btn-sm" type="button" onClick={() => navigate(`/viz?id=${encodeURIComponent(resumeVisualContext.visualId)}`)}>
+                        打开原页面
+                      </button>
+                      <button className="btn btn-sm" type="button" onClick={() => setResumeVisualContext(null)}>
+                        解除上下文
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {(attachments.length > 0 || attachmentError) && (
                   <div style={{ padding: '4px 8px' }}>
                     {attachmentError && <div style={{ color: 'var(--danger)', fontSize: '.75em', marginBottom: 4 }}>{attachmentError}</div>}
@@ -1902,7 +2141,7 @@ export default function Conversations() {
                     {isWaitingPhase(runPhase) ? '停止等待' : '停止'}
                   </button>
                 ) : (
-                  <button className="btn btn-primary" onClick={handleSend} disabled={isSessionDetailLoading || (!input.trim() && attachments.length === 0)}>
+                  <button className="btn btn-primary" onClick={handleSend} disabled={serverStatus !== 'online' || isSessionDetailLoading || (!input.trim() && attachments.length === 0 && !resumeVisualContext)}>
                     发送
                   </button>
                 )}

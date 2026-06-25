@@ -102,7 +102,8 @@
 .ds-btn {
   border: 1.5px solid var(--ink); background: var(--bg-card);
   padding: 8px 14px; border-radius: 999px; font-size: 12px;
-  cursor: pointer; color: var(--ink);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; color: var(--ink); text-decoration: none;
   white-space: nowrap;
   box-shadow: 2px 2px 0 0 var(--ink);
   font-family: var(--font-mono);
@@ -344,6 +345,22 @@
 .ds-empty-emoji { font-size: 64px; margin-bottom: 16px; }
 .ds-empty-title { font-size: 18px; font-weight: 600; color: var(--ink); margin-bottom: 8px; }
 .ds-empty-hint { font-size: 13px; color: var(--ink-muted); margin-bottom: 20px; }
+.ds-empty-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.ds-empty-note {
+  padding: 10px 12px;
+  margin: 0 0 16px;
+  border-radius: 10px;
+  background: rgba(42, 20, 16, 0.05);
+  color: var(--ink-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
 
 /* Widget */
 .ds-widget {

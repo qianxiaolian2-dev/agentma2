@@ -105,6 +105,7 @@ function normalizeSession(session: unknown): ChatSession | null {
   const model = String((session as { model?: unknown }).model || '');
   const sdkSessionId = String((session as { sdkSessionId?: unknown }).sdkSessionId || '');
   const sdkCwd = String((session as { sdkCwd?: unknown }).sdkCwd || '');
+  const sourceVisualId = String((session as { sourceVisualId?: unknown }).sourceVisualId || '');
   const forkedFromSessionId = String((session as { forkedFromSessionId?: unknown }).forkedFromSessionId || '');
   const forkedFromTitle = String((session as { forkedFromTitle?: unknown }).forkedFromTitle || '');
   const collaborationRole = String((session as { collaborationRole?: unknown }).collaborationRole || '');
@@ -130,6 +131,7 @@ function normalizeSession(session: unknown): ChatSession | null {
     model,
     sdkSessionId: sdkSessionId || undefined,
     sdkCwd: sdkCwd || undefined,
+    sourceVisualId: sourceVisualId || undefined,
     forkedFromSessionId: forkedFromSessionId || undefined,
     forkedFromTitle: forkedFromTitle || undefined,
     pinned: Boolean((session as { pinned?: unknown }).pinned),
@@ -219,7 +221,7 @@ export async function saveChatSession(session: ChatSession): Promise<ChatSession
 
 export async function patchChatSession(
   sessionId: string,
-  patch: Partial<Pick<ChatSession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd'>>,
+  patch: Partial<Pick<ChatSession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'sourceVisualId'>>,
 ): Promise<ChatSession> {
   const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}`, {
     method: 'PATCH',

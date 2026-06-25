@@ -105,9 +105,30 @@ export async function saveLayout(id: string, layout: DashboardLayout): Promise<{
   versionId?: string;
   updatedAt?: number;
 }> {
+  return saveLayoutWithMeta(id, layout);
+}
+
+export async function saveLayoutWithMeta(
+  id: string,
+  layout: DashboardLayout,
+  meta?: {
+    note?: string;
+    savedFrom?: 'chat' | 'studio' | 'restore';
+    sourceConversationId?: string;
+    sourceMessageId?: string;
+    sourceRunId?: string;
+    sourceModel?: string;
+    sourceAgentId?: string;
+  },
+): Promise<{
+  id: string;
+  layout: DashboardLayout;
+  versionId?: string;
+  updatedAt?: number;
+}> {
   return jsonReq(`/api/dashboard/${id}`, {
     method: 'PUT',
-    body: JSON.stringify({ layout }),
+    body: JSON.stringify({ layout, ...meta }),
   });
 }
 

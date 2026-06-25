@@ -1,10 +1,10 @@
 const LOCAL_DEV_AUTH_SEED = {
-  token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlZTE1Zjg3Zi1jODQ5LTQ0OGUtOTczNC1lNTM4ZWI1YjE3NzkiLCJ0ZW5hbnRJZCI6IjhhNDNkYTZjLTEzMzYtNDI4MC1iZWMxLTFiYzBmZTZlNzYxMCIsImV4cCI6MTc4MjI3ODk4N30.5g6DDIr-qWg6mHBPNsC1bURLlh0qraWBbwLHhdTjypY',
+  token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlZTE1Zjg3Zi1jODQ5LTQ0OGUtOTczNC1lNTM4ZWI1YjE3NzkiLCJ0ZW5hbnRJZCI6IjhhNDNkYTZjLTEzMzYtNDI4MC1iZWMxLTFiYzBmZTZlNzYxMCIsImV4cCI6MTc4Mjg5MTc2OH0.y8aIoExu2Bix-6ateMhZthxYfM6dRnzvgDDgf5gF57g',
   user: {
     id: 'ee15f87f-c849-448e-9734-e538eb5b1779',
-    username: 'dash-test',
-    email: 'dash-test@example.com',
-    name: 'Dash Test',
+    username: 'dash-test-1781674186',
+    email: 'dash-test-1781674186@example.com',
+    name: 'dash-test-1781674186',
     tenantId: '8a43da6c-1336-4280-bec1-1bc0fe6e7610',
     role: 'tenant_admin' as const,
   },
@@ -24,8 +24,9 @@ function ensureLocalDevAuthSeed() {
     if (stored !== LOCAL_DEV_AUTH_SEED.token) {
       localStorage.setItem('agentma_jwt', LOCAL_DEV_AUTH_SEED.token);
     }
-    if (!localStorage.getItem('agentma_user')) {
-      localStorage.setItem('agentma_user', JSON.stringify(LOCAL_DEV_AUTH_SEED.user));
+    const serializedUser = JSON.stringify(LOCAL_DEV_AUTH_SEED.user);
+    if (localStorage.getItem('agentma_user') !== serializedUser) {
+      localStorage.setItem('agentma_user', serializedUser);
     }
   } catch {}
 }
@@ -66,8 +67,24 @@ export function getAuthHeaders(extra: HeadersInit = {}): HeadersInit {
   return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
 }
 
+function extractErrorMessage(error: unknown) {
+  if (error instanceof Error && typeof error.message === 'string') return error.message.trim();
+  if (typeof error === 'string') return error.trim();
+  return '';
+}
+
 function isLoopbackHostname(hostname: string) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+}
+
+export function describeApiFetchError(error: unknown) {
+  const message = extractErrorMessage(error);
+  if (!/failed to fetch/i.test(message)) return message || '请求失败';
+  if (typeof window === 'undefined') return '无法连接后端 API';
+  if (isLocalDevAgentma()) {
+    return '无法连接后端 API。当前前端会把 /api 代理到 http://localhost:3001，请确认已执行 npm run server，并检查 /api/health 是否可访问。';
+  }
+  return '无法连接后端 API，请检查服务是否可用。';
 }
 
 export function getEndpointProbeBlockReason(endpoint: string): string | null {

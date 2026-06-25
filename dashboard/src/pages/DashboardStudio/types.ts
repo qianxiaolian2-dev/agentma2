@@ -119,9 +119,15 @@ export interface DashboardSummary {
   name: string;
   status: 'draft' | 'published' | 'archived';
   latestVersionId: string;
+  savedFrom?: 'chat' | 'studio' | 'restore';
   latestVersionNo: number;
   versionCount: number;
   datasourceName?: string;
+  sourceConversationId?: string;
+  sourceMessageId?: string;
+  sourceRunId?: string;
+  sourceModel?: string;
+  sourceAgentId?: string;
   createdAt: number;
   updatedAt: number;
   legacy?: boolean;
@@ -136,6 +142,12 @@ export interface DashboardVersionSummary {
   profileSnapshotJson?: string;
   note?: string;
   createdBy?: string;
+  savedFrom?: 'chat' | 'studio' | 'restore';
+  sourceConversationId?: string;
+  sourceMessageId?: string;
+  sourceRunId?: string;
+  sourceModel?: string;
+  sourceAgentId?: string;
   createdAt: number;
   current: boolean;
 }

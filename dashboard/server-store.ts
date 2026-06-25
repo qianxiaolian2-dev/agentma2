@@ -207,6 +207,7 @@ export type ChatHistorySession = {
   model: string;
   sdkSessionId?: string;
   sdkCwd?: string;
+  sourceVisualId?: string;
   forkedFromSessionId?: string;
   forkedFromTitle?: string;
   pinned?: boolean;
@@ -304,6 +305,11 @@ export type DashboardRecord = {
   name: string;
   status: 'draft' | 'published' | 'archived';
   latestVersionId: string;
+  sourceConversationId?: string;
+  sourceMessageId?: string;
+  sourceRunId?: string;
+  sourceModel?: string;
+  sourceAgentId?: string;
   createdAt: number;
   updatedAt: number;
 };
@@ -317,10 +323,17 @@ export type DashboardVersionRecord = {
   profileSnapshotJson?: string;
   note?: string;
   createdBy?: string;
+  savedFrom?: 'chat' | 'studio' | 'restore';
+  sourceConversationId?: string;
+  sourceMessageId?: string;
+  sourceRunId?: string;
+  sourceModel?: string;
+  sourceAgentId?: string;
   createdAt: number;
 };
 
 export type DashboardSummaryRecord = DashboardRecord & {
+  savedFrom?: DashboardVersionRecord['savedFrom'];
   latestVersionNo: number;
   versionCount: number;
   datasourceName?: string;
@@ -547,6 +560,7 @@ function initSchema() {
       model TEXT NOT NULL,
       sdk_session_id TEXT,
       sdk_cwd TEXT,
+      source_visual_id TEXT,
       forked_from_session_id TEXT,
       pinned INTEGER NOT NULL DEFAULT 0,
       collaboration_enabled INTEGER NOT NULL DEFAULT 0,
@@ -702,6 +716,11 @@ function initSchema() {
       name TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'draft',
       latest_version_id TEXT NOT NULL,
+      source_conversation_id TEXT,
+      source_message_id TEXT,
+      source_run_id TEXT,
+      source_model TEXT,
+      source_agent_id TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
@@ -717,6 +736,12 @@ function initSchema() {
       profile_snapshot_json TEXT,
       note TEXT,
       created_by TEXT,
+      saved_from TEXT,
+      source_conversation_id TEXT,
+      source_message_id TEXT,
+      source_run_id TEXT,
+      source_model TEXT,
+      source_agent_id TEXT,
       created_at INTEGER NOT NULL
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboard_versions_no ON dashboard_versions (dashboard_id, version_no);
@@ -730,9 +755,21 @@ function initSchema() {
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users (username)');
   ensureColumn('chat_sessions', 'sdk_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
+  ensureColumn('chat_sessions', 'source_visual_id', 'TEXT');
   ensureColumn('chat_sessions', 'forked_from_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'collaboration_enabled', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('chat_sessions', 'collaboration_updated_at', 'INTEGER');
+  ensureColumn('dashboards', 'source_conversation_id', 'TEXT');
+  ensureColumn('dashboards', 'source_message_id', 'TEXT');
+  ensureColumn('dashboards', 'source_run_id', 'TEXT');
+  ensureColumn('dashboards', 'source_model', 'TEXT');
+  ensureColumn('dashboards', 'source_agent_id', 'TEXT');
+  ensureColumn('dashboard_versions', 'saved_from', 'TEXT');
+  ensureColumn('dashboard_versions', 'source_conversation_id', 'TEXT');
+  ensureColumn('dashboard_versions', 'source_message_id', 'TEXT');
+  ensureColumn('dashboard_versions', 'source_run_id', 'TEXT');
+  ensureColumn('dashboard_versions', 'source_model', 'TEXT');
+  ensureColumn('dashboard_versions', 'source_agent_id', 'TEXT');
   ensureColumn('chat_messages', 'message_id', 'TEXT');
   ensureColumn('chat_messages', 'attachments_json', 'TEXT');
   ensureColumn('chat_messages', 'status', 'TEXT');
@@ -1413,6 +1450,7 @@ function mapChatSession(row: any, messages: ChatHistoryMessage[], viewerSub?: st
     model: row.model,
     sdkSessionId: row.sdk_session_id || undefined,
     sdkCwd: row.sdk_cwd || undefined,
+    sourceVisualId: row.source_visual_id || undefined,
     forkedFromSessionId: row.forked_from_session_id || undefined,
     forkedFromTitle: row.forked_from_title || undefined,
     pinned: Boolean(row.pinned),
@@ -2525,7 +2563,7 @@ export function audit(tenantId: string, action: string, actor: string, actorType
 
 const CHAT_SESSION_SELECT = `
   s.id, s.tenant_id, s.owner_sub, s.template_id, s.title, s.model,
-  s.sdk_session_id, s.sdk_cwd, s.forked_from_session_id,
+  s.sdk_session_id, s.sdk_cwd, s.source_visual_id, s.forked_from_session_id,
   parent.title AS forked_from_title,
   s.pinned, s.collaboration_enabled, s.collaboration_updated_at,
   s.created_at, s.updated_at
@@ -2540,6 +2578,7 @@ type ChatSessionRow = {
   model: string;
   sdk_session_id?: string | null;
   sdk_cwd?: string | null;
+  source_visual_id?: string | null;
   forked_from_session_id?: string | null;
   forked_from_title?: string | null;
   pinned: number;
@@ -2800,6 +2839,29 @@ export function createVisual(
   return { id };
 }
 
+export function updateVisual(
+  tenantId: string,
+  ownerSub: string,
+  id: string,
+  input: { title?: string; html: string; sourceSlug?: string },
+) {
+  const html = String(input.html || '');
+  const sizeBytes = Buffer.byteLength(html);
+  if (sizeBytes > MAX_VISUAL_BYTES) {
+    throw new Error(`visual html exceeds ${MAX_VISUAL_BYTES} bytes`);
+  }
+  const current = getVisual(tenantId, ownerSub, id);
+  if (!current) return null;
+  const title = typeof input.title === 'string' && input.title.trim() ? input.title.trim() : null;
+  const sourceSlug = typeof input.sourceSlug === 'string' && input.sourceSlug.trim() ? input.sourceSlug.trim() : null;
+  db.prepare(`
+    UPDATE visuals
+    SET title = ?, html = ?, size_bytes = ?, source_slug = ?
+    WHERE tenant_id = ? AND owner_sub = ? AND id = ?
+  `).run(title, html, sizeBytes, sourceSlug, tenantId, ownerSub, id);
+  return { id };
+}
+
 export function getVisual(tenantId: string, ownerSub: string, id: string) {
   const row = db.prepare(`
     SELECT id, tenant_id, owner_sub, title, html, size_bytes, source_slug, created_at
@@ -2856,6 +2918,11 @@ function mapDashboardRow(row: Record<string, unknown>): DashboardRecord {
     name: String(row.name || '未命名看板'),
     status: (String(row.status || 'draft') as DashboardRecord['status']),
     latestVersionId: String(row.latest_version_id),
+    sourceConversationId: row.source_conversation_id ? String(row.source_conversation_id) : undefined,
+    sourceMessageId: row.source_message_id ? String(row.source_message_id) : undefined,
+    sourceRunId: row.source_run_id ? String(row.source_run_id) : undefined,
+    sourceModel: row.source_model ? String(row.source_model) : undefined,
+    sourceAgentId: row.source_agent_id ? String(row.source_agent_id) : undefined,
     createdAt: Number(row.created_at) || 0,
     updatedAt: Number(row.updated_at) || 0,
   };
@@ -2871,6 +2938,12 @@ function mapDashboardVersionRow(row: Record<string, unknown>): DashboardVersionR
     profileSnapshotJson: row.profile_snapshot_json ? String(row.profile_snapshot_json) : undefined,
     note: row.note ? String(row.note) : undefined,
     createdBy: row.created_by ? String(row.created_by) : undefined,
+    savedFrom: row.saved_from ? String(row.saved_from) as DashboardVersionRecord['savedFrom'] : undefined,
+    sourceConversationId: row.source_conversation_id ? String(row.source_conversation_id) : undefined,
+    sourceMessageId: row.source_message_id ? String(row.source_message_id) : undefined,
+    sourceRunId: row.source_run_id ? String(row.source_run_id) : undefined,
+    sourceModel: row.source_model ? String(row.source_model) : undefined,
+    sourceAgentId: row.source_agent_id ? String(row.source_agent_id) : undefined,
     createdAt: Number(row.created_at) || 0,
   };
 }
@@ -2885,6 +2958,12 @@ function mapDashboardSummaryRow(row: Record<string, unknown>): DashboardSummaryR
     name: String(row.name || '未命名看板'),
     status: (String(row.status || 'draft') as DashboardRecord['status']),
     latestVersionId: String(row.latest_version_id),
+    sourceConversationId: row.source_conversation_id ? String(row.source_conversation_id) : undefined,
+    sourceMessageId: row.source_message_id ? String(row.source_message_id) : undefined,
+    sourceRunId: row.source_run_id ? String(row.source_run_id) : undefined,
+    sourceModel: row.source_model ? String(row.source_model) : undefined,
+    sourceAgentId: row.source_agent_id ? String(row.source_agent_id) : undefined,
+    savedFrom: row.saved_from ? String(row.saved_from) as DashboardVersionRecord['savedFrom'] : undefined,
     createdAt: Number(row.created_at) || 0,
     updatedAt: Number(row.updated_at) || 0,
     latestVersionNo: Number(row.latest_version_no) || 1,
@@ -2903,6 +2982,12 @@ function mapDashboardVersionSummaryRow(row: Record<string, unknown>): DashboardV
     profileSnapshotJson: row.profile_snapshot_json ? String(row.profile_snapshot_json) : undefined,
     note: row.note ? String(row.note) : undefined,
     createdBy: row.created_by ? String(row.created_by) : undefined,
+    savedFrom: row.saved_from ? String(row.saved_from) as DashboardVersionRecord['savedFrom'] : undefined,
+    sourceConversationId: row.source_conversation_id ? String(row.source_conversation_id) : undefined,
+    sourceMessageId: row.source_message_id ? String(row.source_message_id) : undefined,
+    sourceRunId: row.source_run_id ? String(row.source_run_id) : undefined,
+    sourceModel: row.source_model ? String(row.source_model) : undefined,
+    sourceAgentId: row.source_agent_id ? String(row.source_agent_id) : undefined,
     createdAt: Number(row.created_at) || 0,
     current: Number(row.is_current) === 1,
   };
@@ -2910,7 +2995,9 @@ function mapDashboardVersionSummaryRow(row: Record<string, unknown>): DashboardV
 
 export function getDashboardRecord(tenantId: string, ownerSub: string, dashboardId: string): DashboardRecord | null {
   const row = db.prepare(`
-    SELECT id, tenant_id, owner_sub, datasource_id, table_name, name, status, latest_version_id, created_at, updated_at
+    SELECT id, tenant_id, owner_sub, datasource_id, table_name, name, status, latest_version_id,
+      source_conversation_id, source_message_id, source_run_id, source_model, source_agent_id,
+      created_at, updated_at
     FROM dashboards
     WHERE tenant_id = ? AND owner_sub = ? AND id = ?
   `).get(tenantId, ownerSub, dashboardId) as Record<string, unknown> | undefined;
@@ -2933,6 +3020,12 @@ export function listDashboards(
       d.name,
       d.status,
       d.latest_version_id,
+      d.source_conversation_id,
+      d.source_message_id,
+      d.source_run_id,
+      d.source_model,
+      d.source_agent_id,
+      v.saved_from,
       d.created_at,
       d.updated_at,
       COALESCE(v.version_no, 1) AS latest_version_no,
@@ -2959,7 +3052,9 @@ export function getLatestDashboardVersionRecord(
   dashboardId: string,
 ): DashboardVersionRecord | null {
   const row = db.prepare(`
-    SELECT v.id, v.dashboard_id, v.tenant_id, v.version_no, v.layout_json, v.profile_snapshot_json, v.note, v.created_by, v.created_at
+    SELECT v.id, v.dashboard_id, v.tenant_id, v.version_no, v.layout_json, v.profile_snapshot_json, v.note, v.created_by,
+      v.saved_from, v.source_conversation_id, v.source_message_id, v.source_run_id, v.source_model, v.source_agent_id,
+      v.created_at
     FROM dashboard_versions v
     JOIN dashboards d ON d.id = v.dashboard_id
     WHERE d.tenant_id = ? AND d.owner_sub = ? AND d.id = ? AND d.latest_version_id = v.id
@@ -2974,7 +3069,9 @@ export function getDashboardVersionRecord(
   versionId: string,
 ): DashboardVersionRecord | null {
   const row = db.prepare(`
-    SELECT v.id, v.dashboard_id, v.tenant_id, v.version_no, v.layout_json, v.profile_snapshot_json, v.note, v.created_by, v.created_at
+    SELECT v.id, v.dashboard_id, v.tenant_id, v.version_no, v.layout_json, v.profile_snapshot_json, v.note, v.created_by,
+      v.saved_from, v.source_conversation_id, v.source_message_id, v.source_run_id, v.source_model, v.source_agent_id,
+      v.created_at
     FROM dashboard_versions v
     JOIN dashboards d ON d.id = v.dashboard_id
     WHERE d.tenant_id = ? AND d.owner_sub = ? AND d.id = ? AND v.id = ?
@@ -2997,6 +3094,12 @@ export function listDashboardVersions(
       v.profile_snapshot_json,
       v.note,
       v.created_by,
+      v.saved_from,
+      v.source_conversation_id,
+      v.source_message_id,
+      v.source_run_id,
+      v.source_model,
+      v.source_agent_id,
       v.created_at,
       CASE WHEN d.latest_version_id = v.id THEN 1 ELSE 0 END AS is_current
     FROM dashboard_versions v
@@ -3019,6 +3122,12 @@ export function saveDashboardRecord(
     profileSnapshotJson?: string;
     note?: string;
     createdBy?: string;
+    savedFrom?: DashboardVersionRecord['savedFrom'];
+    sourceConversationId?: string;
+    sourceMessageId?: string;
+    sourceRunId?: string;
+    sourceModel?: string;
+    sourceAgentId?: string;
     status?: DashboardRecord['status'];
   },
 ): { dashboard: DashboardRecord; version: DashboardVersionRecord } {
@@ -3035,10 +3144,19 @@ export function saveDashboardRecord(
   const versionId = crypto.randomUUID();
   const status = input.status || existing?.status || 'draft';
   const name = String(input.name || '').trim() || '未命名看板';
+  const sourceConversationId = input.sourceConversationId !== undefined ? input.sourceConversationId : existing?.sourceConversationId;
+  const sourceMessageId = input.sourceMessageId !== undefined ? input.sourceMessageId : existing?.sourceMessageId;
+  const sourceRunId = input.sourceRunId !== undefined ? input.sourceRunId : existing?.sourceRunId;
+  const sourceModel = input.sourceModel !== undefined ? input.sourceModel : existing?.sourceModel;
+  const sourceAgentId = input.sourceAgentId !== undefined ? input.sourceAgentId : existing?.sourceAgentId;
 
   db.prepare(`
-    INSERT INTO dashboard_versions (id, dashboard_id, tenant_id, version_no, layout_json, profile_snapshot_json, note, created_by, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO dashboard_versions (
+      id, dashboard_id, tenant_id, version_no, layout_json, profile_snapshot_json, note, created_by,
+      saved_from, source_conversation_id, source_message_id, source_run_id, source_model, source_agent_id,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     versionId,
     dashboardId,
@@ -3048,13 +3166,21 @@ export function saveDashboardRecord(
     input.profileSnapshotJson || null,
     input.note || null,
     input.createdBy || null,
+    input.savedFrom || null,
+    sourceConversationId || null,
+    sourceMessageId || null,
+    sourceRunId || null,
+    sourceModel || null,
+    sourceAgentId || null,
     timestamp,
   );
 
   if (existing) {
     db.prepare(`
       UPDATE dashboards
-      SET datasource_id = ?, table_name = ?, name = ?, status = ?, latest_version_id = ?, updated_at = ?
+      SET datasource_id = ?, table_name = ?, name = ?, status = ?, latest_version_id = ?,
+          source_conversation_id = ?, source_message_id = ?, source_run_id = ?, source_model = ?, source_agent_id = ?,
+          updated_at = ?
       WHERE tenant_id = ? AND owner_sub = ? AND id = ?
     `).run(
       input.datasourceId,
@@ -3062,6 +3188,11 @@ export function saveDashboardRecord(
       name,
       status,
       versionId,
+      sourceConversationId || null,
+      sourceMessageId || null,
+      sourceRunId || null,
+      sourceModel || null,
+      sourceAgentId || null,
       timestamp,
       tenantId,
       ownerSub,
@@ -3069,8 +3200,12 @@ export function saveDashboardRecord(
     );
   } else {
     db.prepare(`
-      INSERT INTO dashboards (id, tenant_id, owner_sub, datasource_id, table_name, name, status, latest_version_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO dashboards (
+        id, tenant_id, owner_sub, datasource_id, table_name, name, status, latest_version_id,
+        source_conversation_id, source_message_id, source_run_id, source_model, source_agent_id,
+        created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       dashboardId,
       tenantId,
@@ -3080,6 +3215,11 @@ export function saveDashboardRecord(
       name,
       status,
       versionId,
+      sourceConversationId || null,
+      sourceMessageId || null,
+      sourceRunId || null,
+      sourceModel || null,
+      sourceAgentId || null,
       timestamp,
       timestamp,
     );
@@ -3111,6 +3251,12 @@ export function restoreDashboardVersion(
     profileSnapshotJson: version.profileSnapshotJson,
     note: input?.note || `恢复自版本 v${version.versionNo}`,
     createdBy: input?.createdBy,
+    savedFrom: 'restore',
+    sourceConversationId: version.sourceConversationId,
+    sourceMessageId: version.sourceMessageId,
+    sourceRunId: version.sourceRunId,
+    sourceModel: version.sourceModel,
+    sourceAgentId: version.sourceAgentId,
     status: dashboard.status,
   });
 }
@@ -3254,6 +3400,9 @@ export function saveChatSession(
     : String(session.model || existing?.model || '');
   const sdkSessionId = String(session.sdkSessionId || existing?.sdkSessionId || '').trim();
   const sdkCwd = String(session.sdkCwd || existing?.sdkCwd || '').trim();
+  const sourceVisualId = memberUpdatingSharedSession
+    ? String(existing.sourceVisualId || '').trim()
+    : String(session.sourceVisualId || existing?.sourceVisualId || '').trim();
   const forkedFromSessionId = memberUpdatingSharedSession
     ? String(existing.forkedFromSessionId || '').trim()
     : String(session.forkedFromSessionId || existing?.forkedFromSessionId || '').trim();
@@ -3268,19 +3417,20 @@ export function saveChatSession(
   try {
     db.prepare(`
       INSERT INTO chat_sessions (
-        id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, forked_from_session_id, pinned, created_at, updated_at
+        id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, source_visual_id, forked_from_session_id, pinned, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         template_id = excluded.template_id,
         title = excluded.title,
         model = excluded.model,
         sdk_session_id = excluded.sdk_session_id,
         sdk_cwd = excluded.sdk_cwd,
+        source_visual_id = excluded.source_visual_id,
         forked_from_session_id = excluded.forked_from_session_id,
         pinned = excluded.pinned,
         updated_at = excluded.updated_at
-    `).run(id, tenantId, ownerSub, templateId, title, model, sdkSessionId || null, sdkCwd || null, forkedFromSessionId || null, pinned ? 1 : 0, createdAt, updatedAt);
+    `).run(id, tenantId, ownerSub, templateId, title, model, sdkSessionId || null, sdkCwd || null, sourceVisualId || null, forkedFromSessionId || null, pinned ? 1 : 0, createdAt, updatedAt);
 
     db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(id);
     if (messages.length > 0) {
@@ -3320,7 +3470,7 @@ export function updateChatSession(
   tenantId: string,
   ownerSub: string,
   sessionId: string,
-  patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'forkedFromSessionId'>>,
+  patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'sourceVisualId' | 'forkedFromSessionId'>>,
 ) {
   const currentRow = getOwnedChatSessionRow(tenantId, ownerSub, sessionId);
   if (!currentRow) return null;
@@ -3334,6 +3484,7 @@ export function updateChatSession(
     model: patch.model ?? current.model,
     sdkSessionId: patch.sdkSessionId ?? current.sdkSessionId,
     sdkCwd: patch.sdkCwd ?? current.sdkCwd,
+    sourceVisualId: patch.sourceVisualId ?? current.sourceVisualId,
     forkedFromSessionId: patch.forkedFromSessionId ?? current.forkedFromSessionId,
     updatedAt: now(),
   });
@@ -3351,6 +3502,7 @@ export function forkChatSession(tenantId: string, ownerSub: string, sessionId: s
     model: current.model,
     sdkSessionId: undefined,
     sdkCwd: undefined,
+    sourceVisualId: current.sourceVisualId,
     forkedFromSessionId: current.id,
     pinned: false,
     messages: current.messages,

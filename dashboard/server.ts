@@ -81,6 +81,7 @@ import {
   updateUserRole,
   restoreDashboardVersion,
   saveDashboardRecord,
+  updateVisual,
 } from './server-store.ts';
 import {
   runAgent,
@@ -679,7 +680,11 @@ function readWorkspaceVisual(auth: any, cid: string, relPath: string) {
   const stat = fs.statSync(realFile);
   if (!stat.isFile()) throw makeHttpError('文件不存在', 404);
   if (stat.size > MAX_VISUAL_BYTES) throw makeHttpError('文件过大', 413);
-  return { html: fs.readFileSync(realFile, 'utf8'), mtimeMs: stat.mtimeMs };
+  return {
+    html: fs.readFileSync(realFile, 'utf8'),
+    mtimeMs: stat.mtimeMs,
+    sourceVisualId: session.sourceVisualId,
+  };
 }
 
 function resolveWorkspaceRootFromConversation(auth: any, conversationId: string) {
@@ -1193,6 +1198,13 @@ type ChatFileInput = {
   size: number;
 };
 
+type WorkspaceBootstrapFileInput = {
+  path: string;
+  mediaType: string;
+  data: string;
+  size: number;
+};
+
 const CHAT_IMAGE_MIME_TYPES = new Set<ChatImageMimeType>(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 const CHAT_FILE_EXTENSIONS = new Set([
   '.md', '.markdown', '.txt', '.csv', '.json', '.yaml', '.yml', '.xml', '.html',
@@ -1322,6 +1334,36 @@ async function normalizeChatAttachments(value: unknown): Promise<{ images: ChatI
     }
   }
   return { images: normalizedImages.images, fileBlocks };
+}
+
+function normalizeWorkspaceBootstrapPath(value: unknown) {
+  const normalized = String(value || '').trim().replace(/\\/g, '/').replace(/^\.?\//, '');
+  if (!normalized || normalized.startsWith('/') || normalized.startsWith('../') || normalized.includes('/../')) return '';
+  return normalized.slice(0, 240);
+}
+
+function normalizeWorkspaceBootstrapFiles(value: unknown): { files: WorkspaceBootstrapFileInput[]; error?: string } {
+  if (!Array.isArray(value)) return { files: [] };
+  if (value.length > MAX_CHAT_FILES) return { files: [], error: `最多一次初始化 ${MAX_CHAT_FILES} 个工作区文件` };
+
+  const files: WorkspaceBootstrapFileInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') return { files: [], error: '工作区初始化文件格式无效' };
+    const raw = item as Record<string, unknown>;
+    const filePath = normalizeWorkspaceBootstrapPath(raw.path);
+    if (!filePath) return { files: [], error: '工作区初始化文件路径无效' };
+    const data = String(raw.data || '').replace(/^data:[^;]+;base64,/, '');
+    if (!/^[A-Za-z0-9+/=\s]+$/.test(data)) return { files: [], error: `工作区初始化文件 base64 无效: ${filePath}` };
+    const size = Number(raw.size) || base64SizeBytes(data);
+    if (size > MAX_VISUAL_BYTES) return { files: [], error: `工作区初始化文件不能超过 ${MAX_VISUAL_BYTES} bytes: ${filePath}` };
+    files.push({
+      path: filePath,
+      mediaType: typeof raw.mediaType === 'string' ? raw.mediaType : 'application/octet-stream',
+      data,
+      size,
+    });
+  }
+  return { files };
 }
 
 function parseChatFileUpload(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -1507,9 +1549,14 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const datasourceIds = normalizeStringArray(req.body?.datasourceIds ?? template?.datasourceIds) || [];
   const skills = normalizeStringArray(req.body?.skills);
   const mcpServers = normalizeStringArray(template?.mcpServers || req.body?.mcpServers);
+  const sourceVisualId = typeof req.body?.sourceVisualId === 'string' && req.body.sourceVisualId.trim()
+    ? req.body.sourceVisualId.trim()
+    : '';
   const outputSchema = req.body?.outputSchema && typeof req.body.outputSchema === 'object' && !Array.isArray(req.body.outputSchema)
     ? req.body.outputSchema as Record<string, unknown>
     : undefined;
+  const workspaceBootstrapFiles = normalizeWorkspaceBootstrapFiles(req.body?.workspaceBootstrapFiles);
+  if (workspaceBootstrapFiles.error) { res.status(400).json({ error: workspaceBootstrapFiles.error }); return; }
 
   // Fold multi-turn history into systemPrompt so the model sees prior context.
   // When an SDK transcript id is available, resume that transcript and send
@@ -1555,12 +1602,13 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     res.status(400).json({ error: 'need prompt or messages' }); return;
   }
   if (sessionId) {
-    const visualPreviewPath = `/viz?cid=${encodeURIComponent(sessionId)}&path=viz/<slug>.html`;
+    const visualPreviewPath = `/viz?cid=${encodeURIComponent(sessionId)}&path=viz/<slug>.html${sourceVisualId ? `&sourceVisualId=${encodeURIComponent(sourceVisualId)}` : ''}`;
     effectiveSystemPrompt = [
       effectiveSystemPrompt,
       [
-        '[可视化预览] 用 agentma-visual skill 产出可视化时,把 HTML 写到 ./viz/<slug>.html,',
-        `并给用户这个 markdown 链接:${visualPreviewPath}`,
+        '[可视化预览] 生成可视化页面时，用 Write 工具把 HTML 写到 ./viz/<slug>.html（<slug> 替换为英文短横线连接的页面描述），',
+        `然后给用户这个 markdown 链接: ${visualPreviewPath}（把 <slug> 替换成你实际写的文件名）`,
+        '预览页面加载后会在右上角显示"保存"按钮，用户点击即可保存到素材库。',
       ].join('\n'),
     ].filter(Boolean).join('\n\n');
   }
@@ -1598,6 +1646,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
       model: selectedModel,
       sdkSessionId: resumeSdkSessionId || undefined,
       sdkCwd: sdkCwd || undefined,
+      sourceVisualId: sourceVisualId || undefined,
       forkedFromSessionId: req.body?.forkedFromSessionId,
       forkedFromTitle: req.body?.forkedFromTitle,
       pinned: req.body?.pinned,
@@ -1666,6 +1715,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     subagents,
     skills,
     mcpServers,
+    workspaceBootstrapFiles: workspaceBootstrapFiles.files,
     cwd: sdkCwd || undefined,
     seedDir: resolveAgentSeedDirForTemplate(req.auth.tenantId, template),
     resumeSdkSessionId: resumeSdkSessionId || undefined,
@@ -3361,16 +3411,23 @@ app.post('/api/visuals', authMiddleware, (req: any, res) => {
   try {
     const cid = typeof req.body?.cid === 'string' ? req.body.cid : '';
     const relPath = typeof req.body?.path === 'string' ? req.body.path : '';
+    const requestedSourceVisualId = typeof req.body?.sourceVisualId === 'string' && req.body.sourceVisualId.trim()
+      ? req.body.sourceVisualId.trim()
+      : '';
     const explicitTitle = typeof req.body?.title === 'string' && req.body.title.trim()
       ? req.body.title.trim()
       : undefined;
-    const { html } = readWorkspaceVisual(req.auth, cid, relPath);
+    const { html, sourceVisualId: sessionSourceVisualId } = readWorkspaceVisual(req.auth, cid, relPath);
+    const sourceVisualId = requestedSourceVisualId || sessionSourceVisualId || '';
     if (Buffer.byteLength(html) > MAX_VISUAL_BYTES) throw makeHttpError('文件过大', 413);
-    const result = createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), {
+    const payload = {
       title: explicitTitle || extractTitle(html),
       html,
       sourceSlug: relPath,
-    });
+    };
+    const result = sourceVisualId
+      ? updateVisual(req.auth.tenantId, getChatOwnerSub(req.auth), sourceVisualId, payload) || createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), payload)
+      : createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), payload);
     res.json(result);
   } catch (error) {
     const err = error as Error & { status?: number };
@@ -3788,7 +3845,14 @@ app.put('/api/dashboard/:id', authMiddleware, (req: any, res) => {
       name: String(check.layout.meta?.title || '').trim() || source.name || '未命名看板',
       layoutJson: JSON.stringify(check.layout),
       profileSnapshotJson: JSON.stringify(profile),
+      note: typeof req.body?.note === 'string' ? req.body.note.trim() : undefined,
       createdBy: req.auth.email || req.auth.sub,
+      savedFrom: req.body?.savedFrom === 'chat' || req.body?.savedFrom === 'restore' ? req.body.savedFrom : 'studio',
+      sourceConversationId: typeof req.body?.sourceConversationId === 'string' ? req.body.sourceConversationId.trim() : undefined,
+      sourceMessageId: typeof req.body?.sourceMessageId === 'string' ? req.body.sourceMessageId.trim() : undefined,
+      sourceRunId: typeof req.body?.sourceRunId === 'string' ? req.body.sourceRunId.trim() : undefined,
+      sourceModel: typeof req.body?.sourceModel === 'string' ? req.body.sourceModel.trim() : undefined,
+      sourceAgentId: typeof req.body?.sourceAgentId === 'string' ? req.body.sourceAgentId.trim() : undefined,
     });
     res.json({
       id: saved.dashboard.id,
@@ -3955,7 +4019,16 @@ app.get('/api/chat-sessions/:id', authMiddleware, (req: any, res) => {
 });
 
 app.post('/api/chat-sessions', authMiddleware, (req: any, res) => {
-  const result = saveChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), req.body || {});
+  const body = req.body && typeof req.body === 'object' ? { ...req.body } : {};
+  const sourceVisualId = typeof body.sourceVisualId === 'string' && body.sourceVisualId.trim()
+    ? body.sourceVisualId.trim()
+    : typeof body.source_visual_id === 'string' && body.source_visual_id.trim()
+      ? body.source_visual_id.trim()
+      : undefined;
+  const result = saveChatSession(req.auth.tenantId, getChatOwnerSub(req.auth), {
+    ...body,
+    ...(sourceVisualId ? { sourceVisualId } : {}),
+  });
   if (!result.ok) { res.status(result.status).json({ error: result.error }); return; }
   emitChatSessionEvent(result.session.id, { type: 'session_updated', updatedAt: result.session.updatedAt });
   res.json(result.session);

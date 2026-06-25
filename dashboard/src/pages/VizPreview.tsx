@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import VisualFrame from '../components/artifacts/VisualFrame';
 import LineIcon from '../components/LineIcon';
 import { getAuthHeaders } from '../utils/client-runtime';
+import { getChatSession } from '../utils/chat-sessions';
 
 type VisualPayload = {
   id?: string;
@@ -10,6 +11,7 @@ type VisualPayload = {
   html: string;
   createdAt?: number;
   mtimeMs?: number;
+  sourceVisualId?: string;
 };
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -36,6 +38,7 @@ export default function VizPreview() {
   const id = searchParams.get('id')?.trim() || '';
   const cid = searchParams.get('cid')?.trim() || '';
   const relPath = searchParams.get('path')?.trim() || '';
+  const requestedSourceVisualId = searchParams.get('sourceVisualId')?.trim() || '';
   const isSaved = Boolean(id);
   const [visual, setVisual] = useState<VisualPayload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -44,6 +47,7 @@ export default function VizPreview() {
   const [saveError, setSaveError] = useState('');
   const [fullscreenError, setFullscreenError] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [sourceVisualId, setSourceVisualId] = useState('');
 
   const sourceLabel = useMemo(() => {
     if (isSaved) return '已保存';
@@ -63,7 +67,10 @@ export default function VizPreview() {
           : `/api/visuals/file?cid=${encodeURIComponent(cid)}&path=${encodeURIComponent(relPath)}`;
         const response = await fetch(url, { headers: getAuthHeaders() });
         const data = await readJson<VisualPayload>(response);
-        if (!cancelled) setVisual(data);
+        if (!cancelled) {
+          setVisual(data);
+          if (!id && data?.sourceVisualId) setSourceVisualId(String(data.sourceVisualId).trim());
+        }
       } catch (loadError) {
         if (!cancelled) {
           setVisual(null);
@@ -85,6 +92,26 @@ export default function VizPreview() {
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
   }, []);
 
+  useEffect(() => {
+    if (requestedSourceVisualId) {
+      setSourceVisualId(requestedSourceVisualId);
+      return;
+    }
+    if (!cid || id) {
+      setSourceVisualId('');
+      return;
+    }
+    let cancelled = false;
+    void getChatSession(cid)
+      .then((session) => {
+        if (!cancelled) setSourceVisualId(session?.sourceVisualId || '');
+      })
+      .catch(() => {
+        if (!cancelled) setSourceVisualId('');
+      });
+    return () => { cancelled = true; };
+  }, [cid, id, requestedSourceVisualId]);
+
   const saveVisual = async () => {
     if (!cid || !relPath || saving) return;
     setSaving(true);
@@ -93,7 +120,7 @@ export default function VizPreview() {
       const response = await fetch('/api/visuals', {
         method: 'POST',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ cid, path: relPath, title: visual?.title }),
+        body: JSON.stringify({ cid, path: relPath, title: visual?.title, sourceVisualId: sourceVisualId || undefined }),
       });
       const data = await readJson<{ id: string }>(response);
       navigate(`/viz?id=${encodeURIComponent(data.id)}`, { replace: true });
@@ -166,7 +193,12 @@ export default function VizPreview() {
             <LineIcon name={isFullscreen ? 'collapse' : 'expand'} />
             {isFullscreen ? '退出全屏' : '全屏'}
           </button>
-          <Link className="btn btn-sm" to="/visuals">返回工坊</Link>
+          {isSaved && (
+            <Link className="btn btn-sm btn-primary" to={`/conversations?agent=viz-agent&visualId=${encodeURIComponent(id)}`}>
+              继续修改
+            </Link>
+          )}
+          <Link className="btn btn-sm" to="/visuals">返回素材库</Link>
           {!isSaved && (
             <button className="btn btn-sm btn-primary" type="button" onClick={saveVisual} disabled={saving}>
               {saving ? '保存中…' : '保存'}

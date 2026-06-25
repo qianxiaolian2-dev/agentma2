@@ -144,7 +144,7 @@ export function ChatPanel({ profile, layout = null, onPinToBoard, onApplyLayout 
       <div className="ds-chat-body" ref={scrollRef}>
         {!profile && (
           <div className="ds-chat-placeholder">
-            上传或选择数据源后,我会自动出一份初版看板,并告诉你接下来可以问什么。
+            载入一个工坊版本或补选数据源后,我会基于当前看板继续细化,而不是重新起一个独立会话。
           </div>
         )}
         {messages.map((m) => (
@@ -173,7 +173,7 @@ export function ChatPanel({ profile, layout = null, onPinToBoard, onApplyLayout 
         onSubmit={(e) => { e.preventDefault(); submit(input); }}>
         <input
           className="ds-chat-textbox"
-          placeholder={profile ? (pending ? '请等待回答…' : '问点什么…(回车发送)') : '请先选择数据源'}
+          placeholder={profile ? (pending ? '请等待回答…' : '问点什么…(回车发送)') : '请先载入版本或选择数据源'}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           disabled={!profile || pending}

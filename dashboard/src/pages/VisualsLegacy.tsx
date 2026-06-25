@@ -11,8 +11,6 @@ type VisualListItem = {
 
 type VisualsLegacyProps = {
   embedded?: boolean;
-  canAddToBoard?: boolean;
-  onAddToBoard?: (visual: VisualListItem) => void;
 };
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -39,8 +37,6 @@ function formatTime(value: number) {
 
 export default function VisualsLegacy({
   embedded = false,
-  canAddToBoard = false,
-  onAddToBoard,
 }: VisualsLegacyProps) {
   const [items, setItems] = useState<VisualListItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -92,7 +88,7 @@ export default function VisualsLegacy({
           </div>
           {embedded && (
             <div className="visuals-library-helper">
-              这里保存的是固定 HTML 结果。可以打开查看，也可以直接放进当前看板。
+              这里保存的是固定 HTML 结果。可以打开核对原页面，也可以回到会话继续修改。
             </div>
           )}
         </div>
@@ -104,8 +100,8 @@ export default function VisualsLegacy({
       {items.length === 0 && !loading ? (
         <div className="visuals-empty">
           <strong>暂无已保存可视化</strong>
-          <p>在会话中打开临时预览后，点击预览页右上角的“保存”即可归档到这里。</p>
-          <Link className="btn btn-primary" to="/conversations">去会话</Link>
+          <p>在会话中打开临时预览后，点击预览页右上角的“保存”即可归档到这里，后续也能从这里继续修改。</p>
+          <Link className="btn btn-primary" to="/conversations?agent=viz-agent">去会话生成页面</Link>
         </div>
       ) : (
         <div className="table-wrap">
@@ -131,17 +127,9 @@ export default function VisualsLegacy({
                   <td>{formatBytes(item.sizeBytes)}</td>
                   <td>
                     <div className="visual-row-actions">
-                      {onAddToBoard && (
-                        <button
-                          className="btn btn-sm btn-primary"
-                          type="button"
-                          onClick={() => onAddToBoard(item)}
-                          disabled={!canAddToBoard}
-                          title={canAddToBoard ? '把这个 HTML 页面放入当前看板' : '请先在上方生成或选择一个看板'}
-                        >
-                          放入看板
-                        </button>
-                      )}
+                      <Link className="btn btn-sm btn-primary" to={`/conversations?agent=viz-agent&visualId=${encodeURIComponent(item.id)}`}>
+                        继续修改
+                      </Link>
                       <Link className="btn btn-sm" to={`/viz?id=${encodeURIComponent(item.id)}`}>打开</Link>
                       <button
                         className="btn btn-sm btn-danger"
@@ -171,8 +159,8 @@ export default function VisualsLegacy({
     <div className={`visuals-page${embedded ? ' visuals-page-embedded' : ''}`}>
       {!embedded && (
         <div className="page-header">
-          <h1>我的可视化</h1>
-          <p>保存后的可视化产物会保留在这里，临时预览需要先在预览页保存。</p>
+          <h1>HTML 素材库</h1>
+          <p>保存后的 HTML 页面会保留在这里。可以重新打开，也可以直接回到会话继续修改。</p>
         </div>
       )}
 
