@@ -1556,16 +1556,6 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   } else {
     res.status(400).json({ error: 'need prompt or messages' }); return;
   }
-  if (sessionId) {
-    const visualPreviewPath = `/viz?cid=${encodeURIComponent(sessionId)}&path=viz/<slug>.html`;
-    effectiveSystemPrompt = [
-      effectiveSystemPrompt,
-      [
-        '[可视化预览] 用 agentma-visual skill 产出可视化时,把 HTML 写到 ./viz/<slug>.html,',
-        `并给用户这个 markdown 链接:${visualPreviewPath}`,
-      ].join('\n'),
-    ].filter(Boolean).join('\n\n');
-  }
   const selectedModel = [
     model,
     provider?.ANTHROPIC_MODEL,
