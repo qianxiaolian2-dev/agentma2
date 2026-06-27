@@ -1,6 +1,6 @@
 import type {
   SDKMessage, SdkOptions, SDKSessionInfo, SessionMessage,
-  McpServerStatus, HookEvent, HookCallbackMatcher, HookJSONOutput,
+  McpServerStatus, HookEvent, HookCallbackMatcher,
   AgentDefinition, PermissionMode, PermissionResult,
   TodoItem, FileCheckpoint, RateLimitInfo,
 } from './types';
@@ -100,7 +100,7 @@ class SdkSimulator {
   }
 
   // --- ClaudeSDKClient 操作 ---
-  async connect(prompt?: string): Promise<void> {
+  async connect(): Promise<void> {
     await this.delay(500);
     this.connected = true;
   }
@@ -172,7 +172,7 @@ class SdkSimulator {
     if (srv) srv.status = enabled ? 'connected' : 'disabled';
   }
 
-  async addMcpServer(name: string, config: Record<string, unknown>): Promise<void> {
+  async addMcpServer(name: string, _config: Record<string, unknown>): Promise<void> {
     await this.delay(400);
     this.mcpServers.push({
       name,
@@ -187,7 +187,7 @@ class SdkSimulator {
     return [...this.subagents];
   }
 
-  async stopSubagentTask(taskId: string): Promise<void> {
+  async stopSubagentTask(_taskId: string): Promise<void> {
     await this.delay(200);
   }
 
@@ -218,11 +218,11 @@ class SdkSimulator {
     return { ...this.hookConfigs };
   }
 
-  async triggerHook(event: HookEvent, toolName?: string): Promise<{ input: Record<string, unknown>; output: Record<string, unknown> }> {
+  async triggerHook(event: HookEvent, toolName?: string): Promise<{ event: HookEvent; input: Record<string, unknown>; output: Record<string, unknown> }> {
     await this.delay(300);
     const log = generateHookLog(event, toolName);
     this.hookLogs.push(log);
-    return { input: log.input, output: log.output };
+    return { event: log.event, input: log.input, output: log.output };
   }
 
   getHookLogs() {

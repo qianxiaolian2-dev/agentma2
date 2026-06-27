@@ -36,6 +36,15 @@ npm run dev
 - 前端：`5173`
 - 后端：`3001`
 
+## Agent 运行隔离开关
+
+租户 agent run 默认启用 SDK sandbox，并只传入最小环境变量白名单。可用以下环境变量临时调整：
+
+- `AGENTMA_SANDBOX_ENABLED`：默认开启；设为 `0` 可临时关闭 sandbox 排障。
+- `AGENTMA_SANDBOX_FAIL_IF_UNAVAILABLE`：默认开启；sandbox 不可用时报错退出。设为 `0` 会允许降级裸跑，仅用于排障。
+- `AGENTMA_SANDBOX_NETWORK_MANAGED_ONLY`：默认关闭；设为 `1` 后只允许 managed domains 网络策略，需先验证 WebFetch/远程 MCP/npx。
+- `AGENTMA_RUN_ENV_ALLOWLIST`：逗号分隔追加传入 agent run 的环境变量名。默认仅传 `PATH,LANG,LC_ALL,LC_CTYPE,TZ,TERM,TMPDIR,SHELL`，再注入本次 provider 的 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`。
+
 ## 构建
 
 仅构建前端静态资源：

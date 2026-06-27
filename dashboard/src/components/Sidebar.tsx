@@ -1,42 +1,71 @@
 import { NavLink } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
+import AgentMaMark from './AgentMaMark';
+import LineIcon from './LineIcon';
+import type { LineIconName } from './LineIcon';
 
 const SECTIONS = [
   {
     title: '核心',
     items: [
-      { path: '/', label: '总览', icon: '◈' },
-      { path: '/conversations', label: '会话', icon: '💬' },
-      { path: '/agents', label: 'Agent 市场', icon: '🤖' },
-      { path: '/playground', label: 'Playground', icon: '▶' },
-      { path: '/account', label: '账户管理', icon: '👤' },
-      { path: '/settings', label: '全局设置', icon: '⚙' },
-    ],
-  },
-  {
-    title: '接口',
-    items: [
-      { path: '/tools', label: '工具背包', icon: '🎒' },
-      { path: '/skills', label: '技能背包', icon: '✨' },
-      { path: '/hooks', label: 'Hook 系统', icon: '🪝' },
-      { path: '/subagents', label: '子代理管理', icon: '🤖' },
-      { path: '/permissions', label: '权限系统', icon: '🛡' },
+      { path: '/conversations', label: '会话', icon: 'chat' },
+      { path: '/agents', label: 'Agent 市场', icon: 'market' },
+      { path: '/knowledge', label: '知识库', icon: 'book' },
+      { path: '/visuals', label: 'HTML 素材库', icon: 'chart' },
+      { path: '/skills', label: '技能背包', icon: 'spark' },
+      { path: '/account', label: '账户管理', icon: 'user' },
     ],
   },
   {
     title: '运维',
     items: [
-      { path: '/observability', label: '可观测性', icon: '📊' },
+      { path: '/', label: '总览', icon: 'overview' },
+      { path: '/playground', label: 'Playground', icon: 'play' },
+      { path: '/settings', label: '全局设置', icon: 'gear' },
+      { path: '/tools', label: '工具背包', icon: 'tools' },
+      { path: '/hooks', label: 'Hook 系统', icon: 'hook' },
+      { path: '/subagents', label: '子代理管理', icon: 'agents' },
+      { path: '/permissions', label: '权限系统', icon: 'shield' },
+      { path: '/observability', label: '可观测性', icon: 'chart' },
+      { path: '/crawler', label: '操作后台', icon: 'tools' },
     ],
   },
-];
+] satisfies Array<{ title: string; items: Array<{ path: string; label: string; icon: LineIconName }> }>;
 
-export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
+type SidebarProps = {
+  collapsed?: boolean;
+  onNavigate?: () => void;
+  onToggleCollapsed?: () => void;
+};
+
+function userInitial(label?: string) {
+  const raw = (label || 'A').trim();
+  return raw.slice(0, 1).toUpperCase();
+}
+
+export default function Sidebar({ collapsed = false, onNavigate, onToggleCollapsed }: SidebarProps) {
   const { user, logout } = useAuth();
   return (
-    <nav className="sidebar-body" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div className="sidebar-logo">🐾 AgentMa</div>
-      <div style={{ flex: 1, overflow: 'auto' }}>
+    <nav className="sidebar-body">
+      <div className="sidebar-logo-row">
+        <div className="sidebar-logo" title="AgentMa">
+          <AgentMaMark className="sidebar-logo-mark" />
+          <span className="sidebar-logo-lockup">
+            <span className="sidebar-logo-text">agentma</span>
+            <span className="sidebar-logo-tag">agent management</span>
+          </span>
+        </div>
+        <button
+          type="button"
+          className="icon-btn sidebar-collapse-btn"
+          onClick={onToggleCollapsed}
+          aria-label={collapsed ? '展开侧边栏' : '折叠侧边栏'}
+          title={collapsed ? '展开侧边栏' : '折叠侧边栏'}
+        >
+          <LineIcon name={collapsed ? 'chevronRight' : 'chevronLeft'} />
+        </button>
+      </div>
+      <div className="sidebar-scroll">
         {SECTIONS.map(section => (
           <div className="sidebar-section" key={section.title}>
             <div className="sidebar-section-title">{section.title}</div>
@@ -46,18 +75,27 @@ export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
                 to={item.path}
                 end={item.path === '/'}
                 onClick={onNavigate}
+                title={collapsed ? item.label : undefined}
                 className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}
               >
-                <span>{item.icon}</span>
-                <span>{item.label}</span>
+                <span className="sidebar-link-icon">
+                  <LineIcon name={item.icon} />
+                </span>
+                <span className="sidebar-link-label">{item.label}</span>
               </NavLink>
             ))}
           </div>
         ))}
       </div>
-      <div style={{ padding: '12px 20px', borderTop: '1px solid var(--border)', fontSize: '.8em' }}>
-        {user && <div style={{ marginBottom: 6, color: 'var(--ink-secondary)' }}>{user.email}</div>}
-        <button className="btn btn-sm" onClick={logout} style={{ width: '100%' }}>登出</button>
+      <div className="sidebar-footer">
+        <span className="sidebar-user-chip">{userInitial(user?.username || user?.name || user?.email)}</span>
+        <span className="sidebar-user-meta">
+          <span className="sidebar-user-name">{user?.username || user?.name || 'AgentMa'}</span>
+          {user && <span className="sidebar-user-mail" title={user.email}>{user.email}</span>}
+        </span>
+        <button className="icon-btn sidebar-logout-btn" onClick={logout} title="登出" aria-label="登出">
+          <LineIcon name="logout" />
+        </button>
       </div>
     </nav>
   );

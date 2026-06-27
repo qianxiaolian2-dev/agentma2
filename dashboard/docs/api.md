@@ -114,13 +114,15 @@ Authorization: Bearer <jwt-or-api-key>
     { "role": "user", "content": "你好" }
   ],
   "systemPrompt": "你是一个助手",
+  "model": "deepseek-v4-pro",
   "provider": {
     "ANTHROPIC_AUTH_TOKEN": "sk-xxx",
-    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-    "ANTHROPIC_MODEL": "deepseek-v4-pro"
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"
   }
 }
 ```
+
+`model` 表示本次运行使用的 Agent 模型；账户管理只维护供应商 API 凭据和可用模型清单，不再配置供应商默认模型。`provider.ANTHROPIC_MODEL` 仅作为旧客户端兼容兜底。
 
 返回格式：
 
@@ -151,12 +153,13 @@ Authorization: Bearer <jwt-or-api-key>
 
 隔离规则：
 
-- 按 `tenant_id + owner_sub` 隔离
-- 不同租户、不同登录身份互相不可见
+- 默认按 `tenant_id + owner_sub` 隔离
+- 开启协作后，同租户内已加入该会话的成员也可见
+- 不同租户、未加入的登录身份互相不可见
 
 ### `GET /api/chat-sessions`
 
-返回当前登录用户可见的全部会话，按 `pinned DESC, updatedAt DESC` 排序。
+返回当前登录用户可见的全部会话，包括自己创建的会话和已加入的协作会话，按 `pinned DESC, updatedAt DESC` 排序。
 
 响应示例：
 
@@ -164,6 +167,7 @@ Authorization: Bearer <jwt-or-api-key>
 [
   {
     "id": "chat-123",
+    "ownerSub": "admin@example.com",
     "templateId": "agent-1",
     "title": "帮我看一下日志",
     "messages": [
@@ -172,6 +176,9 @@ Authorization: Bearer <jwt-or-api-key>
     ],
     "model": "deepseek-v4-pro",
     "pinned": false,
+    "collaborationEnabled": true,
+    "collaborationRole": "owner",
+    "collaborationUpdatedAt": 1780081795000,
     "createdAt": 1780081794000,
     "updatedAt": 1780081795000
   }
@@ -211,10 +218,11 @@ Authorization: Bearer <jwt-or-api-key>
 - `templateId` 必填
 - `messages` 会整体替换，不是增量追加
 - 若 `id` 不存在则创建，存在则更新
+- 已加入协作会话的成员可保存共享消息，但不能通过该接口改标题、置顶等 owner 元数据
 
 ### `PATCH /api/chat-sessions/:id`
 
-更新会话元数据，不改消息正文。
+Owner 更新会话元数据，不改消息正文。
 
 当前支持字段：
 
@@ -227,9 +235,59 @@ Authorization: Bearer <jwt-or-api-key>
 }
 ```
 
+### `PATCH /api/chat-sessions/:id/collaboration`
+
+Owner 开启或关闭协作。
+
+请求体：
+
+```json
+{
+  "enabled": true
+}
+```
+
+说明：
+
+- 开启后，同租户用户可通过分享链接加入
+- 关闭后，会移除成员访问权限
+
+### `POST /api/chat-sessions/:id/join`
+
+当前 JWT 用户加入已开启协作的同租户会话。
+
+说明：
+
+- API Key 身份不能加入协作会话
+- 未开启协作、跨租户、或不存在的会话返回 404
+- 成功后该会话会出现在 `GET /api/chat-sessions` 列表中
+
+### `GET /api/chat-sessions/:id/events`
+
+订阅协作会话变更事件。
+
+返回格式：
+
+- `Content-Type: text/event-stream`
+- 事件体统一为 `data: {...}\n\n`
+
+常见事件：
+
+```json
+{ "type": "connected", "sessionId": "chat-123" }
+{ "type": "session_updated", "sessionId": "chat-123", "updatedAt": 1780081795000 }
+{ "type": "session_deleted", "sessionId": "chat-123", "deletedAt": 1780081796000 }
+```
+
+客户端收到 `session_updated` 后应重新读取 `GET /api/chat-sessions/:id`，不要把事件体当作完整状态。
+
+### `POST /api/chat-sessions/:id/fork`
+
+复制当前可访问会话为自己的私有会话。Owner 和协作成员都可使用。
+
 ### `DELETE /api/chat-sessions/:id`
 
-删除会话及其全部消息。
+Owner 删除会话及其全部消息。
 
 响应示例：
 
@@ -243,6 +301,7 @@ Authorization: Bearer <jwt-or-api-key>
 
 - `GET /api/chat-sessions` 会直接返回完整消息数组，数据量大时会偏重
 - `POST /api/chat-sessions` 采用整段覆盖写入，不是 append-only
+- 协作会话同时保存时仍是后完成的请求覆盖前一个完整消息数组
 - 暂未提供分页、搜索、摘要列表、单独消息追加接口
 
 如果后续要给外部系统正式接入，建议下一版拆成：
@@ -274,6 +333,21 @@ Authorization: Bearer <jwt-or-api-key>
 ### `GET /api/users`
 
 列出当前租户用户。
+
+### `POST /api/users`
+
+管理员在当前租户内创建用户。
+
+请求体示例：
+
+```json
+{
+  "name": "Member",
+  "email": "member@example.com",
+  "password": "secret123",
+  "role": "member"
+}
+```
 
 ### `PATCH /api/users/:email`
 
@@ -383,11 +457,93 @@ Authorization: Bearer <jwt-or-api-key>
 
 读取当前租户共享的 Agent 模板列表。
 
+### `GET /api/agents/:id/claude-md`
+
+预览指定 Agent 真实运行时会加载的 `CLAUDE.md` / `CLAUDE.local.md` 文件。服务端优先使用该 Agent 最近一次可访问会话的 `sdkCwd`；如果没有运行会话，则按新会话默认临时 cwd 展示候选路径。响应包含 cwd 来源、候选文件命中状态、已加载文件列表和合并后的原始 Markdown。
+
 ### `PUT /api/agents`
 
 整段替换当前租户的 Agent 模板列表。
 
-## 11. 事件与部署
+## 11. Skills 公共目录
+
+公共技能只支持学习成用户背包副本，不支持运行时引用、启用或直接使用公共技能。
+
+### `GET /api/skills/public`
+
+列出公共技能。
+
+响应示例：
+
+```json
+[
+  {
+    "id": "skill-public-1",
+    "slug": "code-review",
+    "name": "code-review",
+    "description": "代码审查技能",
+    "authorSub": "admin@example.com",
+    "authorTenantId": "tenant-uuid",
+    "revision": 1,
+    "publishedAt": 1780081794000,
+    "updatedAt": 1780081794000
+  }
+]
+```
+
+### `GET /api/skills/public/:id`
+
+读取单个公共技能详情。`:id` 可以是公共技能 `id` 或 `slug`。
+
+### `POST /api/skills/public/:id/learn`
+
+把公共技能复制到当前用户的技能背包。学习后得到的是用户级技能副本，后续公共技能更新不会自动同步到该副本。
+
+请求体：
+
+```json
+{
+  "nameOverride": "code-review-copy"
+}
+```
+
+`nameOverride` 可选，用于解决用户背包里已有同名技能的情况。
+
+成功响应示例：
+
+```json
+{
+  "name": "code-review-copy",
+  "description": "代码审查技能",
+  "location": "user",
+  "path": "/Users/me/.claude/skills/code-review-copy/",
+  "enabled": false,
+  "installed": true,
+  "learnedFromPublicSkillId": "skill-public-1",
+  "learnedFromPublicRevision": 1,
+  "learnedAt": 1780081795000
+}
+```
+
+### `POST /api/skills/public`
+
+管理员把用户背包里的技能发布到公共目录。
+
+请求体：
+
+```json
+{
+  "path": "/Users/me/.claude/skills/code-review/",
+  "name": "code-review",
+  "description": "代码审查技能"
+}
+```
+
+### `PATCH /api/skills/public/:id`
+
+管理员更新本租户发布的公共技能。传入 `path` 或 `skillName` 时会复制新的技能包并递增 `revision`；只改 `name`、`description` 或 `slug` 时只更新公共目录信息。
+
+## 12. 事件与部署
 
 这部分接口主要服务当前站内的 MCP/事件桥接，不是稳定公开 API。
 

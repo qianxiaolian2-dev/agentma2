@@ -1,37 +1,54 @@
-import { useState, useEffect, useRef } from 'react';
+import { useRef, useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { AgentTemplate, EffortLevel, PermissionMode, SkillInfo, RegisteredTool } from '../simulator/types';
-import { BUILT_IN_TOOLS, EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, MOCK_MCP_SERVERS, initCustomTools } from '../simulator/mock-data';
+import type { AgentDefinition, AgentTemplate, EffortLevel, PermissionMode, SkillInfo, RegisteredTool } from '../simulator/types';
+import { EFFORT_LEVELS, PERMISSION_MODES, DEFAULT_SKILLS, initCustomTools } from '../simulator/mock-data';
+import { useAuth } from '../contexts/AuthContext';
+import { bootstrapAgentTemplates, loadCachedAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
 import { getAuthHeaders } from '../utils/client-runtime';
+import { listProviderModels, resolveProviderForModel } from '../utils/providers';
 
-const LS_AGENTS = 'agentma_templates';
+type KnowledgeSource = {
+  id: string;
+  name: string;
+  path: string;
+  enabled: boolean;
+};
 
-// Instant paint from the local cache; the tenant-shared server copy is fetched on mount and is authoritative.
-function loadCachedTemplates(): AgentTemplate[] {
-  try { const raw = localStorage.getItem(LS_AGENTS); if (raw) return JSON.parse(raw); } catch {}
-  return [];
-}
+type ClaudeMdPreviewFile = {
+  source: 'user' | 'project' | 'local';
+  label: string;
+  path: string;
+  exists: boolean;
+  bytes?: number;
+  mtimeMs?: number;
+  content?: string;
+  error?: string;
+};
 
-// Mirror to localStorage so other pages (Conversations / AgentChat) that read the cache stay in sync.
-function cacheTemplates(list: AgentTemplate[]) {
-  try { localStorage.setItem(LS_AGENTS, JSON.stringify(list)); } catch {}
-}
+type ClaudeMdPreview = {
+  agentId: string;
+  agentName: string;
+  cwd: string;
+  cwdExists: boolean;
+  cwdSource: 'latest_session' | 'template_seed' | 'new_session';
+  latestSession: { id: string; title: string; updatedAt: number } | null;
+  settingSources: Array<'user' | 'project' | 'local'>;
+  files: ClaudeMdPreviewFile[];
+  loadedFiles: string[];
+  effectiveContent: string;
+  generatedAt: number;
+  notes: string[];
+};
 
-async function fetchTemplates(): Promise<AgentTemplate[]> {
-  const r = await fetch('/api/agents', { headers: getAuthHeaders() });
-  if (!r.ok) throw new Error(`GET /api/agents ${r.status}`);
-  const list = await r.json();
-  return Array.isArray(list) ? list : [];
-}
-
-async function saveTemplates(list: AgentTemplate[]) {
-  cacheTemplates(list);
-  await fetch('/api/agents', {
-    method: 'PUT',
-    headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify(list),
-  });
-}
+type AgentImportReport = {
+  templateId: string;
+  seedDir: string;
+  unpacked: Array<{ path: string; bytes: number; category: string }>;
+  detected: { agents: string[]; skills: string[]; claudeMd: boolean; remoteMcp: string[] };
+  disabled: { hooks: string[]; stdioMcp: string[] };
+  skipped: Array<{ path: string; reason: string }>;
+  notes: string[];
+};
 
 function loadSkills(): SkillInfo[] {
   try { const raw = localStorage.getItem('agentma_skills'); if (raw) return JSON.parse(raw); } catch {}
@@ -43,14 +60,79 @@ function loadMcpServers(): { name: string }[] {
   return [];
 }
 
+function normalizeKnowledgeSources(value: unknown): KnowledgeSource[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const raw = item as Record<string, unknown>;
+    const id = typeof raw.id === 'string' ? raw.id : '';
+    const path = typeof raw.path === 'string' ? raw.path : '';
+    if (!id || !path || Number(raw.archivedAt) || Number(raw.deletedAt)) return [];
+    return [{
+      id,
+      name: typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : path.split('/').filter(Boolean).pop() || '知识库',
+      path,
+      enabled: raw.enabled !== false,
+    }];
+  });
+}
+
+function getDirectoryRelativePath(file: File) {
+  return ((file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name).replace(/\\/g, '/');
+}
+
 function newTemplate(): AgentTemplate {
   return {
     id: '', name: '', description: '', systemPrompt: '',
-    model: 'deepseek-v4-pro[1m]', tools: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'],
-    mcpServers: [], eventSources: [], skills: [],
+    model: '', tools: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'],
+    mcpServers: [], eventSources: [], skills: [], knowledgeSourceIds: [],
     effort: 'high', maxTurns: 50, permissionMode: 'default',
-    providerOverrides: {},
     createdAt: Date.now(), updatedAt: Date.now(),
+  };
+}
+
+function defaultSubagent(): AgentDefinition {
+  return {
+    description: '只读代码探索代理',
+    prompt: '你是一个只读代码探索子代理。分析文件和结构，最后给出简短结论，不修改文件。',
+    tools: ['Read', 'Grep', 'Glob'],
+    effort: 'medium',
+    permissionMode: 'default',
+  };
+}
+
+function getCloneTemplateName(sourceName: string, templates: AgentTemplate[]) {
+  const existingNames = new Set(templates.map(template => template.name.trim()).filter(Boolean));
+  const baseName = `${sourceName.trim() || '未命名 Agent'} 克隆`;
+  let name = baseName;
+  let suffix = 2;
+  while (existingNames.has(name)) {
+    name = `${baseName} ${suffix}`;
+    suffix += 1;
+  }
+  return name;
+}
+
+function getCloneTemplateId(templates: AgentTemplate[], now: number) {
+  const existingIds = new Set(templates.map(template => template.id));
+  let id = `agent-${now}`;
+  let suffix = 2;
+  while (existingIds.has(id)) {
+    id = `agent-${now}-${suffix}`;
+    suffix += 1;
+  }
+  return id;
+}
+
+function cloneTemplate(source: AgentTemplate, templates: AgentTemplate[]): AgentTemplate {
+  const now = Date.now();
+  const cloned = JSON.parse(JSON.stringify(source)) as AgentTemplate;
+  return {
+    ...cloned,
+    id: getCloneTemplateId(templates, now),
+    name: getCloneTemplateName(source.name, templates),
+    createdAt: now,
+    updatedAt: now,
   };
 }
 
@@ -63,23 +145,206 @@ const TOOL_CATEGORIES = [
   { name: 'mcp', label: 'MCP', tools: ['ListMcpResources', 'ReadMcpResource'] },
   { name: 'notebook', label: 'Notebook', tools: ['NotebookEdit'] },
 ];
+const KNOWLEDGE_TOOLS = ['Read', 'Grep', 'Glob'];
+
+type ModelPickerProps = {
+  value: string;
+  models: string[];
+  onChange: (value: string) => void;
+  allowEmpty?: boolean;
+  placeholder?: string;
+};
+
+function ModelPicker({ value, models, onChange, allowEmpty = false, placeholder = '选择模型' }: ModelPickerProps) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredModels = models.filter(model => model.toLowerCase().includes(normalizedQuery));
+  const displayValue = open ? query : value;
+  const disabled = models.length === 0 && !allowEmpty;
+
+  const choose = (model: string) => {
+    onChange(model);
+    setQuery('');
+    setOpen(false);
+  };
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <input
+        value={displayValue}
+        onFocus={() => {
+          setOpen(true);
+          setQuery('');
+        }}
+        onChange={event => {
+          setQuery(event.target.value);
+          setOpen(true);
+        }}
+        onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+        onKeyDown={event => {
+          if (event.key === 'Enter' && open) {
+            event.preventDefault();
+            const first = filteredModels[0] || (allowEmpty && !query.trim() ? '' : undefined);
+            if (first !== undefined) choose(first);
+          }
+          if (event.key === 'Escape') setOpen(false);
+        }}
+        placeholder={models.length ? placeholder : '先到账户管理配置可用模型'}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        disabled={disabled}
+        style={{ fontFamily: 'var(--font-mono)', paddingRight: 34 }}
+      />
+      <button
+        type="button"
+        className="btn btn-sm"
+        onMouseDown={event => event.preventDefault()}
+        onClick={() => {
+          if (!disabled) {
+            setOpen(current => !current);
+            setQuery('');
+          }
+        }}
+        disabled={disabled}
+        aria-label="展开模型列表"
+        style={{ position: 'absolute', right: 5, top: 5, width: 26, height: 26, padding: 0 }}
+      >
+        ▾
+      </button>
+      {open && !disabled && (
+        <div
+          role="listbox"
+          style={{
+            position: 'absolute',
+            zIndex: 120,
+            top: 'calc(100% + 4px)',
+            left: 0,
+            right: 0,
+            maxHeight: 220,
+            overflowY: 'auto',
+            border: '1px solid var(--border)',
+            borderRadius: 6,
+            background: 'var(--bg-card)',
+            boxShadow: '0 12px 32px rgba(0, 0, 0, .18)',
+          }}
+        >
+          {allowEmpty && !normalizedQuery && (
+            <button
+              type="button"
+              role="option"
+              className="btn btn-sm"
+              onMouseDown={event => event.preventDefault()}
+              onClick={() => choose('')}
+              style={{ width: '100%', justifyContent: 'flex-start', border: 0, borderRadius: 0 }}
+            >
+              继承主模型
+            </button>
+          )}
+          {filteredModels.map(model => (
+            <button
+              type="button"
+              role="option"
+              aria-selected={model === value}
+              key={model}
+              className="btn btn-sm"
+              onMouseDown={event => event.preventDefault()}
+              onClick={() => choose(model)}
+              style={{
+                width: '100%',
+                justifyContent: 'flex-start',
+                border: 0,
+                borderRadius: 0,
+                fontFamily: 'var(--font-mono)',
+                background: model === value ? 'var(--accent-bg)' : 'transparent',
+              }}
+            >
+              {model}
+            </button>
+          ))}
+          {filteredModels.length === 0 && (
+            <div style={{ padding: '8px 10px', color: 'var(--ink-muted)', fontSize: '.78em' }}>
+              没有匹配的可用模型
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Agents() {
   const navigate = useNavigate();
-  const [templates, setTemplates] = useState<AgentTemplate[]>(loadCachedTemplates);
-  const didLoad = useRef(false);
+  const { user } = useAuth();
+  const [templates, setTemplates] = useState<AgentTemplate[]>([]);
   const [form, setForm] = useState<AgentTemplate>(newTemplate());
   const [isEditing, setIsEditing] = useState(false);
+  const [isEditorOpen, setIsEditorOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [previewAgent, setPreviewAgent] = useState<AgentTemplate | null>(null);
+  const [claudeMdPreview, setClaudeMdPreview] = useState<ClaudeMdPreview | null>(null);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
+  const [importReport, setImportReport] = useState<AgentImportReport | null>(null);
+  const [importedAgent, setImportedAgent] = useState<AgentTemplate | null>(null);
+  const [isImportReportOpen, setIsImportReportOpen] = useState(false);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
   // 动态加载技能和 MCP 服务器（非写死）
   const [liveSkills] = useState<SkillInfo[]>(loadSkills);
   const [liveMcp] = useState<{ name: string }[]>(loadMcpServers);
+  const [liveKnowledgeSources, setLiveKnowledgeSources] = useState<KnowledgeSource[]>([]);
   const [liveEventSources, setLiveEventSources] = useState<Array<{ name: string; type: string; url: string; enabled: boolean }>>([]);
+  const modelSuggestions = listProviderModels();
+  const availableModelSet = new Set(modelSuggestions);
+  const selectedModel = form.model.trim();
+  const selectedModelAvailable = selectedModel ? availableModelSet.has(selectedModel) : false;
+  const providerMatch = selectedModelAvailable ? resolveProviderForModel(selectedModel) : null;
 
   useEffect(() => {
     fetch('/api/events/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'list' }) })
       .then(r => r.json()).then(data => { if (Array.isArray(data)) setLiveEventSources(data); }).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!user?.tenantId) return;
+    fetch('/api/knowledge/sources', { headers: getAuthHeaders() })
+      .then(r => r.ok ? r.json() : [])
+      .then(data => setLiveKnowledgeSources(normalizeKnowledgeSources(data)))
+      .catch(() => setLiveKnowledgeSources([]));
+  }, [user?.tenantId]);
   const [liveCustomTools, setLiveCustomTools] = useState<RegisteredTool[]>(() => initCustomTools());
+  const subagentEntries = Object.entries(form.subagents || {});
+
+  useEffect(() => {
+    if (!isEditorOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsEditorOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isEditorOpen]);
+
+  useEffect(() => {
+    if (!isPreviewOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsPreviewOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isPreviewOpen]);
+
+  useEffect(() => {
+    if (!isImportReportOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setIsImportReportOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isImportReportOpen]);
 
   // 每次页面可见时刷新自定义工具
   useEffect(() => {
@@ -91,53 +356,227 @@ export default function Agents() {
     return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('storage', onStorage); };
   }, []);
 
-  // Load tenant-shared agents from the server on mount (overrides the local cache).
   useEffect(() => {
-    fetchTemplates()
-      .then(list => { setTemplates(list); cacheTemplates(list); })
-      .catch(() => {})
-      .finally(() => { didLoad.current = true; });
-  }, []);
+    if (!user?.tenantId) return;
 
-  // Persist changes to the server (and mirror to cache); skip until the initial load completes.
+    let cancelled = false;
+    setTemplates(loadCachedAgentTemplates(user.tenantId));
+    setIsLoading(true);
+
+    void bootstrapAgentTemplates(user.tenantId, user.role === 'tenant_admin')
+      .then((list) => {
+        if (cancelled) return;
+        setTemplates(list);
+        setError('');
+      })
+      .catch((loadError) => {
+        if (cancelled) return;
+        setError((loadError as Error).message || '加载 Agent 失败');
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [user?.tenantId, user?.role]);
+
   useEffect(() => {
-    if (!didLoad.current) return;
-    void saveTemplates(templates).catch(() => {});
-  }, [templates]);
+    if (!form.id) return;
+    const current = templates.find((template) => template.id === form.id);
+    if (current) {
+      const selectedKnowledgeIds = (current.knowledgeSourceIds || []).length
+        ? current.knowledgeSourceIds || []
+        : current.useKnowledge
+          ? liveKnowledgeSources.filter(source => source.enabled).map(source => source.id)
+          : [];
+      setForm({
+        ...current,
+        knowledgeSourceIds: selectedKnowledgeIds,
+        useKnowledge: selectedKnowledgeIds.length > 0 || current.useKnowledge || undefined,
+      });
+      setIsEditing(true);
+      return;
+    }
+    if (isEditing) {
+      setForm(newTemplate());
+      setIsEditing(false);
+    }
+  }, [templates, form.id, isEditing, liveKnowledgeSources]);
 
   const handleSelect = (t: AgentTemplate) => {
-    setForm({ ...t });
+    const selectedKnowledgeIds = (t.knowledgeSourceIds || []).length
+      ? t.knowledgeSourceIds || []
+      : t.useKnowledge
+        ? liveKnowledgeSources.filter(source => source.enabled).map(source => source.id)
+        : [];
+    setForm({
+      ...t,
+      knowledgeSourceIds: selectedKnowledgeIds,
+      useKnowledge: selectedKnowledgeIds.length > 0 || t.useKnowledge || undefined,
+    });
     setIsEditing(true);
+    setIsEditorOpen(true);
   };
 
   const handleNew = () => {
     setForm(newTemplate());
     setIsEditing(false);
+    setIsEditorOpen(true);
   };
 
-  const handleSave = () => {
-    if (!form.name.trim()) return;
+  const handleClone = async (source: AgentTemplate) => {
+    if (!user?.tenantId) return;
+    const cloned = cloneTemplate(source, templates);
+    const nextTemplates = [cloned, ...templates];
+
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      const persistedClone = persisted.find((template) => template.id === cloned.id) || cloned;
+      setTemplates(persisted);
+      setForm(persistedClone);
+      setIsEditing(true);
+      setIsEditorOpen(true);
+      setError('');
+    } catch (saveError) {
+      setError((saveError as Error).message || '克隆 Agent 失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (!form.name.trim() || !user?.tenantId) return;
+    if (!modelSuggestions.length) {
+      setError('请先到账户管理 -> 供应商配置至少一个可用模型');
+      return;
+    }
+    if (!selectedModel || !availableModelSet.has(selectedModel)) {
+      setError('请选择供应商中已配置的可用模型');
+      return;
+    }
+    const invalidSubagent = Object.entries(form.subagents || {}).find(([, agent]) => (
+      agent.model && !availableModelSet.has(agent.model)
+    ));
+    if (invalidSubagent) {
+      setError(`子代理 ${invalidSubagent[0]} 的模型不在供应商可用模型中`);
+      return;
+    }
+    const selectedProviderId = providerMatch?.profile.id || resolveProviderForModel(selectedModel).profile.id;
+    const crossProviderSubagent = Object.entries(form.subagents || {}).find(([, agent]) => (
+      agent.model && resolveProviderForModel(agent.model).profile.id !== selectedProviderId
+    ));
+    if (crossProviderSubagent) {
+      setError(`子代理 ${crossProviderSubagent[0]} 的模型属于另一个供应商；同一次 SDK 运行只能使用一个供应商`);
+      return;
+    }
     const now = Date.now();
+    const selectedKnowledgeIds = (form.knowledgeSourceIds || []).filter(Boolean);
+    const selectedSkills = form.skills || [];
+    const hasLegacyAllKnowledge = Boolean(form.useKnowledge && selectedKnowledgeIds.length === 0 && liveKnowledgeSources.length === 0);
+    const effectiveTools = selectedSkills.length > 0
+      ? Array.from(new Set([...form.tools, 'Skill']))
+      : form.tools;
     const saved: AgentTemplate = {
       ...form,
       id: form.id || `agent-${now}`,
       name: form.name.trim(),
+      model: selectedModel,
+      knowledgeSourceIds: selectedKnowledgeIds,
+      useKnowledge: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge || undefined,
+      providerOverrides: undefined,
+      tools: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge
+        ? Array.from(new Set([...effectiveTools, ...KNOWLEDGE_TOOLS]))
+        : effectiveTools,
       createdAt: form.createdAt || now,
       updatedAt: now,
     };
+    const nextTemplates = isEditing
+      ? templates.map(t => t.id === saved.id ? saved : t)
+      : [saved, ...templates];
 
-    if (isEditing) {
-      setTemplates(prev => prev.map(t => t.id === saved.id ? saved : t));
-    } else {
-      setTemplates(prev => [saved, ...prev]);
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      setTemplates(persisted);
+      setForm(persisted.find((template) => template.id === saved.id) || saved);
+      setIsEditing(true);
+      setError('');
+    } catch (saveError) {
+      setError((saveError as Error).message || '保存 Agent 失败');
+    } finally {
+      setIsSaving(false);
     }
-    setForm(saved);
-    setIsEditing(true);
   };
 
-  const handleDelete = (id: string) => {
-    setTemplates(prev => prev.filter(t => t.id !== id));
-    if (form.id === id) { setForm(newTemplate()); setIsEditing(false); }
+  const handleDelete = async (id: string) => {
+    if (!user?.tenantId) return;
+    const nextTemplates = templates.filter(t => t.id !== id);
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      setTemplates(persisted);
+      setError('');
+      if (form.id === id) {
+        setForm(newTemplate());
+        setIsEditing(false);
+        setIsEditorOpen(false);
+      }
+    } catch (saveError) {
+      setError((saveError as Error).message || '删除 Agent 失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleImportDirectory = async (fileList: FileList | null) => {
+    const files = Array.from(fileList || []);
+    if (importInputRef.current) importInputRef.current.value = '';
+    if (!files.length || !user?.tenantId) return;
+
+    setIsImporting(true);
+    setError('');
+    try {
+      const formData = new FormData();
+      formData.append('mode', 'new');
+      for (const file of files) {
+        formData.append('files', file, file.name);
+        formData.append('relativePaths', getDirectoryRelativePath(file));
+      }
+      const response = await fetch('/api/agents/import', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: formData,
+      });
+      const text = await response.text();
+      let data: { template?: AgentTemplate; report?: AgentImportReport; error?: string } = {};
+      if (text) {
+        const trimmed = text.trimStart();
+        if (trimmed.startsWith('<')) {
+          throw new Error(`导入接口返回了 HTML (${response.status})，后端可能未部署 /api/agents/import 或 /api 代理指向旧服务`);
+        }
+        try {
+          data = JSON.parse(text) as { template?: AgentTemplate; report?: AgentImportReport; error?: string };
+        } catch {
+          throw new Error('导入接口返回了无法解析的响应');
+        }
+      }
+      if (!response.ok) throw new Error(data.error || `导入失败: ${response.status}`);
+      if (!data.template || !data.report) throw new Error('导入响应缺少模板或报告');
+      const refreshed = await bootstrapAgentTemplates(user.tenantId, user.role === 'tenant_admin');
+      setTemplates(refreshed);
+      const savedTemplate = refreshed.find((template) => template.id === data.template?.id) || data.template;
+      setForm(savedTemplate);
+      setIsEditing(true);
+      setIsEditorOpen(false);
+      setImportedAgent(savedTemplate);
+      setImportReport(data.report);
+      setIsImportReportOpen(true);
+    } catch (importError) {
+      setError((importError as Error).message || '导入 Agent 失败');
+    } finally {
+      setIsImporting(false);
+    }
   };
 
   const toggleTool = (tool: string) => {
@@ -147,6 +586,59 @@ export default function Agents() {
         ? prev.tools.filter(t => t !== tool)
         : [...prev.tools, tool],
     }));
+  };
+
+  const toggleKnowledgeSource = (sourceId: string) => {
+    setForm(prev => ({
+      ...prev,
+      knowledgeSourceIds: (prev.knowledgeSourceIds || []).includes(sourceId)
+        ? (prev.knowledgeSourceIds || []).filter(id => id !== sourceId)
+        : [...(prev.knowledgeSourceIds || []), sourceId],
+    }));
+  };
+
+  const addSubagent = () => {
+    setForm(prev => {
+      const count = Object.keys(prev.subagents || {}).length + 1;
+      return {
+        ...prev,
+        tools: prev.tools.includes('Agent') ? prev.tools : [...prev.tools, 'Agent'],
+        subagents: {
+          ...(prev.subagents || {}),
+          [`worker-${count}`]: defaultSubagent(),
+        },
+      };
+    });
+  };
+
+  const renameSubagent = (oldName: string, nextName: string) => {
+    const cleanName = nextName.trim();
+    if (!cleanName || cleanName === oldName) return;
+    setForm(prev => {
+      const subagents = { ...(prev.subagents || {}) };
+      if (!subagents[oldName] || subagents[cleanName]) return prev;
+      subagents[cleanName] = subagents[oldName];
+      delete subagents[oldName];
+      return { ...prev, subagents };
+    });
+  };
+
+  const updateSubagent = (name: string, patch: Partial<AgentDefinition>) => {
+    setForm(prev => ({
+      ...prev,
+      subagents: {
+        ...(prev.subagents || {}),
+        [name]: { ...(prev.subagents || {})[name], ...patch },
+      },
+    }));
+  };
+
+  const deleteSubagent = (name: string) => {
+    setForm(prev => {
+      const subagents = { ...(prev.subagents || {}) };
+      delete subagents[name];
+      return { ...prev, subagents };
+    });
   };
 
   const toggleMcp = (srv: string) => {
@@ -176,8 +668,40 @@ export default function Agents() {
     }));
   };
 
-  const startChat = (t: AgentTemplate) => {
-    navigate('/conversations');
+  const openClaudeMdPreview = async (agent: AgentTemplate) => {
+    setPreviewAgent(agent);
+    setClaudeMdPreview(null);
+    setPreviewError('');
+    setIsPreviewOpen(true);
+    setIsPreviewLoading(true);
+    try {
+      const response = await fetch(`/api/agents/${encodeURIComponent(agent.id)}/claude-md`, {
+        headers: getAuthHeaders(),
+      });
+      const text = await response.text();
+      const data = text ? JSON.parse(text) : null;
+      if (!response.ok) {
+        const message = data && typeof data === 'object' && 'error' in data
+          ? String((data as { error?: unknown }).error || '读取 CLAUDE.md 失败')
+          : `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+      setClaudeMdPreview(data as ClaudeMdPreview);
+    } catch (previewLoadError) {
+      setPreviewError((previewLoadError as Error).message || '读取 CLAUDE.md 失败');
+    } finally {
+      setIsPreviewLoading(false);
+    }
+  };
+
+  const startChat = (agentId: string) => {
+    navigate(`/conversations?agent=${encodeURIComponent(agentId)}`);
+  };
+
+  const formatBytes = (bytes?: number) => {
+    if (!Number.isFinite(bytes)) return '';
+    if ((bytes || 0) < 1024) return `${bytes} B`;
+    return `${Math.round((bytes || 0) / 1024)} KB`;
   };
 
   return (
@@ -187,34 +711,106 @@ export default function Agents() {
         <p>创建可复用的 Agent 配置模版，选择工具和技能，保存后开启多轮对话</p>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr', gap: 20 }}>
-        {/* 模板列表 */}
-        <div>
-          <button className="btn btn-primary mb-4" onClick={handleNew} style={{ width: '100%' }}>
-            + 新建 Agent
-          </button>
+      {error && (
+        <div className="card" style={{ marginBottom: 16, borderColor: 'var(--danger)', color: 'var(--danger)' }}>
+          {error}
+        </div>
+      )}
 
-          {templates.length === 0 ? (
+      <div className="agents-page-shell">
+        {/* 模板列表 */}
+        <div className="agents-list-panel">
+          <div className="agents-list-toolbar mb-4">
+            <button className="btn btn-primary" onClick={handleNew} disabled={isSaving || isImporting}>
+              + 新建 Agent
+            </button>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => importInputRef.current?.click()}
+              disabled={isSaving || isImporting}
+            >
+              {isImporting ? '导入中...' : '导入本地项目'}
+            </button>
+            <input
+              ref={importInputRef}
+              type="file"
+              multiple
+              {...({ webkitdirectory: '', directory: '' } as Record<string, string>)}
+              style={{ display: 'none' }}
+              onChange={event => { void handleImportDirectory(event.target.files); }}
+            />
+          </div>
+
+          {isLoading ? (
+            <div className="card" style={{ textAlign: 'center', color: 'var(--ink-muted)', padding: 40 }}>
+              加载中...
+            </div>
+          ) : templates.length === 0 ? (
             <div className="card" style={{ textAlign: 'center', color: 'var(--ink-muted)', padding: 40 }}>
               暂无 Agent，点击上方按钮创建
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div className="agents-list-grid">
               {templates.map(t => (
                 <div
                   key={t.id}
                   className={`agent-card ${form.id === t.id ? 'selected' : ''}`}
                   onClick={() => handleSelect(t)}
                 >
-                  <div className="flex-between">
+                  <div className="agent-card-head">
                     <div className="agent-card-name">{t.name}</div>
-                    <span style={{ fontSize: '.7em', color: 'var(--ink-muted)' }}>
-                      {new Date(t.updatedAt).toLocaleDateString()}
-                    </span>
+                    <div className="agent-card-actions">
+                      <span className="agent-card-date">
+                        {new Date(t.updatedAt).toLocaleDateString()}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn btn-sm agent-card-preview-btn"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void openClaudeMdPreview(t);
+                        }}
+                        disabled={isSaving || !t.id}
+                        title={`预览 ${t.name} 运行时生效的 CLAUDE.md`}
+                      >
+                        CLAUDE.md
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-sm agent-card-clone-btn"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void handleClone(t);
+                        }}
+                        disabled={isSaving || !t.id}
+                        title={`克隆 ${t.name} 为新 Agent 模板`}
+                      >
+                        克隆
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-primary agent-card-chat-btn"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          startChat(t.id);
+                        }}
+                        disabled={isSaving || !t.id}
+                        title={`和 ${t.name} 开始对话`}
+                      >
+                        开始对话
+                      </button>
+                    </div>
                   </div>
                   <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
                   <div className="agent-card-tags">
                     <span className="badge badge-muted">{t.model}</span>
+                    {t.seedDir && <span className="badge badge-warning">本地项目 seed</span>}
+                    {((t.knowledgeSourceIds || []).length > 0 || t.useKnowledge) && (
+                      <span className="badge badge-success">
+                        知识库×{(t.knowledgeSourceIds || []).length || liveKnowledgeSources.filter(source => source.enabled).length || '全部'}
+                      </span>
+                    )}
                     {t.tools.slice(0, 3).map(tool => <span key={tool} className="badge badge-info">{tool}</span>)}
                     {t.tools.length > 3 && <span className="badge badge-muted">+{t.tools.length - 3}</span>}
                   </div>
@@ -223,22 +819,245 @@ export default function Agents() {
             </div>
           )}
         </div>
+      </div>
 
-        {/* 编辑表单 */}
-        <div>
-          <div className="card">
-            <div className="flex-between mb-4">
+      {isPreviewOpen && (
+        <div className="agents-preview-backdrop" onClick={() => setIsPreviewOpen(false)}>
+          <section
+            className="agents-preview-panel card"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`预览 ${previewAgent?.name || 'Agent'} 的 CLAUDE.md`}
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex-between agents-preview-head">
+              <div>
+                <div className="card-header" style={{ marginBottom: 2 }}>
+                  {previewAgent?.name || claudeMdPreview?.agentName || 'Agent'} · CLAUDE.md
+                </div>
+                <div className="agents-preview-subtitle">
+                  真实运行时文件系统说明预览
+                </div>
+              </div>
+              <button type="button" className="btn btn-sm btn-ghost" onClick={() => setIsPreviewOpen(false)}>
+                关闭
+              </button>
+            </div>
+
+            {isPreviewLoading ? (
+              <div className="agents-preview-empty">读取运行时 CLAUDE.md...</div>
+            ) : previewError ? (
+              <div className="agents-preview-error">{previewError}</div>
+            ) : claudeMdPreview && (
+              <div className="agents-preview-body">
+                <div className="agents-preview-meta">
+                  <div>
+                    <span className="agents-preview-meta-label">cwd</span>
+                    <code>{claudeMdPreview.cwd}</code>
+                  </div>
+                  <div>
+                    <span className="agents-preview-meta-label">来源</span>
+                    <span>
+                      {claudeMdPreview.cwdSource === 'latest_session'
+                        ? '最近运行会话'
+                        : claudeMdPreview.cwdSource === 'template_seed'
+                          ? '模板 seed 仓'
+                          : '新会话默认临时目录'}
+                      {claudeMdPreview.cwdExists ? '' : ' · 当前不存在'}
+                    </span>
+                  </div>
+                  {claudeMdPreview.latestSession && (
+                    <div>
+                      <span className="agents-preview-meta-label">会话</span>
+                      <span>
+                        {claudeMdPreview.latestSession.title} · {new Date(claudeMdPreview.latestSession.updatedAt).toLocaleString()}
+                      </span>
+                    </div>
+                  )}
+                  <div>
+                    <span className="agents-preview-meta-label">settingSources</span>
+                    <span>{claudeMdPreview.settingSources.join(', ')}</span>
+                  </div>
+                </div>
+
+                <div className="agents-preview-files">
+                  {claudeMdPreview.files.map(file => (
+                    <div key={file.path} className={`agents-preview-file ${file.exists ? 'loaded' : 'missing'}`}>
+                      <div className="agents-preview-file-main">
+                        <span className={`badge ${file.exists ? 'badge-success' : 'badge-muted'}`}>
+                          {file.exists ? '已命中' : '缺失'}
+                        </span>
+                        <span className="agents-preview-file-label">{file.label}</span>
+                        {file.bytes !== undefined && <span className="agents-preview-file-size">{formatBytes(file.bytes)}</span>}
+                        {file.error && <span className="badge badge-warning">{file.error}</span>}
+                      </div>
+                      <code>{file.path}</code>
+                    </div>
+                  ))}
+                </div>
+
+                {claudeMdPreview.notes.length > 0 && (
+                  <div className="agents-preview-notes">
+                    {claudeMdPreview.notes.map(note => <div key={note}>{note}</div>)}
+                  </div>
+                )}
+
+                <div>
+                  <div className="agents-preview-section-title">
+                    合并预览 · {claudeMdPreview.loadedFiles.length} 个文件
+                  </div>
+                  {claudeMdPreview.effectiveContent ? (
+                    <pre className="agents-preview-content">{claudeMdPreview.effectiveContent}</pre>
+                  ) : (
+                    <div className="agents-preview-empty">
+                      没有找到会被加载的 CLAUDE.md 文件。
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {isImportReportOpen && importReport && (
+        <div className="agents-preview-backdrop" onClick={() => setIsImportReportOpen(false)}>
+          <section
+            className="agents-preview-panel card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Agent 导入报告"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex-between agents-preview-head">
+              <div>
+                <div className="card-header" style={{ marginBottom: 2 }}>
+                  {importedAgent?.name || 'Imported Agent'} · 导入报告
+                </div>
+                <div className="agents-preview-subtitle">
+                  模板 seed 已写入，后续新会话会在首跑复制到 workspace cwd
+                </div>
+              </div>
+              <div className="flex gap-2">
+                {importedAgent?.id && (
+                  <button type="button" className="btn btn-sm btn-primary" onClick={() => startChat(importedAgent.id)}>
+                    开始对话
+                  </button>
+                )}
+                <button type="button" className="btn btn-sm btn-ghost" onClick={() => setIsImportReportOpen(false)}>
+                  关闭
+                </button>
+              </div>
+            </div>
+
+            <div className="agents-preview-body">
+              <div className="agents-preview-meta">
+                <div>
+                  <span className="agents-preview-meta-label">templateId</span>
+                  <code>{importReport.templateId}</code>
+                </div>
+                <div>
+                  <span className="agents-preview-meta-label">seedDir</span>
+                  <code>{importReport.seedDir}</code>
+                </div>
+                <div>
+                  <span className="agents-preview-meta-label">unpacked</span>
+                  <span>{importReport.unpacked.length} 个文件</span>
+                </div>
+                <div>
+                  <span className="agents-preview-meta-label">skipped</span>
+                  <span>{importReport.skipped.length} 个文件</span>
+                </div>
+              </div>
+
+              <div className="agents-import-detected">
+                <span className="badge badge-success">CLAUDE.md {importReport.detected.claudeMd ? '已检测' : '未检测'}</span>
+                {importReport.detected.agents.map(name => <span key={`agent-${name}`} className="badge badge-info">agent: {name}</span>)}
+                {importReport.detected.skills.map(name => <span key={`skill-${name}`} className="badge badge-info">skill: {name}</span>)}
+                {importReport.detected.remoteMcp.map(name => <span key={`mcp-${name}`} className="badge badge-success">remote MCP: {name}</span>)}
+                {!importReport.detected.agents.length && !importReport.detected.skills.length && !importReport.detected.remoteMcp.length && !importReport.detected.claudeMd && (
+                  <span className="badge badge-muted">未检测到 Claude Code 专用文件</span>
+                )}
+              </div>
+
+              {(importReport.disabled.hooks.length > 0 || importReport.disabled.stdioMcp.length > 0) && (
+                <div className="agents-preview-notes">
+                  {importReport.disabled.hooks.length > 0 && (
+                    <div>已禁用 hooks: {importReport.disabled.hooks.join(', ')}</div>
+                  )}
+                  {importReport.disabled.stdioMcp.length > 0 && (
+                    <div>已剥离 stdio MCP: {importReport.disabled.stdioMcp.join(', ')}</div>
+                  )}
+                </div>
+              )}
+
+              {importReport.notes.length > 0 && (
+                <div className="agents-preview-notes">
+                  {importReport.notes.map(note => <div key={note}>{note}</div>)}
+                </div>
+              )}
+
+              {importReport.unpacked.length > 0 && (
+                <div>
+                  <div className="agents-preview-section-title">已解包文件</div>
+                  <div className="agents-import-file-list">
+                    {importReport.unpacked.slice(0, 80).map(file => (
+                      <div key={file.path} className="agents-import-file-row">
+                        <span className="badge badge-muted">{file.category}</span>
+                        <code>{file.path}</code>
+                        <span>{formatBytes(file.bytes)}</span>
+                      </div>
+                    ))}
+                    {importReport.unpacked.length > 80 && (
+                      <div className="agents-import-file-row muted">
+                        还有 {importReport.unpacked.length - 80} 个文件未显示
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {importReport.skipped.length > 0 && (
+                <div>
+                  <div className="agents-preview-section-title">已跳过</div>
+                  <div className="agents-import-file-list">
+                    {importReport.skipped.slice(0, 40).map(file => (
+                      <div key={`${file.path}-${file.reason}`} className="agents-import-file-row skipped">
+                        <code>{file.path}</code>
+                        <span>{file.reason}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {isEditorOpen && (
+        <div className="agents-editor-backdrop" onClick={() => setIsEditorOpen(false)}>
+          <aside
+            className="agents-editor-panel card"
+            role="dialog"
+            aria-modal="true"
+            aria-label={isEditing ? `编辑 Agent ${form.name}` : '新建 Agent'}
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="flex-between mb-4 agents-editor-head">
               <div className="card-header" style={{ marginBottom: 0 }}>
                 {isEditing ? `编辑: ${form.name}` : '新建 Agent'}
               </div>
               <div className="flex gap-2">
                 {isEditing && (
-                  <>
-                    <button className="btn btn-sm btn-primary" onClick={() => startChat(form)}>💬 开始对话</button>
-                    <button className="btn btn-sm btn-danger" onClick={() => handleDelete(form.id)}>删除</button>
-                  </>
+                  <button className="btn btn-sm btn-danger" onClick={() => { void handleDelete(form.id); }} disabled={isSaving}>删除</button>
                 )}
-                <button className="btn btn-sm btn-primary" onClick={handleSave}>收养</button>
+                <button className="btn btn-sm btn-primary" onClick={() => { void handleSave(); }} disabled={isSaving}>
+                  {isSaving ? '保存中...' : '保存'}
+                </button>
+                <button type="button" className="btn btn-sm btn-ghost" onClick={() => setIsEditorOpen(false)} disabled={isSaving}>
+                  关闭
+                </button>
               </div>
             </div>
 
@@ -258,7 +1077,7 @@ export default function Agents() {
               <textarea
                 value={form.systemPrompt}
                 onChange={e => setForm({ ...form, systemPrompt: e.target.value })}
-                rows={3}
+                rows={8}
                 placeholder="你是一位资深的...&#10;&#10;请遵循以下规则：&#10;1. ..."
                 style={{ resize: 'vertical' }}
               />
@@ -266,20 +1085,18 @@ export default function Agents() {
 
             <div className="grid-2">
               <div className="form-group">
-                <label>模型</label>
-                <input
+                <label className="flex gap-2" style={{ alignItems: 'center' }}>
+                  模型
+                  {selectedModelAvailable && providerMatch
+                    ? <span className="badge badge-muted">{providerMatch.profile.name}</span>
+                    : <span className="badge badge-warning">{selectedModel ? '不可用' : '必选'}</span>}
+                </label>
+                <ModelPicker
                   value={form.model}
-                  onChange={e => setForm({ ...form, model: e.target.value })}
-                  placeholder="deepseek-v4-pro[1m]"
-                  list="model-suggestions"
-                  style={{ fontFamily: 'var(--font-mono)' }}
+                  models={modelSuggestions}
+                  onChange={model => setForm({ ...form, model })}
+                  placeholder="输入或选择模型"
                 />
-              </div>
-              <div className="form-group">
-                <label>效能等级</label>
-                <select value={form.effort} onChange={e => setForm({ ...form, effort: e.target.value as EffortLevel })}>
-                  {EFFORT_LEVELS.map(e => <option key={e.value} value={e.value}>{e.label} ({e.value})</option>)}
-                </select>
               </div>
               <div className="form-group">
                 <label>maxTurns</label>
@@ -293,83 +1110,101 @@ export default function Agents() {
               </div>
             </div>
 
-            {/* 供应商配置覆盖 (Agent 级别) */}
-            <details style={{ marginBottom: 14 }}>
-              <summary style={{ cursor: 'pointer', fontWeight: 600, fontSize: '.85em', color: 'var(--warning)', marginBottom: 10 }}>
-                ⚡ 供应商配置覆盖 (可选 — 留空则使用全局配置)
+            {/* 结构化输出 */}
+            <details>
+              <summary style={{ cursor: 'pointer', fontSize: '.82em', color: 'var(--ink-secondary)', marginBottom: 8 }}>
+                结构化输出 (outputSchema) {form.outputSchema ? '✓' : '— 可选'}
               </summary>
-              <div className="grid-2" style={{ marginTop: 10, padding: '10px 14px', background: 'var(--warning-bg)', borderRadius: 6 }}>
-                <div className="form-group">
-                  <label>ANTHROPIC_AUTH_TOKEN</label>
-                  <input
-                    type="password"
-                    value={form.providerOverrides?.ANTHROPIC_AUTH_TOKEN || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_AUTH_TOKEN: e.target.value } })}
-                    placeholder="留空使用全局 Key"
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_BASE_URL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_BASE_URL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_BASE_URL: e.target.value } })}
-                    placeholder="留空使用全局端点"
-                    style={{ fontFamily: 'var(--font-mono)', fontSize: '.78em' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_MODEL (覆盖模板 model)</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_MODEL: e.target.value } })}
-                    placeholder={`当前: ${form.model}`}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>CLAUDE_CODE_SUBAGENT_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.CLAUDE_CODE_SUBAGENT_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, CLAUDE_CODE_SUBAGENT_MODEL: e.target.value } })}
-                    placeholder="子代理模型"
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_DEFAULT_OPUS_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_DEFAULT_OPUS_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_DEFAULT_OPUS_MODEL: e.target.value } })}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_DEFAULT_SONNET_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_DEFAULT_SONNET_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_DEFAULT_SONNET_MODEL: e.target.value } })}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_DEFAULT_HAIKU_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_DEFAULT_HAIKU_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_DEFAULT_HAIKU_MODEL: e.target.value } })}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
-                <div className="form-group">
-                  <label>ANTHROPIC_REASONING_MODEL</label>
-                  <input
-                    value={form.providerOverrides?.ANTHROPIC_REASONING_MODEL || ''}
-                    onChange={e => setForm({ ...form, providerOverrides: { ...form.providerOverrides, ANTHROPIC_REASONING_MODEL: e.target.value } })}
-                    style={{ fontFamily: 'var(--font-mono)' }}
-                  />
-                </div>
+              <div className="form-group">
+                <label>JSON Schema（留空 = 纯文本输出）</label>
+                <textarea
+                  rows={6}
+                  style={{ fontFamily: 'var(--font-mono)', fontSize: '.76em', resize: 'vertical' }}
+                  placeholder={'{\n  "type": "object",\n  "properties": {\n    "title": { "type": "string" },\n    "summary": { "type": "string" }\n  },\n  "required": ["title", "summary"]\n}'}
+                  value={form.outputSchema ? JSON.stringify(form.outputSchema, null, 2) : ''}
+                  onChange={e => {
+                    const raw = e.target.value.trim();
+                    if (!raw) { setForm({ ...form, outputSchema: undefined }); return; }
+                    try { setForm({ ...form, outputSchema: JSON.parse(raw) }); } catch { /* keep existing until valid */ }
+                  }}
+                />
+                {form.outputSchema && (
+                  <div style={{ fontSize: '.72em', color: 'var(--success)', marginTop: 4 }}>schema 有效，运行时启用结构化输出</div>
+                )}
               </div>
             </details>
+
+            {/* 文件检查点 */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+              <input
+                type="checkbox"
+                checked={Boolean(form.enableFileCheckpointing)}
+                onChange={e => setForm({ ...form, enableFileCheckpointing: e.target.checked || undefined })}
+                style={{ width: 'auto' }}
+              />
+              <span style={{ fontSize: '.85em' }}>
+                enableFileCheckpointing — 编辑前快照文件，支持 /rewind 回滚
+              </span>
+            </label>
+
+            {/* 知识库选择 */}
+            <div className="form-group">
+              <label>
+                知识库 (Knowledge) — 已选 {(form.knowledgeSourceIds || []).length} 个 ·{' '}
+                <a href="/knowledge" style={{ color: 'var(--accent)', fontSize: '.85em' }}>管理知识库</a>
+              </label>
+              {liveKnowledgeSources.length > 0 && (
+                <div style={{ color: 'var(--ink-muted)', fontSize: '.74em', margin: '2px 0 8px' }}>
+                  🔒 默认只读：仅当你是该知识库的创建人、且在知识库页面关闭了「只读」时，你的 Agent 才能写入；其他成员始终只读。
+                </div>
+              )}
+              {liveKnowledgeSources.length === 0 ? (
+                <div style={{ color: 'var(--ink-muted)', fontSize: '.78em', padding: '8px 0' }}>
+                  暂无知识库，请先在知识库页面创建。
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {liveKnowledgeSources.map(source => {
+                    const selected = (form.knowledgeSourceIds || []).includes(source.id);
+                    return (
+                      <label
+                        key={source.id}
+                        title={source.path}
+                        style={{
+                          display: 'inline-grid',
+                          gridTemplateColumns: 'auto minmax(0, 1fr)',
+                          alignItems: 'start',
+                          gap: 6,
+                          padding: '6px 9px',
+                          borderRadius: 4,
+                          fontSize: '.76em',
+                          cursor: source.enabled || selected ? 'pointer' : 'not-allowed',
+                          background: selected ? 'var(--success-bg)' : 'var(--bg-hover)',
+                          color: selected ? 'var(--success)' : 'var(--ink-secondary)',
+                          border: `1px solid ${selected ? 'var(--success)' : 'transparent'}`,
+                          opacity: source.enabled ? 1 : .5,
+                          maxWidth: 340,
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => toggleKnowledgeSource(source.id)}
+                          disabled={!source.enabled && !selected}
+                          style={{ width: 'auto', margin: '2px 0 0' }}
+                        />
+                        <span style={{ minWidth: 0 }}>
+                          <span style={{ display: 'block', fontWeight: 700 }}>{source.name}</span>
+                          <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: '.8em', color: 'inherit', opacity: .72, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {source.path}
+                          </span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
 
             {/* 工具选择 */}
             <div className="form-group">
@@ -438,6 +1273,114 @@ export default function Agents() {
               </div>
             </div>
 
+            {/* 子代理定义 */}
+            <div className="form-group">
+              <div className="flex-between" style={{ marginBottom: 8 }}>
+                <label style={{ marginBottom: 0 }}>子代理 (SDK agents) — 已定义 {subagentEntries.length} 个</label>
+                <button type="button" className="btn btn-sm btn-primary" onClick={addSubagent}>
+                  + 子代理
+                </button>
+              </div>
+              {subagentEntries.length === 0 ? (
+                <div style={{ color: 'var(--ink-muted)', fontSize: '.78em', padding: '8px 0' }}>
+                  添加后会自动启用 Agent 工具，运行时通过 SDK Agent tool 调用。
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {subagentEntries.map(([name, agent]) => (
+                    <div key={name} className="tool-card" style={{ padding: 12 }}>
+                      <div className="grid-2">
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>名称</label>
+                          <input
+                            defaultValue={name}
+                            onBlur={e => renameSubagent(name, e.target.value)}
+                            style={{ fontFamily: 'var(--font-mono)' }}
+                          />
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>模型覆盖</label>
+                          <ModelPicker
+                            value={agent.model || ''}
+                            models={modelSuggestions}
+                            onChange={model => updateSubagent(name, { model: model || undefined })}
+                            allowEmpty
+                            placeholder="留空继承主模型"
+                          />
+                        </div>
+                      </div>
+                      <div className="form-group" style={{ marginBottom: 8 }}>
+                        <label>description</label>
+                        <input
+                          value={agent.description}
+                          onChange={e => updateSubagent(name, { description: e.target.value })}
+                          placeholder="何时使用这个子代理"
+                        />
+                      </div>
+                      <div className="form-group" style={{ marginBottom: 8 }}>
+                        <label>prompt</label>
+                        <textarea
+                          value={agent.prompt}
+                          onChange={e => updateSubagent(name, { prompt: e.target.value })}
+                          rows={2}
+                          placeholder="子代理系统提示词"
+                          style={{ resize: 'vertical' }}
+                        />
+                      </div>
+                      <div className="grid-2">
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>tools</label>
+                          <input
+                            value={(agent.tools || []).join(', ')}
+                            onChange={e => updateSubagent(name, { tools: e.target.value.split(',').map(t => t.trim()).filter(Boolean) })}
+                            placeholder="Read, Grep, Glob"
+                            style={{ fontFamily: 'var(--font-mono)' }}
+                          />
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>maxTurns</label>
+                          <input
+                            type="number"
+                            value={agent.maxTurns || ''}
+                            onChange={e => updateSubagent(name, { maxTurns: Number(e.target.value) || undefined })}
+                            placeholder="继承默认"
+                          />
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>effort</label>
+                          <select value={agent.effort || ''} onChange={e => updateSubagent(name, { effort: e.target.value as EffortLevel || undefined })}>
+                            <option value="">继承</option>
+                            {EFFORT_LEVELS.map(e => <option key={e.value} value={e.value}>{e.label} ({e.value})</option>)}
+                          </select>
+                        </div>
+                        <div className="form-group" style={{ marginBottom: 8 }}>
+                          <label>权限模式</label>
+                          <select value={agent.permissionMode || ''} onChange={e => updateSubagent(name, { permissionMode: e.target.value as PermissionMode || undefined })}>
+                            <option value="">继承</option>
+                            {PERMISSION_MODES.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                      <div className="flex-between">
+                        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, margin: 0, fontSize: '.78em' }}>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(agent.background)}
+                            onChange={e => updateSubagent(name, { background: e.target.checked || undefined })}
+                            style={{ width: 'auto', margin: 0 }}
+                          />
+                          background
+                        </label>
+                        <button type="button" className="btn btn-sm btn-danger" onClick={() => deleteSubagent(name)}>
+                          删除子代理
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {/* 技能选择 */}
             {liveSkills.length > 0 && (
               <div className="form-group">
@@ -474,7 +1417,7 @@ export default function Agents() {
             <div className="form-group">
               <label>MCP 服务器 · <a href="/tools" style={{ color: 'var(--accent)', fontSize: '.85em' }}>管理</a></label>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                {(liveMcp.length > 0 ? liveMcp : MOCK_MCP_SERVERS).map(srv => (
+                {liveMcp.map(srv => (
                   <label
                     key={srv.name}
                     style={{
@@ -528,16 +1471,9 @@ export default function Agents() {
                 </div>
               </div>
             )}
-          </div>
+          </aside>
         </div>
-      </div>
-      <datalist id="model-suggestions">
-        <option value="deepseek-v4-pro[1m]" />
-        <option value="deepseek-v4-flash" />
-        <option value="claude-opus-4-7" />
-        <option value="claude-sonnet-4-6" />
-        <option value="claude-haiku-4-5-20251001" />
-      </datalist>
+      )}
     </div>
   );
 }
