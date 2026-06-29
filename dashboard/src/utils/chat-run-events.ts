@@ -1,5 +1,5 @@
 import type { MutableRefObject } from 'react';
-import type { ChatMessage } from '../simulator/types';
+import type { ChatMessage, ChatRunStats } from '../simulator/types';
 import {
   deriveRunPhase,
   mapResultSubtypeToOutcome,
@@ -10,10 +10,10 @@ import {
 import type { PermissionRequest } from '../components/PermissionPrompt';
 import type { AskUserQuestionRequest } from '../components/AskUserQuestionPrompt';
 import { mergeAgentTaskEvent, type AgentTaskEvent } from './agent-tasks';
+import { mergeContextCompactionEvent, type ContextCompactionEvent } from './context-events';
 import { getAuthHeaders } from './client-runtime';
 import { finalizeAssistantDraft, updateAssistantDraft } from './chat-stream-draft';
-
-type RunStats = { costUsd?: number; durationMs?: number; inTok?: number; outTok?: number };
+import { chatRunStatsFromResultEvent } from './chat-run-stats';
 
 type ObserveRunOptions = {
   runId: string;
@@ -31,8 +31,9 @@ type ObserveRunOptions = {
   setPendingPermissions: (updater: (previous: PermissionRequest[]) => PermissionRequest[]) => void;
   setPendingQuestions: (updater: (previous: AskUserQuestionRequest[]) => AskUserQuestionRequest[]) => void;
   setAgentTasks: (updater: (previous: AgentTaskEvent[]) => AgentTaskEvent[]) => void;
+  setContextEvents: (updater: (previous: ContextCompactionEvent[]) => ContextCompactionEvent[]) => void;
   setStructuredOutput: (value: unknown) => void;
-  setRunStats: (value: RunStats | null) => void;
+  setRunStats: (value: ChatRunStats | null) => void;
   abortRef: MutableRefObject<AbortController | null>;
   signal?: AbortSignal;
 };
@@ -103,6 +104,7 @@ export async function observeServerRun(options: ObserveRunOptions) {
     sdkSessionId?: string,
     sdkCwd?: string,
     detail?: string,
+    runStats?: ChatRunStats,
   ) => {
     if (didFinalize) return;
     didFinalize = true;
@@ -116,6 +118,7 @@ export async function observeServerRun(options: ObserveRunOptions) {
       thinking || undefined,
       detail,
       options.runId,
+      runStats,
     );
     options.onMessages(finalMessages);
     await options.persistFinal(finalMessages, sdkSessionId, sdkCwd);
@@ -164,21 +167,24 @@ export async function observeServerRun(options: ObserveRunOptions) {
           options.onMessages(prev => updateAssistantDraft(prev, options.draftId, { content: text, status: 'streaming', runId: options.runId }));
           updateRunPhase({ initializing: false, thinking: false, streaming: true, toolExecuting: false });
         }
+      } else if (data.type === 'run_log') {
+        const level = data.level === 'warn' ? 'warn' : 'info';
+        const message = typeof data.message === 'string' ? data.message : '';
+        if (message) {
+          text += `\n[${level}] ${message}\n`;
+          options.onMessages(prev => updateAssistantDraft(prev, options.draftId, { content: text, status: 'streaming', runId: options.runId }));
+        }
       } else if (data.type === 'result') {
         const finalOutcome = receivedOutcome || mapResultSubtypeToOutcome(data.subtype);
         const finalDetail = outcomeDetail || (typeof data.subtype === 'string' ? data.subtype : undefined);
         const finalContent = text || (typeof data.text === 'string' ? data.text : '');
         if (data.structuredOutput !== undefined) options.setStructuredOutput(data.structuredOutput);
-        if (data.cost_usd !== undefined || data.duration_ms !== undefined) {
-          const usage = data.usage && typeof data.usage === 'object' ? data.usage as { input_tokens?: unknown; output_tokens?: unknown } : {};
-          options.setRunStats({
-            costUsd: typeof data.cost_usd === 'number' ? data.cost_usd : undefined,
-            durationMs: typeof data.duration_ms === 'number' ? data.duration_ms : undefined,
-            inTok: typeof usage.input_tokens === 'number' ? usage.input_tokens : undefined,
-            outTok: typeof usage.output_tokens === 'number' ? usage.output_tokens : undefined,
-          });
+        let finalRunStats: ChatRunStats | undefined;
+        if (data.cost_usd !== undefined || data.duration_ms !== undefined || data.usage !== undefined) {
+          finalRunStats = chatRunStatsFromResultEvent(data);
+          options.setRunStats(finalRunStats || null);
         }
-        await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId as string | undefined, data.sdkCwd as string | undefined, finalDetail);
+        await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId as string | undefined, data.sdkCwd as string | undefined, finalDetail, finalRunStats);
       } else if (data.type === 'run_outcome') {
         receivedOutcome = normalizeRunOutcome(data.outcome, receivedOutcome || 'provider_error');
         outcomeDetail = typeof data.subtype === 'string'
@@ -219,6 +225,8 @@ export async function observeServerRun(options: ObserveRunOptions) {
       } else if (String(data.type || '').startsWith('task_')) {
         options.setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
         updateRunPhase({ initializing: false, toolExecuting: true, thinking: false, streaming: false });
+      } else if (data.type === 'context_compaction') {
+        options.setContextEvents(prev => mergeContextCompactionEvent(prev, data));
       } else if (data.type === 'error') {
         cachedErrorMessage = String(data.message || '未知错误');
         receivedOutcome = receivedOutcome || 'provider_error';

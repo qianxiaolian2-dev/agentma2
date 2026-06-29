@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { ClipboardEvent } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import type { AgentTemplate, ChatAttachment, ChatMessage, ChatSession, ProviderConfig, ChatImageMimeType } from '../simulator/types';
+import type { AgentTemplate, ChatAttachment, ChatMessage, ChatRunStats, ChatSession, ProviderConfig, ChatImageMimeType } from '../simulator/types';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, getCachedAgentTemplateById } from '../utils/agent-templates';
 import { isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
@@ -17,12 +17,17 @@ import {
 } from '../utils/chat-sessions';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
+import { mergeContextCompactionEvent, type ContextCompactionEvent } from '../utils/context-events';
 import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
 import { findPendingRunMessage, observeServerRun } from '../utils/chat-run-events';
+import { chatRunStatsFromResultEvent, latestAssistantRunStats } from '../utils/chat-run-stats';
 import { fetchProviderModels, listProviderModels, loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
 import ChatModelPicker from '../components/ChatModelPicker';
+import ModelPicker from '../components/common/ModelPicker';
+import ContextWindowMeter from '../components/ContextWindowMeter';
+import ContextCompactionEvents from '../components/ContextCompactionEvents';
 import {
   deriveRunPhase,
   isWaitingPhase,
@@ -59,6 +64,14 @@ function canResumeChatSession(session: ChatSession | null | undefined) {
   return Boolean(session?.sdkSessionId);
 }
 
+function defaultVisualPreprocessEnabled(template: AgentTemplate | null | undefined) {
+  return template?.visualPreprocessDefault === true;
+}
+
+function defaultVisualPreprocessModel(template: AgentTemplate | null | undefined) {
+  return template?.visualPreprocessModel || '';
+}
+
 const SCROLL_BOTTOM_THRESHOLD = 80;
 
 function isTextEntryElement(element: Element | null) {
@@ -87,8 +100,9 @@ export default function AgentChat() {
   const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
   const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
   const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
+  const [contextEvents, setContextEvents] = useState<ContextCompactionEvent[]>([]);
   const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
-  const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
+  const [runStats, setRunStats] = useState<ChatRunStats | null>(null);
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState('');
   const [collaborationError, setCollaborationError] = useState('');
@@ -96,6 +110,8 @@ export default function AgentChat() {
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [modelOptions, setModelOptions] = useState<string[]>(() => listProviderModels());
   const [selectedModelOverride, setSelectedModelOverride] = useState<{ contextKey: string; model: string } | null>(null);
+  const [visualPreprocessEnabled, setVisualPreprocessEnabled] = useState(false);
+  const [visualPreprocessModel, setVisualPreprocessModel] = useState('');
   const [, setActiveRunId] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -170,6 +186,10 @@ export default function AgentChat() {
     if (cachedTemplate) {
       setTemplate(cachedTemplate);
       provider.current = resolveProviderForModel(cachedTemplate.model).provider;
+      if (!resumeSessionId) {
+        setVisualPreprocessEnabled(defaultVisualPreprocessEnabled(cachedTemplate));
+        setVisualPreprocessModel(defaultVisualPreprocessModel(cachedTemplate));
+      }
     }
 
     (async () => {
@@ -183,6 +203,8 @@ export default function AgentChat() {
         if (cancelled) return;
         setTemplate(serverTemplate);
         provider.current = resolveProviderForModel(serverTemplate.model).provider;
+        const templateVisualEnabled = defaultVisualPreprocessEnabled(serverTemplate);
+        const templateVisualModel = defaultVisualPreprocessModel(serverTemplate);
 
         const sessions = await bootstrapChatSessions(!isUsingApiKeyAuth());
         const existingSession = resumeSessionId
@@ -200,12 +222,16 @@ export default function AgentChat() {
           setSessionId(hydratedSession.id);
           setSessionMeta(hydratedSession);
           setMessages(hydratedSession.messages);
+          setVisualPreprocessEnabled(hydratedSession.visualPreprocessEnabled ?? templateVisualEnabled);
+          setVisualPreprocessModel(hydratedSession.visualPreprocessModel || templateVisualModel);
           return;
         }
 
         setSessionId('');
         setSessionMeta(null);
         setMessages([]);
+        setVisualPreprocessEnabled(templateVisualEnabled);
+        setVisualPreprocessModel(templateVisualModel);
       } catch (error) {
         console.error('failed to load chat sessions', error);
       }
@@ -234,6 +260,8 @@ export default function AgentChat() {
       model: effectiveModel,
       sdkSessionId: canReuseCurrentSdkSession ? sessionMeta?.sdkSessionId : sdkSessionId,
       sdkCwd: (canReuseCurrentSdkSession ? sessionMeta?.sdkCwd : undefined) || sdkCwd,
+      visualPreprocessEnabled,
+      visualPreprocessModel: visualPreprocessModel || undefined,
       forkedFromSessionId: sessionMeta?.forkedFromSessionId,
       forkedFromTitle: sessionMeta?.forkedFromTitle,
       pinned: sessionMeta?.pinned,
@@ -257,7 +285,7 @@ export default function AgentChat() {
       console.error('failed to persist chat session', error);
       return nextId;
     }
-  }, [template, id, sessionId, sessionMeta, selectedModel]);
+  }, [template, id, sessionId, sessionMeta, selectedModel, visualPreprocessEnabled, visualPreprocessModel]);
 
   const refreshSession = useCallback(async (targetSessionId: string) => {
     const refreshed = await getChatSession(targetSessionId);
@@ -272,9 +300,11 @@ export default function AgentChat() {
     if (sessionId === targetSessionId) {
       setSessionMeta(refreshed);
       setMessages(refreshed.messages);
+      setVisualPreprocessEnabled(refreshed.visualPreprocessEnabled ?? defaultVisualPreprocessEnabled(template));
+      setVisualPreprocessModel(refreshed.visualPreprocessModel || defaultVisualPreprocessModel(template));
     }
     return refreshed;
-  }, [sessionId]);
+  }, [sessionId, template]);
 
   useEffect(() => {
     if (!sessionId || !pendingRunMessage?.id || !pendingRunMessage.runId) {
@@ -289,6 +319,7 @@ export default function AgentChat() {
     setPendingPermissions([]);
     setPendingQuestions([]);
     setAgentTasks([]);
+    setContextEvents([]);
     setStructuredOutput(null);
     setRunStats(null);
     void observeServerRun({
@@ -309,6 +340,7 @@ export default function AgentChat() {
       setPendingPermissions,
       setPendingQuestions,
       setAgentTasks,
+      setContextEvents,
       setStructuredOutput,
       setRunStats,
       abortRef,
@@ -346,6 +378,8 @@ export default function AgentChat() {
       const saved = await setChatSessionCollaboration(sessionId, !sessionMeta?.collaborationEnabled);
       setSessionMeta(saved);
       setMessages(saved.messages);
+      setVisualPreprocessEnabled(saved.visualPreprocessEnabled ?? defaultVisualPreprocessEnabled(template));
+      setVisualPreprocessModel(saved.visualPreprocessModel || defaultVisualPreprocessModel(template));
     } catch (error) {
       setCollaborationError((error as Error).message || '协作设置失败');
     }
@@ -489,6 +523,7 @@ export default function AgentChat() {
     setRunPhase('initializing');
     setPendingQuestions([]);
     setAgentTasks([]);
+    setContextEvents([]);
     setStructuredOutput(null);
     setRunStats(null);
 
@@ -528,11 +563,12 @@ export default function AgentChat() {
       sdkSessionId?: string,
       sdkCwd?: string,
       detail?: string,
+      finalRunStats?: ChatRunStats,
     ) => {
       if (didFinalize) return;
       didFinalize = true;
       updateRunPhase({ finalizing: true, initializing: false, streaming: false, thinking: false, toolExecuting: false });
-      const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, content, outcome, thinking || undefined, detail, runIdForDraft || undefined);
+      const finalMessages = finalizeAssistantDraft(newMessages, draftId, assistantTimestamp, content, outcome, thinking || undefined, detail, runIdForDraft || undefined, finalRunStats);
       setMessages(finalMessages);
       await persistSession(finalMessages, sdkSessionId, sdkCwd, requestSessionId);
     };
@@ -558,11 +594,14 @@ export default function AgentChat() {
             thinking: m.thinking,
             outcome: m.outcome,
             outcomeDetail: m.outcomeDetail,
+            runStats: m.runStats,
           })),
           systemPrompt: template.systemPrompt || undefined,
           model: effectiveModel,
           provider: provider.current,
           providerProfiles: loadProviderProfiles(),
+          visualPreprocessEnabled,
+          visualPreprocessModel: visualPreprocessModel || undefined,
           templateId: template.id,
           sessionId: requestSessionId,
           tools: buildRequestToolsForAgent(template),
@@ -643,14 +682,24 @@ export default function AgentChat() {
                 setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
                 updateRunPhase({ initializing: false, thinking: false, streaming: true, toolExecuting: false });
               }
+            } else if (data.type === 'run_log') {
+              const level = data.level === 'warn' ? 'warn' : 'info';
+              const message = typeof data.message === 'string' ? data.message : '';
+              if (message) {
+                text += `\n[${level}] ${message}\n`;
+                setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
+              }
             } else if (data.type === 'result') {
               const finalOutcome = receivedOutcome || mapResultSubtypeToOutcome(data.subtype);
               const finalDetail = outcomeDetail || (typeof data.subtype === 'string' ? data.subtype : undefined);
               const finalContent = text || data.text || '';
               if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
-              if (data.cost_usd !== undefined || data.duration_ms !== undefined)
-                setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId, data.sdkCwd, finalDetail);
+              let finalRunStats: ChatRunStats | undefined;
+              if (data.cost_usd !== undefined || data.duration_ms !== undefined || data.usage !== undefined) {
+                finalRunStats = chatRunStatsFromResultEvent(data);
+                setRunStats(finalRunStats || null);
+              }
+              await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId, data.sdkCwd, finalDetail, finalRunStats);
             } else if (data.type === 'run_outcome') {
               receivedOutcome = normalizeRunOutcome(data.outcome, receivedOutcome || 'provider_error');
               outcomeDetail = typeof data.subtype === 'string'
@@ -687,6 +736,8 @@ export default function AgentChat() {
             } else if (String(data.type || '').startsWith('task_')) {
               setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
               updateRunPhase({ initializing: false, toolExecuting: true, thinking: false, streaming: false });
+            } else if (data.type === 'context_compaction') {
+              setContextEvents(prev => mergeContextCompactionEvent(prev, data));
             } else if (data.type === 'error') {
               cachedErrorMessage = String(data.message || '未知错误');
               receivedOutcome = receivedOutcome || 'provider_error';
@@ -708,7 +759,7 @@ export default function AgentChat() {
       }
     }
     finishRun();
-  }, [input, attachments, isStreaming, template, messages, persistSession, selectedModel, sessionMeta, sessionId, id]);
+  }, [input, attachments, isStreaming, template, messages, persistSession, selectedModel, sessionMeta, sessionId, id, visualPreprocessEnabled, visualPreprocessModel]);
 
   const handleStop = useCallback(() => {
     abortRef.current?.abort();
@@ -719,6 +770,7 @@ export default function AgentChat() {
   }
 
   const displayModel = selectedModel || sessionMeta?.model || template.model || '';
+  const observedRunStats = runStats || (!isStreaming ? latestAssistantRunStats(messages) : null);
 
   return (
     <div>
@@ -740,6 +792,40 @@ export default function AgentChat() {
             disabled={isStreaming}
             onChange={model => setSelectedModelOverride({ contextKey: modelContextKey, model })}
           />
+          <ContextWindowMeter
+            model={displayModel}
+            inputTokens={observedRunStats?.inTok}
+            outputTokens={observedRunStats?.outTok}
+            compacted={contextEvents.length > 0}
+          />
+          <label
+            className="badge badge-muted"
+            title="开启后图片先由视觉模型预处理，再交给当前 Agent"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: isStreaming ? 'not-allowed' : 'pointer' }}
+          >
+            <input
+              type="checkbox"
+              checked={visualPreprocessEnabled}
+              disabled={isStreaming}
+              onChange={event => {
+                const enabled = event.target.checked;
+                setVisualPreprocessEnabled(enabled);
+                if (enabled && !visualPreprocessModel) setVisualPreprocessModel(defaultVisualPreprocessModel(template));
+              }}
+              style={{ width: 'auto', margin: 0 }}
+            />
+            视觉预处理
+          </label>
+          {visualPreprocessEnabled && (
+            <div style={{ width: 220, maxWidth: '100%' }}>
+              <ModelPicker
+                value={visualPreprocessModel}
+                models={modelOptions}
+                onChange={setVisualPreprocessModel}
+                placeholder="视觉模型"
+              />
+            </div>
+          )}
           {runPhase !== 'idle' && (
             <span className={`badge ${phaseBadgeClass(runPhase)}`}>{phaseLabel(runPhase)}</span>
           )}
@@ -787,7 +873,11 @@ export default function AgentChat() {
           )}
 
           {messages.map((msg, i) => (
-            <ChatMessageBubble key={msg.id || i} message={msg} />
+            <ChatMessageBubble
+              key={msg.id || i}
+              message={msg}
+              waitingLabel={msg.status === 'pending' && runPhase !== 'idle' ? phaseLabel(runPhase) : undefined}
+            />
           ))}
 
           {agentTasks.length > 0 && (
@@ -813,6 +903,8 @@ export default function AgentChat() {
             </div>
           )}
 
+          <ContextCompactionEvents events={contextEvents} />
+
           {structuredOutput !== null && !isStreaming && (
             <div className="chat-msg assistant" style={{ padding: '8px 12px' }}>
               <div style={{ fontSize: '.72em', fontWeight: 600, color: 'var(--ink-muted)', marginBottom: 6 }}>
@@ -822,11 +914,11 @@ export default function AgentChat() {
             </div>
           )}
 
-          {runStats && !isStreaming && (
+          {observedRunStats && !isStreaming && (
             <div style={{ textAlign: 'right', fontSize: '.72em', color: 'var(--ink-muted)', padding: '2px 4px' }}>
-              {runStats.durationMs != null && <span>{(runStats.durationMs / 1000).toFixed(1)}s</span>}
-              {runStats.inTok != null && <span style={{ marginLeft: 8 }}>{runStats.inTok}↑ {runStats.outTok ?? 0}↓ tok</span>}
-              {runStats.costUsd != null && <span style={{ marginLeft: 8 }}>${runStats.costUsd.toFixed(4)}</span>}
+              {observedRunStats.durationMs != null && <span>{(observedRunStats.durationMs / 1000).toFixed(1)}s</span>}
+              {observedRunStats.inTok != null && <span style={{ marginLeft: 8 }}>{observedRunStats.inTok}↑ {observedRunStats.outTok ?? 0}↓ tok</span>}
+              {observedRunStats.costUsd != null && <span style={{ marginLeft: 8 }}>${observedRunStats.costUsd.toFixed(4)}</span>}
             </div>
           )}
 

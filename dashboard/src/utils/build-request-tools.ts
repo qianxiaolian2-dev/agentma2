@@ -16,6 +16,7 @@ export const BUILT_IN_REQUEST_TOOL_SCHEMAS: Record<string, Record<string, unknow
   Glob: { pattern: 'string' },
   WebSearch: { query: 'string' },
   WebFetch: { url: 'string', prompt: 'string' },
+  ToolSearch: { query: 'string' },
   TaskCreate: { subject: 'string', description: 'string' },
   TaskUpdate: { taskId: 'string', status: 'string' },
   TaskGet: { taskId: 'string' },
@@ -24,6 +25,26 @@ export const BUILT_IN_REQUEST_TOOL_SCHEMAS: Record<string, Record<string, unknow
   TaskOutput: { taskId: 'string', block: 'boolean?', timeout: 'number?' },
   Agent: { description: 'string', prompt: 'string', subagent_type: 'string?', run_in_background: 'boolean?' },
   AskUserQuestion: { questions: 'array' },
+  'model.request': {
+    model: 'string?',
+    prompt: 'string',
+    system: 'string?',
+    imageUrl: 'string?',
+    imageBase64: 'string?',
+    imageMediaType: 'string?',
+    maxTokens: 'number?',
+    temperature: 'number?',
+  },
+  'image.inspect': {
+    imagePath: 'string?',
+    imagePaths: 'string[]?',
+    path: 'string?',
+    paths: 'string[]?',
+    prompt: 'string?',
+    model: 'string?',
+    maxTokens: 'number?',
+    temperature: 'number?',
+  },
 };
 
 export function buildRequestTools(

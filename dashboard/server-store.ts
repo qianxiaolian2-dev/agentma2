@@ -175,6 +175,13 @@ export type HookRuleDecision = {
   output: Record<string, unknown>;
 };
 
+export type ChatRunStats = {
+  costUsd?: number;
+  durationMs?: number;
+  inTok?: number;
+  outTok?: number;
+};
+
 export type ChatHistoryMessage = {
   id?: string;
   role: 'user' | 'assistant' | 'system';
@@ -184,6 +191,7 @@ export type ChatHistoryMessage = {
   outcome?: RunOutcome;
   outcomeDetail?: string;
   runId?: string;
+  runStats?: ChatRunStats;
   attachments?: ChatHistoryAttachment[];
   timestamp: number;
 };
@@ -207,6 +215,8 @@ export type ChatHistorySession = {
   model: string;
   sdkSessionId?: string;
   sdkCwd?: string;
+  visualPreprocessEnabled?: boolean;
+  visualPreprocessModel?: string;
   forkedFromSessionId?: string;
   forkedFromTitle?: string;
   pinned?: boolean;
@@ -246,9 +256,17 @@ export type ProviderProfileRow = {
   ANTHROPIC_AUTH_TOKEN: string;
   ANTHROPIC_BASE_URL: string;
   availableModels: string[];
+  modelContextWindows?: Record<string, number>;
   enabled: boolean;
   isDefault: boolean;
   createdAt: number;
+  updatedAt: number;
+};
+
+export type InternalToolSettingRow = {
+  tenantId: string;
+  toolId: string;
+  settings: Record<string, unknown>;
   updatedAt: number;
 };
 
@@ -603,6 +621,14 @@ function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_provider_profiles_tenant ON provider_profiles (tenant_id, updated_at DESC);
 
+    CREATE TABLE IF NOT EXISTS internal_tool_settings (
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+      tool_id TEXT NOT NULL,
+      settings_json TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, tool_id)
+    );
+
     CREATE TABLE IF NOT EXISTS public_skills (
       id TEXT PRIMARY KEY,
       slug TEXT NOT NULL UNIQUE,
@@ -666,6 +692,8 @@ function initSchema() {
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users (username)');
   ensureColumn('chat_sessions', 'sdk_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'sdk_cwd', 'TEXT');
+  ensureColumn('chat_sessions', 'visual_preprocess_enabled', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('chat_sessions', 'visual_preprocess_model', 'TEXT');
   ensureColumn('chat_sessions', 'forked_from_session_id', 'TEXT');
   ensureColumn('chat_sessions', 'collaboration_enabled', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('chat_sessions', 'collaboration_updated_at', 'INTEGER');
@@ -676,6 +704,8 @@ function initSchema() {
   ensureColumn('chat_messages', 'outcome', 'TEXT');
   ensureColumn('chat_messages', 'outcome_detail', 'TEXT');
   ensureColumn('chat_messages', 'run_id', 'TEXT');
+  ensureColumn('chat_messages', 'run_stats_json', 'TEXT');
+  ensureColumn('provider_profiles', 'model_context_windows_json', 'TEXT');
   ensureColumn('quotas', 'knowledge_upload_admin_max_files', 'INTEGER NOT NULL DEFAULT 100');
   ensureColumn('quotas', 'knowledge_upload_member_max_files', 'INTEGER NOT NULL DEFAULT 20');
   ensureColumn('quotas', 'knowledge_upload_max_file_bytes', 'INTEGER NOT NULL DEFAULT 1048576');
@@ -1302,6 +1332,31 @@ function parseChatAttachments(value: unknown): ChatHistoryAttachment[] {
   }
 }
 
+function finiteNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeChatRunStats(value: unknown): ChatRunStats | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const stats: ChatRunStats = {
+    costUsd: finiteNumber(raw.costUsd),
+    durationMs: finiteNumber(raw.durationMs),
+    inTok: finiteNumber(raw.inTok),
+    outTok: finiteNumber(raw.outTok),
+  };
+  return Object.values(stats).some(v => v !== undefined) ? stats : undefined;
+}
+
+function parseChatRunStats(value: unknown): ChatRunStats | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  try {
+    return normalizeChatRunStats(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizeChatMessages(messages: unknown): ChatHistoryMessage[] {
   if (!Array.isArray(messages)) return [];
   return messages.flatMap((message, index) => {
@@ -1319,6 +1374,7 @@ function normalizeChatMessages(messages: unknown): ChatHistoryMessage[] {
     const thinking = typeof raw.thinking === 'string' && raw.thinking ? raw.thinking : undefined;
     const outcomeDetail = typeof raw.outcomeDetail === 'string' && raw.outcomeDetail ? raw.outcomeDetail : undefined;
     const runId = typeof raw.runId === 'string' && raw.runId ? raw.runId : undefined;
+    const runStats = normalizeChatRunStats(raw.runStats);
     return [{
       ...(id ? { id } : {}),
       role: role as ChatHistoryMessage['role'],
@@ -1328,6 +1384,7 @@ function normalizeChatMessages(messages: unknown): ChatHistoryMessage[] {
       ...(outcome ? { outcome } : {}),
       ...(outcomeDetail ? { outcomeDetail } : {}),
       ...(runId ? { runId } : {}),
+      ...(runStats ? { runStats } : {}),
       ...(attachments.length ? { attachments } : {}),
       timestamp: Number.isFinite(timestamp) ? timestamp : now() + index,
     }];
@@ -1349,6 +1406,8 @@ function mapChatSession(row: any, messages: ChatHistoryMessage[], viewerSub?: st
     model: row.model,
     sdkSessionId: row.sdk_session_id || undefined,
     sdkCwd: row.sdk_cwd || undefined,
+    visualPreprocessEnabled: Boolean(row.visual_preprocess_enabled),
+    visualPreprocessModel: row.visual_preprocess_model || undefined,
     forkedFromSessionId: row.forked_from_session_id || undefined,
     forkedFromTitle: row.forked_from_title || undefined,
     pinned: Boolean(row.pinned),
@@ -2461,7 +2520,7 @@ export function audit(tenantId: string, action: string, actor: string, actorType
 
 const CHAT_SESSION_SELECT = `
   s.id, s.tenant_id, s.owner_sub, s.template_id, s.title, s.model,
-  s.sdk_session_id, s.sdk_cwd, s.forked_from_session_id,
+  s.sdk_session_id, s.sdk_cwd, s.visual_preprocess_enabled, s.visual_preprocess_model, s.forked_from_session_id,
   parent.title AS forked_from_title,
   s.pinned, s.collaboration_enabled, s.collaboration_updated_at,
   s.created_at, s.updated_at
@@ -2476,6 +2535,8 @@ type ChatSessionRow = {
   model: string;
   sdk_session_id?: string | null;
   sdk_cwd?: string | null;
+  visual_preprocess_enabled?: number | null;
+  visual_preprocess_model?: string | null;
   forked_from_session_id?: string | null;
   forked_from_title?: string | null;
   pinned: number;
@@ -2548,7 +2609,7 @@ function getAnyChatSessionRow(sessionId: string) {
 
 function listMessagesForSession(sessionId: string) {
   const rows = db.prepare(`
-    SELECT message_id, role, content, attachments_json, status, thinking, outcome, outcome_detail, run_id, timestamp
+    SELECT message_id, role, content, attachments_json, status, thinking, outcome, outcome_detail, run_id, run_stats_json, timestamp
     FROM chat_messages
     WHERE session_id = ?
     ORDER BY seq ASC
@@ -2562,6 +2623,7 @@ function listMessagesForSession(sessionId: string) {
     outcome?: string | null;
     outcome_detail?: string | null;
     run_id?: string | null;
+    run_stats_json?: string | null;
     timestamp: number;
   }>;
   return rows.map((row) => {
@@ -2572,6 +2634,7 @@ function listMessagesForSession(sessionId: string) {
     const thinking = row.thinking || undefined;
     const outcomeDetail = row.outcome_detail || undefined;
     const runId = row.run_id || undefined;
+    const runStats = parseChatRunStats(row.run_stats_json);
     return {
       ...(id ? { id } : {}),
       role: row.role,
@@ -2581,6 +2644,7 @@ function listMessagesForSession(sessionId: string) {
       ...(outcome ? { outcome } : {}),
       ...(outcomeDetail ? { outcomeDetail } : {}),
       ...(runId ? { runId } : {}),
+      ...(runStats ? { runStats } : {}),
       ...(attachments.length ? { attachments } : {}),
       timestamp: row.timestamp,
     };
@@ -2921,6 +2985,14 @@ export function saveChatSession(
     : String(session.model || existing?.model || '');
   const sdkSessionId = String(session.sdkSessionId || existing?.sdkSessionId || '').trim();
   const sdkCwd = String(session.sdkCwd || existing?.sdkCwd || '').trim();
+  const visualPreprocessEnabled = memberUpdatingSharedSession
+    ? Boolean(existing.visualPreprocessEnabled)
+    : (typeof session.visualPreprocessEnabled === 'boolean'
+      ? session.visualPreprocessEnabled
+      : Boolean(existing?.visualPreprocessEnabled));
+  const visualPreprocessModel = memberUpdatingSharedSession
+    ? String(existing.visualPreprocessModel || '').trim()
+    : String(session.visualPreprocessModel || existing?.visualPreprocessModel || '').trim();
   const forkedFromSessionId = memberUpdatingSharedSession
     ? String(existing.forkedFromSessionId || '').trim()
     : String(session.forkedFromSessionId || existing?.forkedFromSessionId || '').trim();
@@ -2935,28 +3007,32 @@ export function saveChatSession(
   try {
     db.prepare(`
       INSERT INTO chat_sessions (
-        id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, forked_from_session_id, pinned, created_at, updated_at
+        id, tenant_id, owner_sub, template_id, title, model, sdk_session_id, sdk_cwd, visual_preprocess_enabled, visual_preprocess_model, forked_from_session_id, pinned, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         template_id = excluded.template_id,
         title = excluded.title,
         model = excluded.model,
         sdk_session_id = excluded.sdk_session_id,
         sdk_cwd = excluded.sdk_cwd,
+        visual_preprocess_enabled = excluded.visual_preprocess_enabled,
+        visual_preprocess_model = excluded.visual_preprocess_model,
         forked_from_session_id = excluded.forked_from_session_id,
         pinned = excluded.pinned,
         updated_at = excluded.updated_at
-    `).run(id, tenantId, ownerSub, templateId, title, model, sdkSessionId || null, sdkCwd || null, forkedFromSessionId || null, pinned ? 1 : 0, createdAt, updatedAt);
+    `).run(id, tenantId, ownerSub, templateId, title, model, sdkSessionId || null, sdkCwd || null, visualPreprocessEnabled ? 1 : 0, visualPreprocessModel || null, forkedFromSessionId || null, pinned ? 1 : 0, createdAt, updatedAt);
 
     db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(id);
     if (messages.length > 0) {
       const insertMessage = db.prepare(`
-        INSERT INTO chat_messages (session_id, seq, message_id, role, content, attachments_json, status, thinking, outcome, outcome_detail, run_id, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO chat_messages (session_id, seq, message_id, role, content, attachments_json, status, thinking, outcome, outcome_detail, run_id, run_stats_json, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       messages.forEach((message, index) => {
         const attachmentsJson = message.attachments?.length ? JSON.stringify(message.attachments) : null;
+        const runStats = normalizeChatRunStats(message.runStats);
+        const runStatsJson = runStats ? JSON.stringify(runStats) : null;
         insertMessage.run(
           id,
           index,
@@ -2969,6 +3045,7 @@ export function saveChatSession(
           message.outcome || null,
           message.outcomeDetail || null,
           message.runId || null,
+          runStatsJson,
           Number(message.timestamp) || updatedAt + index,
         );
       });
@@ -2987,7 +3064,7 @@ export function updateChatSession(
   tenantId: string,
   ownerSub: string,
   sessionId: string,
-  patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'forkedFromSessionId'>>,
+  patch: Partial<Pick<ChatHistorySession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'visualPreprocessEnabled' | 'visualPreprocessModel' | 'forkedFromSessionId'>>,
 ) {
   const currentRow = getOwnedChatSessionRow(tenantId, ownerSub, sessionId);
   if (!currentRow) return null;
@@ -3001,6 +3078,8 @@ export function updateChatSession(
     model: patch.model ?? current.model,
     sdkSessionId: patch.sdkSessionId ?? current.sdkSessionId,
     sdkCwd: patch.sdkCwd ?? current.sdkCwd,
+    visualPreprocessEnabled: typeof patch.visualPreprocessEnabled === 'boolean' ? patch.visualPreprocessEnabled : current.visualPreprocessEnabled,
+    visualPreprocessModel: patch.visualPreprocessModel ?? current.visualPreprocessModel,
     forkedFromSessionId: patch.forkedFromSessionId ?? current.forkedFromSessionId,
     updatedAt: now(),
   });
@@ -3018,6 +3097,8 @@ export function forkChatSession(tenantId: string, ownerSub: string, sessionId: s
     model: current.model,
     sdkSessionId: undefined,
     sdkCwd: undefined,
+    visualPreprocessEnabled: current.visualPreprocessEnabled,
+    visualPreprocessModel: current.visualPreprocessModel,
     forkedFromSessionId: current.id,
     pinned: false,
     messages: current.messages,
@@ -3107,13 +3188,34 @@ function splitProviderModels(value: string): string[] {
     .filter(model => model && !model.includes('*'))));
 }
 
+function normalizeProviderModelContextWindows(value: unknown): Record<string, number> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).flatMap(([model, tokens]) => {
+    const name = model.trim();
+    const numeric = Number(tokens);
+    if (!name || name.includes('*') || !Number.isFinite(numeric) || numeric <= 0) return [];
+    return [[name, Math.floor(numeric)] as const];
+  }));
+}
+
+function parseProviderModelContextWindowsJson(value: unknown): Record<string, number> {
+  if (typeof value !== 'string' || !value.trim()) return {};
+  try {
+    return normalizeProviderModelContextWindows(JSON.parse(value));
+  } catch {
+    return {};
+  }
+}
+
 function normalizeProviderProfileInput(tenantId: string, input: Record<string, unknown>, fallbackIndex: number): ProviderProfileRow {
   const timestamp = now();
   const id = String(input.id || `provider-${timestamp}-${fallbackIndex}`).trim().slice(0, 96);
+  const modelContextWindows = normalizeProviderModelContextWindows(input.modelContextWindows);
   const availableModels = [
     ...(Array.isArray(input.availableModels) ? input.availableModels : []),
     ...(typeof input.modelPatterns === 'string' ? splitProviderModels(input.modelPatterns) : []),
     ...(typeof input.ANTHROPIC_MODEL === 'string' ? [input.ANTHROPIC_MODEL] : []),
+    ...Object.keys(modelContextWindows),
   ].flatMap((item) => {
     if (typeof item !== 'string') return [];
     const model = item.trim();
@@ -3127,6 +3229,7 @@ function normalizeProviderProfileInput(tenantId: string, input: Record<string, u
     ANTHROPIC_AUTH_TOKEN: String(input.ANTHROPIC_AUTH_TOKEN || '').trim(),
     ANTHROPIC_BASE_URL: String(input.ANTHROPIC_BASE_URL || '').trim(),
     availableModels: Array.from(new Set(availableModels)),
+    modelContextWindows,
     enabled: input.enabled !== false,
     isDefault: input.isDefault === true,
     createdAt: Number(input.createdAt) || timestamp,
@@ -3142,6 +3245,7 @@ function mapProviderProfile(row: any): ProviderProfileRow {
     ANTHROPIC_AUTH_TOKEN: row.auth_token || '',
     ANTHROPIC_BASE_URL: row.base_url || '',
     availableModels: parseProviderModelsJson(row.available_models_json),
+    modelContextWindows: parseProviderModelContextWindowsJson(row.model_context_windows_json),
     enabled: Boolean(row.enabled),
     isDefault: Boolean(row.is_default),
     createdAt: row.created_at,
@@ -3151,7 +3255,7 @@ function mapProviderProfile(row: any): ProviderProfileRow {
 
 export function listProviderProfiles(tenantId: string): ProviderProfileRow[] {
   const rows = db.prepare(`
-    SELECT tenant_id, id, name, auth_token, base_url, available_models_json, enabled, is_default, created_at, updated_at
+    SELECT tenant_id, id, name, auth_token, base_url, available_models_json, model_context_windows_json, enabled, is_default, created_at, updated_at
     FROM provider_profiles
     WHERE tenant_id = ?
     ORDER BY is_default DESC, updated_at DESC, name ASC
@@ -3176,9 +3280,9 @@ export function replaceProviderProfiles(tenantId: string, profiles: Array<Record
     db.prepare('DELETE FROM provider_profiles WHERE tenant_id = ?').run(tenantId);
     const insert = db.prepare(`
       INSERT INTO provider_profiles (
-        tenant_id, id, name, auth_token, base_url, available_models_json, enabled, is_default, created_at, updated_at
+        tenant_id, id, name, auth_token, base_url, available_models_json, model_context_windows_json, enabled, is_default, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const profile of nextProfiles) {
       insert.run(
@@ -3188,6 +3292,7 @@ export function replaceProviderProfiles(tenantId: string, profiles: Array<Record
         profile.ANTHROPIC_AUTH_TOKEN,
         profile.ANTHROPIC_BASE_URL,
         JSON.stringify(profile.availableModels),
+        JSON.stringify(profile.modelContextWindows || {}),
         profile.enabled ? 1 : 0,
         profile.isDefault ? 1 : 0,
         profile.createdAt,
@@ -3215,6 +3320,65 @@ export function resolveProviderProfileForModel(tenantId: string, model: string):
     )) || null;
   }
   return usable.find(profile => profile.isDefault) || usable[0] || null;
+}
+
+// ═══ Internal Tool Settings (tenant-shared) ═══
+function parseInternalToolSettingsJson(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'string' || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function mapInternalToolSetting(row: any): InternalToolSettingRow {
+  return {
+    tenantId: row.tenant_id,
+    toolId: row.tool_id,
+    settings: parseInternalToolSettingsJson(row.settings_json),
+    updatedAt: row.updated_at,
+  };
+}
+
+export function listInternalToolSettings(tenantId: string): InternalToolSettingRow[] {
+  const rows = db.prepare(`
+    SELECT tenant_id, tool_id, settings_json, updated_at
+    FROM internal_tool_settings
+    WHERE tenant_id = ?
+    ORDER BY tool_id ASC
+  `).all(tenantId);
+  return rows.map(mapInternalToolSetting);
+}
+
+export function getInternalToolSetting(tenantId: string, toolId: string): InternalToolSettingRow | null {
+  const row = db.prepare(`
+    SELECT tenant_id, tool_id, settings_json, updated_at
+    FROM internal_tool_settings
+    WHERE tenant_id = ? AND tool_id = ?
+  `).get(tenantId, toolId);
+  return row ? mapInternalToolSetting(row) : null;
+}
+
+export function updateInternalToolSetting(
+  tenantId: string,
+  toolId: string,
+  settings: Record<string, unknown>,
+): InternalToolSettingRow {
+  const timestamp = now();
+  db.prepare(`
+    INSERT INTO internal_tool_settings (tenant_id, tool_id, settings_json, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(tenant_id, tool_id) DO UPDATE SET
+      settings_json = excluded.settings_json,
+      updated_at = excluded.updated_at
+  `).run(tenantId, toolId, JSON.stringify(settings), timestamp);
+  const saved = getInternalToolSetting(tenantId, toolId);
+  if (!saved) throw new Error('failed to save internal tool settings');
+  return saved;
 }
 
 // ═══ Agent Templates (personal + published per tenant) ═══

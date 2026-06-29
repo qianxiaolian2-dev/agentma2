@@ -28,7 +28,7 @@ export const BUILT_IN_TOOLS: BuiltInTool[] = [
   { name: 'ExitPlanMode', description: '退出规划模式', category: 'interaction', inputSchema: {} },
   { name: 'EnterWorktree', description: '进入 git worktree', category: 'execution', inputSchema: { name: 'string?' } },
   { name: 'Skill', description: '调用技能', category: 'interaction', inputSchema: { skill: 'string', args: 'string?' } },
-  { name: 'ToolSearch', description: '搜索可用工具', category: 'search', inputSchema: { query: 'string' } },
+  { name: 'ToolSearch', description: 'SDK 工具发现机制（非普通 MCP 工具）', category: 'search', inputSchema: { query: 'string' } },
   { name: 'ListMcpResources', description: '列出 MCP 资源', category: 'mcp', inputSchema: { server: 'string' } },
   { name: 'ReadMcpResource', description: '读取 MCP 资源', category: 'mcp', inputSchema: { server: 'string', uri: 'string' } },
 ];
@@ -494,7 +494,7 @@ export const DEFAULT_SKILLS: SkillInfo[] = [
   { name: 'docx', description: '读写 Word 文档 (.docx)', location: 'user', path: '~/.claude/skills/docx/', enabled: true },
   { name: 'xlsx', description: '读写 Excel 电子表格', location: 'user', path: '~/.claude/skills/xlsx/', enabled: false },
   { name: 'pptx', description: '创建和编辑 PPT 演示文稿', location: 'user', path: '~/.claude/skills/pptx/', enabled: false },
-  { name: 'agentma-visual', description: '把内容渲染成可预览和保存的 HTML 可视化', location: 'user', path: '~/.claude/skills/agentma-visual/', enabled: true },
+  { name: 'agentma-visual', description: '把内容渲染成可预览和保存的 HTML/Markdown 可视化', location: 'user', path: '~/.claude/skills/agentma-visual/', enabled: true },
   { name: 'code-review', description: '自动化代码审查助手', location: 'project', path: '.claude/skills/code-review/', enabled: true },
   { name: 'i18n-helper', description: '国际化翻译辅助工具', location: 'project', path: '.claude/skills/i18n-helper/', enabled: false },
   { name: 'api-doc-gen', description: '从代码生成 API 文档', location: 'project', path: '.claude/skills/api-doc-gen/', enabled: true },

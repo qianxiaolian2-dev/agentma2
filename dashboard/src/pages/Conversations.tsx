@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { ClipboardEvent } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import type { ChatSession, AgentTemplate, ChatMessage, ProviderConfig, ChatAttachment, ChatImageMimeType } from '../simulator/types';
+import type { ChatSession, AgentTemplate, ChatMessage, ChatRunStats, ProviderConfig, ChatAttachment, ChatImageMimeType } from '../simulator/types';
 import { initCustomTools } from '../simulator/mock-data';
 import type { EventSourceConfig } from '../simulator/types';
 import { getEndpointProbeBlockReason, isUsingApiKeyAuth, getAuthHeaders } from '../utils/client-runtime';
@@ -11,13 +11,18 @@ import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, ensureVizAgentTemplate, loadCachedAgentTemplates } from '../utils/agent-templates';
 import { buildRequestToolsForAgent } from '../utils/build-request-tools';
 import { mergeAgentTaskEvent, taskStatusColor, taskStatusLabel, type AgentTaskEvent } from '../utils/agent-tasks';
+import { mergeContextCompactionEvent, type ContextCompactionEvent } from '../utils/context-events';
 import { appendAssistantDraft, finalizeAssistantDraft, updateAssistantDraft } from '../utils/chat-stream-draft';
 import { findPendingRunMessage, observeServerRun } from '../utils/chat-run-events';
+import { chatRunStatsFromResultEvent, latestAssistantRunStats } from '../utils/chat-run-stats';
 import { fetchProviderModels, listProviderModels, loadProviderProfiles, resolveProviderForModel } from '../utils/providers';
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
-import MascotRunner from '../components/MascotRunner';
+import WaitingHint from '../components/WaitingHint';
 import ChatModelPicker from '../components/ChatModelPicker';
+import ModelPicker from '../components/common/ModelPicker';
+import ContextWindowMeter from '../components/ContextWindowMeter';
+import ContextCompactionEvents from '../components/ContextCompactionEvents';
 import {
   deriveRunPhase,
   isWaitingPhase,
@@ -145,6 +150,14 @@ function canResumeSessionForAgent(session: ChatSession | null | undefined, agent
   return session.templateId === agent.id;
 }
 
+function defaultVisualPreprocessEnabled(agent: AgentTemplate | null | undefined) {
+  return agent?.visualPreprocessDefault === true;
+}
+
+function defaultVisualPreprocessModel(agent: AgentTemplate | null | undefined) {
+  return agent?.visualPreprocessModel || '';
+}
+
 const SCROLL_BOTTOM_THRESHOLD = 80;
 
 function isTextEntryElement(element: Element | null) {
@@ -158,6 +171,36 @@ function isTextEntryElement(element: Element | null) {
 }
 
 type ConversationUrlState = Pick<ChatSession, 'id' | 'sdkSessionId'> | null;
+type SessionRunUiState = {
+  isStreaming: boolean;
+  phase: RunPhase;
+  runId: string;
+  pendingPermissions: PermissionRequest[];
+  pendingQuestions: AskUserQuestionRequest[];
+  agentTasks: AgentTaskEvent[];
+  contextEvents: ContextCompactionEvent[];
+  structuredOutput: unknown;
+  runStats: ChatRunStats | null;
+};
+
+const EMPTY_PERMISSION_REQUESTS: PermissionRequest[] = [];
+const EMPTY_ASK_USER_QUESTIONS: AskUserQuestionRequest[] = [];
+const EMPTY_AGENT_TASKS: AgentTaskEvent[] = [];
+const EMPTY_CONTEXT_EVENTS: ContextCompactionEvent[] = [];
+
+function createIdleSessionRunUiState(): SessionRunUiState {
+  return {
+    isStreaming: false,
+    phase: 'idle',
+    runId: '',
+    pendingPermissions: [],
+    pendingQuestions: [],
+    agentTasks: [],
+    contextEvents: [],
+    structuredOutput: null,
+    runStats: null,
+  };
+}
 
 export default function Conversations() {
   const navigate = useNavigate();
@@ -175,6 +218,8 @@ export default function Conversations() {
   const [selectedAgentId, setSelectedAgentId] = useState('');
   const [modelOptions, setModelOptions] = useState<string[]>(() => listProviderModels());
   const [selectedModelOverride, setSelectedModelOverride] = useState<{ contextKey: string; model: string } | null>(null);
+  const [visualPreprocessEnabled, setVisualPreprocessEnabled] = useState(false);
+  const [visualPreprocessModel, setVisualPreprocessModel] = useState('');
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [loadingSessionId, setLoadingSessionId] = useState('');
   const [sessionLoadError, setSessionLoadError] = useState('');
@@ -183,14 +228,7 @@ export default function Conversations() {
   // 聊天状态
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [runPhase, setRunPhase] = useState<RunPhase>('idle');
-  const [, setActiveRunId] = useState('');
-  const [pendingPermissions, setPendingPermissions] = useState<PermissionRequest[]>([]);
-  const [pendingQuestions, setPendingQuestions] = useState<AskUserQuestionRequest[]>([]);
-  const [agentTasks, setAgentTasks] = useState<AgentTaskEvent[]>([]);
-  const [structuredOutput, setStructuredOutput] = useState<unknown>(null);
-  const [runStats, setRunStats] = useState<{ costUsd?: number; durationMs?: number; inTok?: number; outTok?: number } | null>(null);
+  const [sessionRunUi, setSessionRunUi] = useState<Record<string, SessionRunUiState>>({});
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState('');
   const [showScrollBottom, setShowScrollBottom] = useState(false);
@@ -202,7 +240,8 @@ export default function Conversations() {
   const sessionLoadSeqRef = useRef(0);
   const isInputComposingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  const runAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const activeSessionIdRef = useRef<string | null>(null);
   const observingRunIdRef = useRef('');
   const activeItemRef = useRef<HTMLDivElement>(null);
   const provider = useRef<ProviderConfig>(resolveProviderForModel().provider);
@@ -212,6 +251,16 @@ export default function Conversations() {
   const modelContextKey = `${selectedAgentId || ''}:${activeSessionId || 'new'}`;
   const selectedModel = selectedModelOverride?.contextKey === modelContextKey ? selectedModelOverride.model : '';
   const effectiveModel = selectedModel || activeSession?.model || currentAgent?.model || '';
+  const activeRunUi = activeSessionId ? sessionRunUi[activeSessionId] : undefined;
+  const isStreaming = Boolean(activeRunUi?.isStreaming);
+  const runPhase = activeRunUi?.phase || 'idle';
+  const pendingPermissions = activeRunUi?.pendingPermissions || EMPTY_PERMISSION_REQUESTS;
+  const pendingQuestions = activeRunUi?.pendingQuestions || EMPTY_ASK_USER_QUESTIONS;
+  const agentTasks = activeRunUi?.agentTasks || EMPTY_AGENT_TASKS;
+  const contextEvents = activeRunUi?.contextEvents || EMPTY_CONTEXT_EVENTS;
+  const structuredOutput = activeRunUi?.structuredOutput ?? null;
+  const runStats = activeRunUi?.runStats || null;
+  const observedRunStats = runStats || (!isStreaming ? latestAssistantRunStats(messages) : null);
   const pendingRunMessage = useMemo(() => findPendingRunMessage(messages), [messages]);
   const focusChatInput = useCallback(() => {
     requestAnimationFrame(() => {
@@ -230,9 +279,63 @@ export default function Conversations() {
   const selectedAgentSessions = selectedAgentId ? getSessionsForAgent(sessions, selectedAgentId) : [];
   const visibleSessions = selectedAgentSessions
     .filter(session => !sessionSearch || getChatSessionDisplayTitle(session).toLowerCase().includes(sessionSearch.toLowerCase()));
-  const persistRef = useRef<((msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => Promise<string>) | null>(null);
+  const persistRef = useRef<((msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string, options?: { syncUrl?: boolean }) => Promise<string>) | null>(null);
   const appliedDraftRef = useRef('');
   const appliedConversationRequestRef = useRef('');
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    if (!currentAgent || activeSessionId) return;
+    setVisualPreprocessEnabled(defaultVisualPreprocessEnabled(currentAgent));
+    setVisualPreprocessModel(defaultVisualPreprocessModel(currentAgent));
+  }, [activeSessionId, currentAgent?.id, currentAgent?.visualPreprocessDefault, currentAgent?.visualPreprocessModel]);
+
+  const patchSessionRunUi = useCallback((
+    sessionId: string,
+    updater: (current: SessionRunUiState) => SessionRunUiState,
+  ) => {
+    if (!sessionId) return;
+    setSessionRunUi(prev => {
+      const current = prev[sessionId] || createIdleSessionRunUiState();
+      const next = updater(current);
+      return { ...prev, [sessionId]: next };
+    });
+  }, []);
+
+  const beginSessionRun = useCallback((sessionId: string) => {
+    patchSessionRunUi(sessionId, () => ({
+      ...createIdleSessionRunUiState(),
+      isStreaming: true,
+      phase: 'initializing',
+    }));
+  }, [patchSessionRunUi]);
+
+  const updateSessionRunPhase = useCallback((sessionId: string, phase: RunPhase) => {
+    patchSessionRunUi(sessionId, current => ({ ...current, phase, isStreaming: current.isStreaming || phase !== 'idle' }));
+  }, [patchSessionRunUi]);
+
+  const finishSessionRun = useCallback((sessionId: string) => {
+    runAbortControllersRef.current.delete(sessionId);
+    patchSessionRunUi(sessionId, current => ({
+      ...current,
+      isStreaming: false,
+      phase: 'idle',
+      runId: '',
+      pendingPermissions: [],
+      pendingQuestions: [],
+    }));
+  }, [patchSessionRunUi]);
+
+  const setSessionMessages = useCallback((
+    sessionId: string,
+    updater: ChatMessage[] | ((previous: ChatMessage[]) => ChatMessage[]),
+  ) => {
+    if (activeSessionIdRef.current !== sessionId) return;
+    setMessages(updater);
+  }, []);
 
   useEffect(() => {
     if (!user?.tenantId) return;
@@ -318,15 +421,17 @@ export default function Conversations() {
     const messageCount = session.messageCount ?? session.messages.length;
     const hasFullMessages = session.messages.length >= messageCount;
 
+    activeSessionIdRef.current = session.id;
     setActiveSessionId(session.id);
     setMessages(hasFullMessages ? session.messages : []);
-    setPendingQuestions([]);
-    setAgentTasks([]);
     setSessionLoadError('');
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setAttachmentError('');
+    const sessionAgent = templates.find(t => t.id === session.templateId) || null;
+    setVisualPreprocessEnabled(session.visualPreprocessEnabled ?? defaultVisualPreprocessEnabled(sessionAgent));
+    setVisualPreprocessModel(session.visualPreprocessModel || defaultVisualPreprocessModel(sessionAgent));
     if (session.templateId && templates.find(t => t.id === session.templateId)) {
       setSelectedAgentId(session.templateId);
     }
@@ -344,6 +449,7 @@ export default function Conversations() {
       if (sessionLoadSeqRef.current !== loadSeq) return null;
       if (!fullSession) {
         setSessions(prev => prev.filter(item => item.id !== session.id));
+        activeSessionIdRef.current = null;
         setActiveSessionId(null);
         setMessages([]);
         syncConversationUrl(null);
@@ -351,6 +457,9 @@ export default function Conversations() {
       }
       upsertSession(fullSession);
       setMessages(fullSession.messages);
+      const fullSessionAgent = templates.find(t => t.id === fullSession.templateId) || null;
+      setVisualPreprocessEnabled(fullSession.visualPreprocessEnabled ?? defaultVisualPreprocessEnabled(fullSessionAgent));
+      setVisualPreprocessModel(fullSession.visualPreprocessModel || defaultVisualPreprocessModel(fullSessionAgent));
       if (fullSession.templateId && templates.find(t => t.id === fullSession.templateId)) {
         setSelectedAgentId(fullSession.templateId);
       }
@@ -370,29 +479,25 @@ export default function Conversations() {
   const doAutoReply = useCallback(async (eventText: string) => {
     if (!currentAgent || isStreaming || !activeSessionId) return;
 
+    const sessionId = activeSessionId;
     const agent = currentAgent;
     const currentMsgs = messages;
-    const active = sessions.find((session) => session.id === activeSessionId);
+    const active = sessions.find((session) => session.id === sessionId);
     const autoModel = selectedModel || active?.model || agent.model;
     const prov = resolveProviderForModel(autoModel).provider;
 
-    setIsStreaming(true);
-    setRunPhase('initializing');
+    beginSessionRun(sessionId);
     const eventMsg: ChatMessage = { role: 'user', content: eventText, timestamp: Date.now() };
     const newMsgs = [...currentMsgs, eventMsg];
     const assistantTimestamp = Date.now();
     const draftId0 = crypto.randomUUID();
     const draftMsgs = appendAssistantDraft(newMsgs, draftId0, assistantTimestamp);
-    setMessages(draftMsgs);
-    await persistRef.current?.(draftMsgs, activeSessionId, undefined, undefined);
-    setPendingQuestions([]);
-    setAgentTasks([]);
-    setStructuredOutput(null);
-    setRunStats(null);
+    setSessionMessages(sessionId, draftMsgs);
+    await persistRef.current?.(draftMsgs, sessionId, undefined, undefined, { syncUrl: activeSessionIdRef.current === sessionId });
 
     let thinking = '';
     let text = '';
-    let runIdForDraft = '';
+    const runIdForDraft = { current: '' };
     let didFinalize = false;
     let receivedOutcome: RunOutcome | null = null;
     let outcomeDetail: string | undefined;
@@ -410,13 +515,10 @@ export default function Conversations() {
     let pendingQuestionCount = 0;
     const updateRunPhase = (patch: Partial<typeof phaseFlags>) => {
       Object.assign(phaseFlags, patch);
-      setRunPhase(deriveRunPhase(phaseFlags));
+      updateSessionRunPhase(sessionId, deriveRunPhase(phaseFlags));
     };
     const finishRun = () => {
-      abortRef.current = null;
-      setIsStreaming(false);
-      setRunPhase('idle');
-      setActiveRunId('');
+      finishSessionRun(sessionId);
     };
     const persistFinalMessage = async (
       content: string,
@@ -424,18 +526,22 @@ export default function Conversations() {
       sdkSessionId?: string,
       sdkCwd?: string,
       detail?: string,
+      finalRunStats?: ChatRunStats,
     ) => {
       if (didFinalize) return;
       didFinalize = true;
       updateRunPhase({ finalizing: true, initializing: false, streaming: false, thinking: false, toolExecuting: false });
-      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId0, assistantTimestamp, content, outcome, thinking || undefined, detail, runIdForDraft || undefined);
-      setMessages(finalMsgs);
-      const sid = await (persistRef.current?.(finalMsgs, activeSessionId, sdkSessionId, sdkCwd) || Promise.resolve(''));
-      if (sid) setActiveSessionId(sid);
+      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId0, assistantTimestamp, content, outcome, thinking || undefined, detail, runIdForDraft.current || undefined, finalRunStats);
+      setSessionMessages(sessionId, finalMsgs);
+      const sid = await (persistRef.current?.(finalMsgs, sessionId, sdkSessionId, sdkCwd, { syncUrl: activeSessionIdRef.current === sessionId }) || Promise.resolve(''));
+      if (sid && activeSessionIdRef.current === sessionId) {
+        activeSessionIdRef.current = sid;
+        setActiveSessionId(sid);
+      }
     };
 
     const controller = new AbortController();
-    abortRef.current = controller;
+    runAbortControllersRef.current.set(sessionId, controller);
 
     try {
       const shouldResume = canResumeSessionForAgent(active, agent);
@@ -456,13 +562,14 @@ export default function Conversations() {
             thinking: m.thinking,
             outcome: m.outcome,
             outcomeDetail: m.outcomeDetail,
+            runStats: m.runStats,
           })),
           systemPrompt: agent.systemPrompt || undefined,
           model: autoModel,
           provider: prov,
           providerProfiles: loadProviderProfiles(),
           templateId: agent.id,
-          sessionId: activeSessionId || undefined,
+          sessionId,
           tools: buildRequestToolsForAgent(agent),
           mcpServers: agent.mcpServers || [],
           subagents: agent.subagents,
@@ -513,9 +620,9 @@ export default function Conversations() {
             if (d.type === 'run_started') {
               const runId = typeof d.runId === 'string' ? d.runId : '';
               if (runId) {
-                runIdForDraft = runId;
-                setActiveRunId(runId);
-                setMessages(prev => updateAssistantDraft(prev, draftId0, { runId }));
+                runIdForDraft.current = runId;
+                patchSessionRunUi(sessionId, current => ({ ...current, runId, isStreaming: true }));
+                setSessionMessages(sessionId, prev => updateAssistantDraft(prev, draftId0, { runId }));
                 controller.signal.addEventListener('abort', () => {
                   fetch(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
                     method: 'POST',
@@ -528,21 +635,30 @@ export default function Conversations() {
             } else if (d.type === 'delta') {
               if (d.thinking) {
                 thinking += d.text || '';
-                setMessages(prev => updateAssistantDraft(prev, draftId0, { thinking, status: 'streaming' }));
+                setSessionMessages(sessionId, prev => updateAssistantDraft(prev, draftId0, { thinking, status: 'streaming' }));
                 updateRunPhase({ initializing: false, thinking: true, streaming: false, toolExecuting: false });
               } else {
                 text += d.text || '';
-                setMessages(prev => updateAssistantDraft(prev, draftId0, { content: text, status: 'streaming' }));
+                setSessionMessages(sessionId, prev => updateAssistantDraft(prev, draftId0, { content: text, status: 'streaming' }));
                 updateRunPhase({ initializing: false, thinking: false, streaming: true, toolExecuting: false });
               }
             } else if (d.type === 'result') {
               const finalOutcome = receivedOutcome || mapResultSubtypeToOutcome(d.subtype);
               const finalDetail = outcomeDetail || (typeof d.subtype === 'string' ? d.subtype : undefined);
               const content = text || d.text || '';
-              if (d.structuredOutput !== undefined) setStructuredOutput(d.structuredOutput);
-              if (d.cost_usd !== undefined || d.duration_ms !== undefined)
-                setRunStats({ costUsd: d.cost_usd, durationMs: d.duration_ms, inTok: d.usage?.input_tokens, outTok: d.usage?.output_tokens });
-              await persistFinalMessage(content || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, d.sdkSessionId, d.sdkCwd, finalDetail);
+              if (d.structuredOutput !== undefined) {
+                patchSessionRunUi(sessionId, current => ({ ...current, structuredOutput: d.structuredOutput }));
+              }
+              if (d.cost_usd !== undefined || d.duration_ms !== undefined || d.usage !== undefined) {
+                const finalRunStats = chatRunStatsFromResultEvent(d);
+                patchSessionRunUi(sessionId, current => ({
+                  ...current,
+                  runStats: finalRunStats || null,
+                }));
+                await persistFinalMessage(content || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, d.sdkSessionId, d.sdkCwd, finalDetail, finalRunStats);
+              } else {
+                await persistFinalMessage(content || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, d.sdkSessionId, d.sdkCwd, finalDetail);
+              }
             } else if (d.type === 'run_outcome') {
               receivedOutcome = normalizeRunOutcome(d.outcome, receivedOutcome || 'provider_error');
               outcomeDetail = typeof d.subtype === 'string'
@@ -550,35 +666,51 @@ export default function Conversations() {
                 : typeof d.message === 'string' ? d.message : outcomeDetail;
             } else if (d.type === 'permission_request') {
               pendingPermissionCount += 1;
-              setPendingPermissions(prev => [...prev, {
+              const req = {
                 reqId: d.reqId, toolName: d.toolName, input: d.input,
                 title: d.title, displayName: d.displayName, description: d.description,
                 toolUseID: d.toolUseID,
-              }]);
+              };
+              patchSessionRunUi(sessionId, current => ({ ...current, pendingPermissions: [...current.pendingPermissions, req] }));
               updateRunPhase({ awaitingPermission: true, initializing: false });
             } else if (d.type === 'permission_resolved') {
               if (d.reqId) {
                 pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
-                setPendingPermissions(prev => prev.filter(p => p.reqId !== d.reqId));
+                patchSessionRunUi(sessionId, current => ({
+                  ...current,
+                  pendingPermissions: current.pendingPermissions.filter(p => p.reqId !== d.reqId),
+                }));
                 updateRunPhase({ awaitingPermission: pendingPermissionCount > 0 });
               }
             } else if (d.type === 'ask_user_question') {
               pendingQuestionCount += 1;
-              setPendingQuestions(prev => [...prev, {
+              const req = {
                 reqId: d.reqId,
                 questions: d.questions || [],
                 toolUseID: d.toolUseID,
-              }]);
+              };
+              patchSessionRunUi(sessionId, current => ({ ...current, pendingQuestions: [...current.pendingQuestions, req] }));
               updateRunPhase({ awaitingInput: true, initializing: false });
             } else if (d.type === 'ask_user_question_resolved') {
               if (d.reqId) {
                 pendingQuestionCount = Math.max(0, pendingQuestionCount - 1);
-                setPendingQuestions(prev => prev.filter(p => p.reqId !== d.reqId));
+                patchSessionRunUi(sessionId, current => ({
+                  ...current,
+                  pendingQuestions: current.pendingQuestions.filter(p => p.reqId !== d.reqId),
+                }));
                 updateRunPhase({ awaitingInput: pendingQuestionCount > 0 });
               }
             } else if (String(d.type || '').startsWith('task_')) {
-              setAgentTasks(prev => mergeAgentTaskEvent(prev, d));
+              patchSessionRunUi(sessionId, current => ({
+                ...current,
+                agentTasks: mergeAgentTaskEvent(current.agentTasks, d),
+              }));
               updateRunPhase({ initializing: false, toolExecuting: true, thinking: false, streaming: false });
+            } else if (d.type === 'context_compaction') {
+              patchSessionRunUi(sessionId, current => ({
+                ...current,
+                contextEvents: mergeContextCompactionEvent(current.contextEvents, d),
+              }));
             } else if (d.type === 'error') {
               cachedErrorMessage = String(d.message || '未知错误');
               receivedOutcome = receivedOutcome || 'provider_error';
@@ -600,7 +732,19 @@ export default function Conversations() {
       }
     }
     finishRun();
-  }, [currentAgent, isStreaming, activeSessionId, messages, sessions, selectedModel]);
+  }, [
+    activeSessionId,
+    beginSessionRun,
+    currentAgent,
+    finishSessionRun,
+    isStreaming,
+    messages,
+    patchSessionRunUi,
+    selectedModel,
+    sessions,
+    setSessionMessages,
+    updateSessionRunPhase,
+  ]);
 
   // 订阅 EventSource — 当 MCP 服务器部署后，自动桥接 bot 事件到当前会话
   useEffect(() => {
@@ -740,10 +884,9 @@ export default function Conversations() {
     sessionLoadSeqRef.current += 1;
     setLoadingSessionId('');
     setSessionLoadError('');
+    activeSessionIdRef.current = null;
     setActiveSessionId(null);
     setMessages([]);
-    setPendingQuestions([]);
-    setAgentTasks([]);
     setInput(requestedDraft);
     setAttachments([]);
     setAttachmentError('');
@@ -783,8 +926,15 @@ export default function Conversations() {
   };
 
   // 保存会话（服务端持久化 + 本地状态同步）
-  const persistSession = useCallback(async (msgs: ChatMessage[], sid: string | null, sdkSessionId?: string, sdkCwd?: string) => {
+  const persistSession = useCallback(async (
+    msgs: ChatMessage[],
+    sid: string | null,
+    sdkSessionId?: string,
+    sdkCwd?: string,
+    options: { syncUrl?: boolean } = {},
+  ) => {
     if (!selectedAgentId || msgs.length === 0) return '';
+    const shouldSyncUrl = options.syncUrl !== false;
     const now = Date.now();
     const id = sid || `chat-${Date.now()}`;
     const existing = sid ? sessions.find((session) => session.id === sid) : undefined;
@@ -799,6 +949,8 @@ export default function Conversations() {
       model: currentModel,
       sdkSessionId: canReuseExistingSdkSession ? existing?.sdkSessionId : sdkSessionId,
       sdkCwd: (canReuseExistingSdkSession ? existing?.sdkCwd : undefined) || sdkCwd,
+      visualPreprocessEnabled,
+      visualPreprocessModel: visualPreprocessModel || undefined,
       forkedFromSessionId: existing?.forkedFromSessionId,
       forkedFromTitle: existing?.forkedFromTitle,
       pinned: existing?.pinned,
@@ -820,14 +972,14 @@ export default function Conversations() {
         if (!exists) return [saved, ...prev];
         return prev.map((session) => session.id === saved.id ? saved : session);
       });
-      syncConversationUrl(saved);
+      if (shouldSyncUrl) syncConversationUrl(saved);
       return saved.id;
     } catch (error) {
       console.error('failed to persist chat session', error);
-      syncConversationUrl(draft);
+      if (shouldSyncUrl) syncConversationUrl(draft);
       return id;
     }
-  }, [selectedAgentId, currentAgent, sessions, syncConversationUrl, selectedModel]);
+  }, [selectedAgentId, currentAgent, sessions, syncConversationUrl, selectedModel, visualPreprocessEnabled, visualPreprocessModel]);
 
   // 把 persistSession 存到 ref 供 doAutoReply 使用
   persistRef.current = persistSession;
@@ -838,14 +990,15 @@ export default function Conversations() {
     sessionLoadSeqRef.current += 1;
     setLoadingSessionId('');
     setSessionLoadError('');
+    activeSessionIdRef.current = null;
     setActiveSessionId(null);
     setMessages([]);
-    setPendingQuestions([]);
-    setAgentTasks([]);
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setAttachmentError('');
+    setVisualPreprocessEnabled(defaultVisualPreprocessEnabled(currentAgent));
+    setVisualPreprocessModel(defaultVisualPreprocessModel(currentAgent));
     setMobileListOpen(false);
     syncConversationUrl(null);
   };
@@ -868,11 +1021,6 @@ export default function Conversations() {
     setSessionLoadError('');
     setSelectedAgentId(agentId);
     setSessionSearch('');
-    setPendingQuestions([]);
-    setPendingPermissions([]);
-    setAgentTasks([]);
-    setStructuredOutput(null);
-    setRunStats(null);
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
@@ -898,6 +1046,7 @@ export default function Conversations() {
         sessionLoadSeqRef.current += 1;
         setLoadingSessionId('');
         setSessionLoadError('');
+        activeSessionIdRef.current = null;
         setActiveSessionId(null);
         setMessages([]);
         syncConversationUrl(null);
@@ -918,45 +1067,67 @@ export default function Conversations() {
       observingRunIdRef.current = '';
       return;
     }
-    if (isStreaming || abortRef.current) return;
+    if (isStreaming || runAbortControllersRef.current.has(activeSessionId)) return;
     if (observingRunIdRef.current === pendingRunMessage.runId) return;
     observingRunIdRef.current = pendingRunMessage.runId;
+    const sessionId = activeSessionId;
     const controller = new AbortController();
     const baseMessages = messages;
-    setPendingPermissions([]);
-    setPendingQuestions([]);
-    setAgentTasks([]);
-    setStructuredOutput(null);
-    setRunStats(null);
+    const sessionAbortRef = { current: null as AbortController | null };
     void observeServerRun({
       runId: pendingRunMessage.runId,
-      sessionId: activeSessionId,
+      sessionId,
       baseMessages,
       draftId: pendingRunMessage.id,
       assistantTimestamp: pendingRunMessage.timestamp,
       initialThinking: pendingRunMessage.thinking,
       initialText: pendingRunMessage.content,
-      onMessages: setMessages,
+      onMessages: updater => setSessionMessages(sessionId, updater),
       persistFinal: async (nextMessages, sdkSessionId, sdkCwd) => {
-        const sid = await persistSession(nextMessages, activeSessionId, sdkSessionId, sdkCwd);
-        if (sid) setActiveSessionId(sid);
+        const sid = await persistSession(nextMessages, sessionId, sdkSessionId, sdkCwd, { syncUrl: activeSessionIdRef.current === sessionId });
+        if (sid && activeSessionIdRef.current === sessionId) {
+          activeSessionIdRef.current = sid;
+          setActiveSessionId(sid);
+        }
       },
-      setIsStreaming,
-      setRunPhase,
-      setActiveRunId,
-      setPendingPermissions,
-      setPendingQuestions,
-      setAgentTasks,
-      setStructuredOutput,
-      setRunStats,
-      abortRef,
+      setIsStreaming: (value) => {
+        if (value) beginSessionRun(sessionId);
+        else finishSessionRun(sessionId);
+      },
+      setRunPhase: phase => updateSessionRunPhase(sessionId, phase),
+      setActiveRunId: runId => patchSessionRunUi(sessionId, current => ({ ...current, runId })),
+      setPendingPermissions: updater => patchSessionRunUi(sessionId, current => ({ ...current, pendingPermissions: updater(current.pendingPermissions) })),
+      setPendingQuestions: updater => patchSessionRunUi(sessionId, current => ({ ...current, pendingQuestions: updater(current.pendingQuestions) })),
+      setAgentTasks: updater => patchSessionRunUi(sessionId, current => ({ ...current, agentTasks: updater(current.agentTasks) })),
+      setContextEvents: updater => patchSessionRunUi(sessionId, current => ({ ...current, contextEvents: updater(current.contextEvents) })),
+      setStructuredOutput: value => patchSessionRunUi(sessionId, current => ({ ...current, structuredOutput: value })),
+      setRunStats: value => patchSessionRunUi(sessionId, current => ({ ...current, runStats: value })),
+      abortRef: sessionAbortRef,
       signal: controller.signal,
     });
+    if (sessionAbortRef.current) {
+      runAbortControllersRef.current.set(sessionId, sessionAbortRef.current);
+    }
     return () => {
       controller.abort();
       observingRunIdRef.current = '';
     };
-  }, [activeSessionId, pendingRunMessage?.id, pendingRunMessage?.runId, persistSession]);
+  }, [
+    activeSessionId,
+    beginSessionRun,
+    finishSessionRun,
+    isStreaming,
+    messages,
+    patchSessionRunUi,
+    pendingRunMessage?.content,
+    pendingRunMessage?.id,
+    pendingRunMessage?.runId,
+    pendingRunMessage?.thinking,
+    pendingRunMessage?.timestamp,
+    persistSession,
+    setSessionMessages,
+    updateSessionRunPhase,
+  ]);
 
   useEffect(() => {
     if (!joinSessionId) return;
@@ -975,6 +1146,7 @@ export default function Conversations() {
         upsertSession(joined);
         setLoadingSessionId('');
         setSessionLoadError('');
+        activeSessionIdRef.current = joined.id;
         setActiveSessionId(joined.id);
         setMessages(joined.messages);
         if (joined.templateId) setSelectedAgentId(joined.templateId);
@@ -999,6 +1171,7 @@ export default function Conversations() {
         sessionLoadSeqRef.current += 1;
         setLoadingSessionId('');
         setSessionLoadError('');
+        activeSessionIdRef.current = null;
         setActiveSessionId(null);
         setMessages([]);
         return;
@@ -1062,11 +1235,19 @@ export default function Conversations() {
   // 删除会话
   const handleDelete = async (id: string) => {
     const updated = sessions.filter(s => s.id !== id);
+    runAbortControllersRef.current.get(id)?.abort();
+    runAbortControllersRef.current.delete(id);
+    setSessionRunUi(prev => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
     setSessions(updated);
     if (activeSessionId === id) {
       sessionLoadSeqRef.current += 1;
       setLoadingSessionId('');
       setSessionLoadError('');
+      activeSessionIdRef.current = null;
       setActiveSessionId(null);
       setMessages([]);
       setAttachments([]);
@@ -1193,6 +1374,12 @@ export default function Conversations() {
 
     const sendModel = selectedModel || activeSession?.model || currentAgent.model;
     provider.current = resolveProviderForModel(sendModel).provider;
+    const requestSessionId = activeSessionId || `chat-${Date.now()}`;
+    if (!activeSessionId) {
+      activeSessionIdRef.current = requestSessionId;
+      setActiveSessionId(requestSessionId);
+    }
+    beginSessionRun(requestSessionId);
 
     const userMsg: ChatMessage = {
       role: 'user',
@@ -1206,7 +1393,7 @@ export default function Conversations() {
     const draftMsgs = appendAssistantDraft(newMsgs, draftId, assistantTimestamp);
     shouldAutoScrollRef.current = true;
     setShowScrollBottom(false);
-    setMessages(draftMsgs);
+    setSessionMessages(requestSessionId, draftMsgs);
     requestAnimationFrame(() => {
       const el = messagesRef.current;
       if (el) el.scrollTop = el.scrollHeight;
@@ -1215,18 +1402,10 @@ export default function Conversations() {
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
     setAttachmentError('');
-    setIsStreaming(true);
-    setRunPhase('initializing');
-    setPendingQuestions([]);
-    setAgentTasks([]);
-    setStructuredOutput(null);
-    setRunStats(null);
-
-    const requestSessionId = activeSessionId || `chat-${Date.now()}`;
-    await persistSession(draftMsgs, requestSessionId, undefined, undefined);
+    await persistSession(draftMsgs, requestSessionId, undefined, undefined, { syncUrl: activeSessionIdRef.current === requestSessionId });
     let thinking = '';
     let text = '';
-    let runIdForDraft = '';
+    const runIdForDraft = { current: '' };
     let didFinalize = false;
     let receivedOutcome: RunOutcome | null = null;
     let outcomeDetail: string | undefined;
@@ -1244,13 +1423,10 @@ export default function Conversations() {
     let pendingQuestionCount = 0;
     const updateRunPhase = (patch: Partial<typeof phaseFlags>) => {
       Object.assign(phaseFlags, patch);
-      setRunPhase(deriveRunPhase(phaseFlags));
+      updateSessionRunPhase(requestSessionId, deriveRunPhase(phaseFlags));
     };
     const finishRun = () => {
-      abortRef.current = null;
-      setIsStreaming(false);
-      setRunPhase('idle');
-      setActiveRunId('');
+      finishSessionRun(requestSessionId);
     };
     const persistFinalMessage = async (
       finalContent: string,
@@ -1258,18 +1434,22 @@ export default function Conversations() {
       sdkSessionId?: string,
       sdkCwd?: string,
       detail?: string,
+      finalRunStats?: ChatRunStats,
     ) => {
       if (didFinalize) return;
       didFinalize = true;
       updateRunPhase({ finalizing: true, initializing: false, streaming: false, thinking: false, toolExecuting: false });
-      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, finalContent, outcome, thinking || undefined, detail, runIdForDraft || undefined);
-      setMessages(finalMsgs);
-      const sid = await persistSession(finalMsgs, requestSessionId, sdkSessionId, sdkCwd);
-      if (sid) setActiveSessionId(sid);
+      const finalMsgs = finalizeAssistantDraft(newMsgs, draftId, assistantTimestamp, finalContent, outcome, thinking || undefined, detail, runIdForDraft.current || undefined, finalRunStats);
+      setSessionMessages(requestSessionId, finalMsgs);
+      const sid = await persistSession(finalMsgs, requestSessionId, sdkSessionId, sdkCwd, { syncUrl: activeSessionIdRef.current === requestSessionId });
+      if (sid && activeSessionIdRef.current === requestSessionId) {
+        activeSessionIdRef.current = sid;
+        setActiveSessionId(sid);
+      }
     };
 
     const controller = new AbortController();
-    abortRef.current = controller;
+    runAbortControllersRef.current.set(requestSessionId, controller);
 
     try {
       const active = activeSessionId ? sessions.find((session) => session.id === activeSessionId) : null;
@@ -1291,11 +1471,14 @@ export default function Conversations() {
             thinking: m.thinking,
             outcome: m.outcome,
             outcomeDetail: m.outcomeDetail,
+            runStats: m.runStats,
           })),
           systemPrompt: currentAgent.systemPrompt || undefined,
           model: sendModel,
           provider: provider.current,
           providerProfiles: loadProviderProfiles(),
+          visualPreprocessEnabled,
+          visualPreprocessModel: visualPreprocessModel || undefined,
           templateId: currentAgent.id,
           sessionId: requestSessionId,
           tools: buildRequestToolsForAgent(currentAgent),
@@ -1349,9 +1532,9 @@ export default function Conversations() {
             if (data.type === 'run_started') {
               const runId = typeof data.runId === 'string' ? data.runId : '';
               if (runId) {
-                runIdForDraft = runId;
-                setActiveRunId(runId);
-                setMessages(prev => updateAssistantDraft(prev, draftId, { runId }));
+                runIdForDraft.current = runId;
+                patchSessionRunUi(requestSessionId, current => ({ ...current, runId, isStreaming: true }));
+                setSessionMessages(requestSessionId, prev => updateAssistantDraft(prev, draftId, { runId }));
                 controller.signal.addEventListener('abort', () => {
                   fetch(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
                     method: 'POST',
@@ -1364,21 +1547,30 @@ export default function Conversations() {
             } else if (data.type === 'delta') {
               if (data.thinking) {
                 thinking += data.text || '';
-                setMessages(prev => updateAssistantDraft(prev, draftId, { thinking, status: 'streaming' }));
+                setSessionMessages(requestSessionId, prev => updateAssistantDraft(prev, draftId, { thinking, status: 'streaming' }));
                 updateRunPhase({ initializing: false, thinking: true, streaming: false, toolExecuting: false });
               } else {
                 text += data.text || '';
-                setMessages(prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
+                setSessionMessages(requestSessionId, prev => updateAssistantDraft(prev, draftId, { content: text, status: 'streaming' }));
                 updateRunPhase({ initializing: false, thinking: false, streaming: true, toolExecuting: false });
               }
             } else if (data.type === 'result') {
               const finalOutcome = receivedOutcome || mapResultSubtypeToOutcome(data.subtype);
               const finalDetail = outcomeDetail || (typeof data.subtype === 'string' ? data.subtype : undefined);
               const finalContent = text || data.text || '';
-              if (data.structuredOutput !== undefined) setStructuredOutput(data.structuredOutput);
-              if (data.cost_usd !== undefined || data.duration_ms !== undefined)
-                setRunStats({ costUsd: data.cost_usd, durationMs: data.duration_ms, inTok: data.usage?.input_tokens, outTok: data.usage?.output_tokens });
-              await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId, data.sdkCwd, finalDetail);
+              if (data.structuredOutput !== undefined) {
+                patchSessionRunUi(requestSessionId, current => ({ ...current, structuredOutput: data.structuredOutput }));
+              }
+              if (data.cost_usd !== undefined || data.duration_ms !== undefined || data.usage !== undefined) {
+                const finalRunStats = chatRunStatsFromResultEvent(data);
+                patchSessionRunUi(requestSessionId, current => ({
+                  ...current,
+                  runStats: finalRunStats || null,
+                }));
+                await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId, data.sdkCwd, finalDetail, finalRunStats);
+              } else {
+                await persistFinalMessage(finalContent || (cachedErrorMessage ? `错误: ${cachedErrorMessage}` : ''), finalOutcome, data.sdkSessionId, data.sdkCwd, finalDetail);
+              }
             } else if (data.type === 'run_outcome') {
               receivedOutcome = normalizeRunOutcome(data.outcome, receivedOutcome || 'provider_error');
               outcomeDetail = typeof data.subtype === 'string'
@@ -1386,35 +1578,51 @@ export default function Conversations() {
                 : typeof data.message === 'string' ? data.message : outcomeDetail;
             } else if (data.type === 'permission_request') {
               pendingPermissionCount += 1;
-              setPendingPermissions(prev => [...prev, {
+              const req = {
                 reqId: data.reqId, toolName: data.toolName, input: data.input,
                 title: data.title, displayName: data.displayName, description: data.description,
                 toolUseID: data.toolUseID,
-              }]);
+              };
+              patchSessionRunUi(requestSessionId, current => ({ ...current, pendingPermissions: [...current.pendingPermissions, req] }));
               updateRunPhase({ awaitingPermission: true, initializing: false });
             } else if (data.type === 'permission_resolved') {
               if (data.reqId) {
                 pendingPermissionCount = Math.max(0, pendingPermissionCount - 1);
-                setPendingPermissions(prev => prev.filter(p => p.reqId !== data.reqId));
+                patchSessionRunUi(requestSessionId, current => ({
+                  ...current,
+                  pendingPermissions: current.pendingPermissions.filter(p => p.reqId !== data.reqId),
+                }));
                 updateRunPhase({ awaitingPermission: pendingPermissionCount > 0 });
               }
             } else if (data.type === 'ask_user_question') {
               pendingQuestionCount += 1;
-              setPendingQuestions(prev => [...prev, {
+              const req = {
                 reqId: data.reqId,
                 questions: data.questions || [],
                 toolUseID: data.toolUseID,
-              }]);
+              };
+              patchSessionRunUi(requestSessionId, current => ({ ...current, pendingQuestions: [...current.pendingQuestions, req] }));
               updateRunPhase({ awaitingInput: true, initializing: false });
             } else if (data.type === 'ask_user_question_resolved') {
               if (data.reqId) {
                 pendingQuestionCount = Math.max(0, pendingQuestionCount - 1);
-                setPendingQuestions(prev => prev.filter(p => p.reqId !== data.reqId));
+                patchSessionRunUi(requestSessionId, current => ({
+                  ...current,
+                  pendingQuestions: current.pendingQuestions.filter(p => p.reqId !== data.reqId),
+                }));
                 updateRunPhase({ awaitingInput: pendingQuestionCount > 0 });
               }
             } else if (String(data.type || '').startsWith('task_')) {
-              setAgentTasks(prev => mergeAgentTaskEvent(prev, data));
+              patchSessionRunUi(requestSessionId, current => ({
+                ...current,
+                agentTasks: mergeAgentTaskEvent(current.agentTasks, data),
+              }));
               updateRunPhase({ initializing: false, toolExecuting: true, thinking: false, streaming: false });
+            } else if (data.type === 'context_compaction') {
+              patchSessionRunUi(requestSessionId, current => ({
+                ...current,
+                contextEvents: mergeContextCompactionEvent(current.contextEvents, data),
+              }));
             } else if (data.type === 'error') {
               cachedErrorMessage = String(data.message || '未知错误');
               receivedOutcome = receivedOutcome || 'provider_error';
@@ -1436,11 +1644,31 @@ export default function Conversations() {
       }
     }
     finishRun();
-  }, [input, attachments, isStreaming, isSessionDetailLoading, currentAgent, messages, activeSessionId, persistSession, sessions, selectedModel, activeSession?.model]);
+  }, [
+    input,
+    attachments,
+    isStreaming,
+    isSessionDetailLoading,
+    currentAgent,
+    messages,
+    activeSessionId,
+    persistSession,
+    sessions,
+    selectedModel,
+    activeSession?.model,
+    visualPreprocessEnabled,
+    visualPreprocessModel,
+    beginSessionRun,
+    finishSessionRun,
+    patchSessionRunUi,
+    setSessionMessages,
+    updateSessionRunPhase,
+  ]);
 
   const handleStop = useCallback(() => {
-    abortRef.current?.abort();
-  }, []);
+    if (!activeSessionId) return;
+    runAbortControllersRef.current.get(activeSessionId)?.abort();
+  }, [activeSessionId]);
 
   return (
     <div className="conversation-shell">
@@ -1523,6 +1751,14 @@ export default function Conversations() {
                     >
                       {getChatSessionDisplayTitle(s)}
                     </div>
+                  )}
+                  {sessionRunUi[s.id]?.isStreaming && (
+                    <span
+                      className={`badge ${phaseBadgeClass(sessionRunUi[s.id].phase)}`}
+                      style={{ marginLeft: 6, fontSize: '.68em', whiteSpace: 'nowrap' }}
+                    >
+                      {phaseLabel(sessionRunUi[s.id].phase)}
+                    </span>
                   )}
                   <span
                     onClick={e => { void handlePin(s.id, e); }}
@@ -1616,6 +1852,7 @@ export default function Conversations() {
                   会话id {formatShortId(activeSession?.sdkSessionId)}
                 </span>
                 {currentAgent && (
+                  <>
                   <ChatModelPicker
                     value={effectiveModel}
                     templateModel={currentAgent.model}
@@ -1623,6 +1860,41 @@ export default function Conversations() {
                     disabled={isStreaming}
                     onChange={model => setSelectedModelOverride({ contextKey: modelContextKey, model })}
                   />
+                  <ContextWindowMeter
+                    model={effectiveModel}
+                    inputTokens={observedRunStats?.inTok}
+                    outputTokens={observedRunStats?.outTok}
+                    compacted={contextEvents.length > 0}
+                  />
+                  <label
+                    className="badge badge-muted"
+                    title="开启后图片先由视觉模型预处理，再交给当前 Agent"
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: isStreaming ? 'not-allowed' : 'pointer' }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={visualPreprocessEnabled}
+                      disabled={isStreaming}
+                      onChange={event => {
+                        const enabled = event.target.checked;
+                        setVisualPreprocessEnabled(enabled);
+                        if (enabled && !visualPreprocessModel) setVisualPreprocessModel(defaultVisualPreprocessModel(currentAgent));
+                      }}
+                      style={{ width: 'auto', margin: 0 }}
+                    />
+                    视觉预处理
+                  </label>
+                  {visualPreprocessEnabled && (
+                    <div style={{ width: 220, maxWidth: '100%' }}>
+                      <ModelPicker
+                        value={visualPreprocessModel}
+                        models={modelOptions}
+                        onChange={setVisualPreprocessModel}
+                        placeholder="视觉模型"
+                      />
+                    </div>
+                  )}
+                  </>
                 )}
                 {runPhase !== 'idle' && (
                   <span className={`badge ${phaseBadgeClass(runPhase)}`}>{phaseLabel(runPhase)}</span>
@@ -1741,7 +2013,7 @@ export default function Conversations() {
               {isSessionDetailLoading && !isStreaming && (
                 <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--ink-muted)' }}>
                   <div style={{ textAlign: 'center' }}>
-                    <MascotRunner caption="正在翻历史" height={104} />
+                    <WaitingHint label="正在翻历史" />
                     <div style={{ fontSize: '.82em', maxWidth: 300, marginTop: 6 }}>历史列表已可操作，完整消息会话加载完成后自动显示。</div>
                   </div>
                 </div>
@@ -1766,7 +2038,11 @@ export default function Conversations() {
                 </div>
               )}
               {messages.map((msg, i) => (
-                <ChatMessageBubble key={msg.id || i} message={msg} />
+                <ChatMessageBubble
+                  key={msg.id || i}
+                  message={msg}
+                  waitingLabel={msg.status === 'pending' && runPhase !== 'idle' ? phaseLabel(runPhase) : undefined}
+                />
               ))}
               {agentTasks.length > 0 && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -1790,6 +2066,7 @@ export default function Conversations() {
                   ))}
                 </div>
               )}
+              <ContextCompactionEvents events={contextEvents} />
               {structuredOutput !== null && !isStreaming && (
                 <div className="chat-msg assistant" style={{ padding: '8px 12px' }}>
                   <div style={{ fontSize: '.72em', fontWeight: 600, color: 'var(--ink-muted)', marginBottom: 6 }}>
@@ -1798,11 +2075,11 @@ export default function Conversations() {
                   <JsonViewer data={structuredOutput} maxHeight={300} />
                 </div>
               )}
-              {runStats && !isStreaming && (
+              {observedRunStats && !isStreaming && (
                 <div style={{ textAlign: 'right', fontSize: '.72em', color: 'var(--ink-muted)', padding: '2px 4px' }}>
-                  {runStats.durationMs != null && <span>{(runStats.durationMs / 1000).toFixed(1)}s</span>}
-                  {runStats.inTok != null && <span style={{ marginLeft: 8 }}>{runStats.inTok}↑ {runStats.outTok ?? 0}↓ tok</span>}
-                  {runStats.costUsd != null && <span style={{ marginLeft: 8 }}>${runStats.costUsd.toFixed(4)}</span>}
+                  {observedRunStats.durationMs != null && <span>{(observedRunStats.durationMs / 1000).toFixed(1)}s</span>}
+                  {observedRunStats.inTok != null && <span style={{ marginLeft: 8 }}>{observedRunStats.inTok}↑ {observedRunStats.outTok ?? 0}↓ tok</span>}
+                  {observedRunStats.costUsd != null && <span style={{ marginLeft: 8 }}>${observedRunStats.costUsd.toFixed(4)}</span>}
                 </div>
               )}
               <div ref={bottomRef} />
@@ -1822,11 +2099,23 @@ export default function Conversations() {
             <div className="conversation-prompts">
               <AskUserQuestionPromptList
                 pending={pendingQuestions}
-                onResolved={(reqId) => setPendingQuestions(prev => prev.filter(p => p.reqId !== reqId))}
+                onResolved={(reqId) => {
+                  if (!activeSessionId) return;
+                  patchSessionRunUi(activeSessionId, current => ({
+                    ...current,
+                    pendingQuestions: current.pendingQuestions.filter(p => p.reqId !== reqId),
+                  }));
+                }}
               />
               <PermissionPromptList
                 pending={pendingPermissions}
-                onResolved={(reqId) => setPendingPermissions(prev => prev.filter(p => p.reqId !== reqId))}
+                onResolved={(reqId) => {
+                  if (!activeSessionId) return;
+                  patchSessionRunUi(activeSessionId, current => ({
+                    ...current,
+                    pendingPermissions: current.pendingPermissions.filter(p => p.reqId !== reqId),
+                  }));
+                }}
               />
             </div>
 

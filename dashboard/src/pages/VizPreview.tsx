@@ -1,13 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import VisualFrame from '../components/artifacts/VisualFrame';
+import MarkdownMindMap, { type MarkdownVisualMode } from '../components/artifacts/MarkdownMindMap';
 import LineIcon from '../components/LineIcon';
 import { getAuthHeaders } from '../utils/client-runtime';
+import { isLikelyMarkdownMindMap } from '../utils/markdown-mindmap';
 
 type VisualPayload = {
   id?: string;
   title?: string;
   html: string;
+  format?: 'html' | 'markdown';
+  sourceSlug?: string;
   createdAt?: number;
   mtimeMs?: number;
 };
@@ -29,6 +33,21 @@ function formatTime(value?: number) {
   return new Date(value).toLocaleString();
 }
 
+function looksLikeMarkdownPath(value: string) {
+  return /\.(md|markdown)$/i.test(value.trim());
+}
+
+function inferVisualFormat(visual: VisualPayload | null, relPath: string): 'html' | 'markdown' {
+  if (visual?.format === 'markdown') return 'markdown';
+  if (visual?.format === 'html') return 'html';
+  if (looksLikeMarkdownPath(visual?.sourceSlug || relPath)) return 'markdown';
+  const source = visual?.html || '';
+  if (!/^\s*(<!doctype|<html|<script|<style|<svg|<canvas|<div|<section)\b/i.test(source) && isLikelyMarkdownMindMap(source)) {
+    return 'markdown';
+  }
+  return 'html';
+}
+
 export default function VizPreview() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -37,6 +56,7 @@ export default function VizPreview() {
   const cid = searchParams.get('cid')?.trim() || '';
   const relPath = searchParams.get('path')?.trim() || '';
   const isSaved = Boolean(id);
+  const visualKey = `${id}\n${cid}\n${relPath}`;
   const [visual, setVisual] = useState<VisualPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -44,11 +64,16 @@ export default function VizPreview() {
   const [saveError, setSaveError] = useState('');
   const [fullscreenError, setFullscreenError] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [markdownModeState, setMarkdownModeState] = useState<{ key: string; mode: MarkdownVisualMode }>({ key: '', mode: 'mindmap' });
+  const markdownMode = markdownModeState.key === visualKey ? markdownModeState.mode : 'mindmap';
+  const setMarkdownMode = (mode: MarkdownVisualMode) => setMarkdownModeState({ key: visualKey, mode });
 
   const sourceLabel = useMemo(() => {
     if (isSaved) return '已保存';
     return relPath || '临时文件';
   }, [isSaved, relPath]);
+  const visualFormat = useMemo(() => inferVisualFormat(visual, relPath), [visual, relPath]);
+  const isMarkdownVisual = visualFormat === 'markdown';
 
   useEffect(() => {
     let cancelled = false;
@@ -156,6 +181,30 @@ export default function VizPreview() {
           </div>
         </div>
         <div className="visual-actions">
+          {isMarkdownVisual && (
+            <div className="visual-mode-toggle" role="tablist" aria-label="Markdown 预览模式">
+              <button
+                className={markdownMode === 'mindmap' ? 'active' : ''}
+                type="button"
+                role="tab"
+                aria-selected={markdownMode === 'mindmap'}
+                onClick={() => setMarkdownMode('mindmap')}
+              >
+                <LineIcon name="chart" />
+                思维导图
+              </button>
+              <button
+                className={markdownMode === 'markdown' ? 'active' : ''}
+                type="button"
+                role="tab"
+                aria-selected={markdownMode === 'markdown'}
+                onClick={() => setMarkdownMode('markdown')}
+              >
+                <LineIcon name="book" />
+                MD
+              </button>
+            </div>
+          )}
           <button
             className="btn btn-sm visual-fullscreen-btn"
             type="button"
@@ -176,8 +225,12 @@ export default function VizPreview() {
       </div>
       {saveError && <div className="visual-inline-error">{saveError}</div>}
       {fullscreenError && <div className="visual-inline-error">{fullscreenError}</div>}
-      <div className="visual-frame-host">
-        <VisualFrame html={visual.html} />
+      <div className={`visual-frame-host${isMarkdownVisual ? ' visual-markdown-host' : ''}`}>
+        {isMarkdownVisual ? (
+          <MarkdownMindMap markdown={visual.html} title={visual.title} mode={markdownMode} />
+        ) : (
+          <VisualFrame html={visual.html} />
+        )}
       </div>
     </div>
   );

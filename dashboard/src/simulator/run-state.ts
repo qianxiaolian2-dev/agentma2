@@ -96,13 +96,13 @@ export function agentRunOutcomeIsFailure(outcome: RunOutcome): boolean {
 export function phaseLabel(phase: RunPhase): string {
   switch (phase) {
     case 'idle': return '空闲';
-    case 'initializing': return '初始化';
-    case 'thinking': return '思考中';
-    case 'streaming': return '生成中';
-    case 'tool_executing': return '执行工具';
-    case 'awaiting_permission': return '等待授权';
-    case 'awaiting_input': return '等待回答';
-    case 'finalizing': return '收尾';
+    case 'initializing': return '准备回复';
+    case 'thinking': return '整理思路';
+    case 'streaming': return '正在写';
+    case 'tool_executing': return '调用工具';
+    case 'awaiting_permission': return '等你确认';
+    case 'awaiting_input': return '等你补充';
+    case 'finalizing': return '马上好了';
   }
 }
 

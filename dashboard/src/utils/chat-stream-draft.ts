@@ -1,4 +1,4 @@
-import type { ChatMessage } from '../simulator/types';
+import type { ChatMessage, ChatRunStats } from '../simulator/types';
 import { outcomeToMessageStatus, type RunOutcome } from '../simulator/run-state';
 
 export function createAssistantDraft(id: string, timestamp: number): ChatMessage {
@@ -29,6 +29,7 @@ export function finalizeAssistantDraft(
   thinking?: string,
   outcomeDetail?: string,
   runId?: string,
+  runStats?: ChatRunStats,
 ): ChatMessage[] {
   const assistantMessage: ChatMessage = {
     id,
@@ -40,6 +41,7 @@ export function finalizeAssistantDraft(
     ...(thinking ? { thinking } : {}),
     ...(outcomeDetail ? { outcomeDetail } : {}),
     ...(runId ? { runId } : {}),
+    ...(runStats ? { runStats } : {}),
   };
 
   const existingIndex = baseMessages.findIndex((message) => message.id === id);

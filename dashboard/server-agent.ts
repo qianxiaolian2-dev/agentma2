@@ -8,6 +8,7 @@ import {
   createSdkMcpServer,
   type AgentDefinition,
   type CanUseTool,
+  type EffortLevel,
   type HookCallbackMatcher,
   type HookEvent,
   type PermissionResult,
@@ -16,7 +17,8 @@ import {
 import { z } from 'zod';
 import { evaluateHookRules, evaluatePermissionRules, listDatasources, listHookRules, listKnowledgeSources, listProtectedSdkCwds, recordAgentRun } from './server-store.ts';
 import type { DatasourceRow, HookRuleEvent } from './server-store.ts';
-import { runDatasourceQuery, serializeQueryResult, DATASOURCE_QUERY_MAX_ROWS } from './server-datasource.ts';
+import { DATASOURCE_QUERY_MAX_ROWS } from './server-datasource.ts';
+import { buildDatasourceMcp, buildImageInspectMcp, buildModelRequestMcp, listInternalTools } from './server-internal-tools.ts';
 import { mapResultSubtypeToOutcome, type RunOutcome } from './src/simulator/run-state.ts';
 
 // ─── Pricing ─────────────────────────────────────────────────────────────────
@@ -40,11 +42,32 @@ export function estimateCostUsd(model: string, inputTokens: number, outputTokens
 // requestPermission.
 export const SAFE_AUTO_ALLOW_TOOLS = new Set<string>([
   'Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch',
+  'ToolSearch', 'tool_search',
   'TodoWrite', 'TodoRead', 'TaskGet', 'TaskList', 'TaskOutput',
   'ListMcpResources', 'ReadMcpResource',
   // 数据源工具只读(readOnly 连接 + 单条 SELECT/WITH 校验),在 MCP 层自我兜底,放心自动放行。
   'list_datasources', 'query_datasource',
+  // 平台内置模型请求工具只走 tenant 已配置 provider profile，不接受调用方传 key/baseUrl。
+  'mcp__model__request',
+  'mcp__image__inspect',
 ]);
+
+const TOOL_SEARCH_TOOL_NAME = 'ToolSearch';
+
+function isFirstPartyAnthropicBaseUrl(baseUrl: string | undefined) {
+  const raw = String(baseUrl || '').trim();
+  if (!raw) return true;
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host === 'api.anthropic.com' || host.endsWith('.anthropic.com');
+  } catch {
+    return false;
+  }
+}
+
+function resolveToolSearchEnvValue() {
+  return String(process.env.ENABLE_TOOL_SEARCH || '').trim() || 'true';
+}
 
 function visualSkillWriteTarget(toolName: string, input: unknown, skills: string[] | undefined, cwd: string) {
   if (toolName !== 'Write') return '';
@@ -52,7 +75,7 @@ function visualSkillWriteTarget(toolName: string, input: unknown, skills: string
   const filePath = (input as Record<string, unknown> | null | undefined)?.file_path;
   if (typeof filePath !== 'string') return '';
   const normalized = filePath.trim().replace(/\\/g, '/').replace(/^\.\//, '');
-  if (/^viz\/[A-Za-z0-9._-]+\.html$/.test(normalized)) return normalized;
+  if (/^viz\/[A-Za-z0-9._-]+\.(html|md|markdown)$/i.test(normalized)) return normalized;
 
   const resolved = path.resolve(cwd, filePath);
   let resolvedCwd = path.resolve(cwd);
@@ -69,7 +92,7 @@ function visualSkillWriteTarget(toolName: string, input: unknown, skills: string
   const basename = path.basename(resolved);
   if (
     resolvedDir === vizRoot
-    && /^[A-Za-z0-9._-]+\.html$/.test(basename)
+    && /^[A-Za-z0-9._-]+\.(html|md|markdown)$/i.test(basename)
   ) {
     return `viz/${basename}`;
   }
@@ -228,54 +251,6 @@ export function buildCustomToolsMcp(requestTools: unknown[]) {
   }
   if (!sdkTools.length) return null;
   return createSdkMcpServer({ name: 'custom', version: '1.0.0', tools: sdkTools });
-}
-
-// ─── 数据源 MCP(ChatBI 只读查询)────────────────────────────────────────────
-// in-process 跑在服务进程里(受信代码),agent(沙箱内)只能拿到查询结果,
-// 摸不到 SQLite 文件本身。只读保证见 server-datasource.ts。
-export function buildDatasourceMcp(datasources: DatasourceRow[]) {
-  if (!datasources.length) return null;
-  const byId = new Map(datasources.map((source) => [source.id, source]));
-  const summarize = (source: DatasourceRow) => ({
-    id: source.id,
-    name: source.name,
-    tables: source.tables.map((table) => ({
-      name: table.name,
-      rowCount: table.rowCount,
-      columns: table.columns.map((column) => `${column.name} ${column.type}`.trim()),
-    })),
-  });
-  return createSdkMcpServer({
-    name: 'datasource',
-    version: '1.0.0',
-    tools: [
-      tool(
-        'list_datasources',
-        '列出当前可查询的数据源及其表结构(表名、行数、列名/类型)。',
-        {},
-        async () => ({
-          content: [{ type: 'text', text: JSON.stringify(datasources.map(summarize)) }],
-        }),
-      ),
-      tool(
-        'query_datasource',
-        `对指定数据源执行只读 SQL(SQLite 方言)。只允许单条 SELECT/WITH;结果最多返回 ${DATASOURCE_QUERY_MAX_ROWS} 行,聚合请在 SQL 内完成。`,
-        { datasourceId: z.string(), sql: z.string() },
-        async (args: { datasourceId: string; sql: string }) => {
-          const source = byId.get(String(args.datasourceId || '').trim());
-          if (!source) {
-            return { content: [{ type: 'text', text: `err: 数据源不存在或未对本次运行开放: ${args.datasourceId}` }], isError: true };
-          }
-          try {
-            const result = runDatasourceQuery(source.path, String(args.sql || ''));
-            return { content: [{ type: 'text', text: serializeQueryResult(result) }] };
-          } catch (error) {
-            return { content: [{ type: 'text', text: `err: ${(error as Error).message}` }], isError: true };
-          }
-        },
-      ),
-    ],
-  });
 }
 
 // ─── Permission request system ──────────────────────────────────────────────
@@ -446,7 +421,8 @@ export type AgentEvent =
   | { type: 'task_progress'; taskId: string; toolUseId?: string; description: string; subagentType?: string; lastToolName?: string; summary?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }; sdkSessionId?: string }
   | { type: 'task_updated'; taskId: string; status?: string; description?: string; error?: string; backgrounded?: boolean; sdkSessionId?: string }
   | { type: 'task_notification'; taskId: string; toolUseId?: string; status: string; summary?: string; outputFile?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }; sdkSessionId?: string }
-  | { type: 'run_log'; level: 'info' | 'warn'; scope: 'skill'; message: string }
+  | { type: 'context_compaction'; subtype: 'compact_boundary'; message: string; sdkSessionId?: string; timestamp: number }
+  | { type: 'run_log'; level: 'info' | 'warn'; scope: 'skill' | 'tool_search'; message: string }
   | { type: 'run_outcome'; outcome: RunOutcome; subtype?: string; message?: string }
   | { type: 'result'; subtype: string; text: string; usage: { input_tokens: number; output_tokens: number }; duration_ms: number; cost_usd: number; model: string; sdkSessionId?: string; sdkCwd?: string; structuredOutput?: unknown }
   | { type: 'error'; message: string };
@@ -454,9 +430,19 @@ export type AgentEvent =
 export interface RunAgentOptions {
   prompt: string;
   promptImages?: Array<{
+    id?: string;
+    name?: string;
     mediaType: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
     data: string;
+    size?: number;
   }>;
+  visualPreprocess?: {
+    enabled: boolean;
+    model: string;
+    baseUrl?: string;
+    apiKey: string;
+  };
+  imageInspectModel?: string;
   systemPrompt?: string;
   model: string;
   baseUrl?: string;
@@ -481,6 +467,8 @@ export interface RunAgentOptions {
   /** Tenant datasource ids exposed via the read-only datasource MCP tools. */
   datasourceIds?: string[];
   maxTurns?: number;
+  /** Reasoning effort for the MAIN session. Subagent effort is carried separately via AgentDefinition. */
+  effort?: EffortLevel;
   abortController?: AbortController;
   cwd?: string;
   /** Persistent template seed copied into a fresh run cwd before SDK query starts. */
@@ -788,6 +776,14 @@ function buildAskUserQuestionSystemPrompt() {
   ].join('\n');
 }
 
+function buildToolSearchSystemPrompt(mode: string) {
+  return [
+    `当前 Agent 模板已请求启用 SDK ToolSearch,运行配置为 ENABLE_TOOL_SEARCH=${mode}。`,
+    'ToolSearch 是按需发现工具的机制,底层/协议中可能显示为 tool_search；它不同于 WebSearch、Grep、Glob 这类普通搜索工具。',
+    '本项目不会额外注入 ToolSearch MCP 兜底工具；当用户询问可用工具或搜索能力时,如实说明 SDK ToolSearch 是否已请求启用,并说明非官方兼容网关可能不支持 SDK tool_reference。',
+  ].join('\n');
+}
+
 function buildRunIsolationSystemPrompt() {
   return [
     '当前 run 在隔离 workspace 中执行。创建或修改 workspace skill 时,使用相对路径 ./.claude/skills/<skill-name>/SKILL.md。',
@@ -862,6 +858,257 @@ async function* buildUserPromptStream(text: string, images: NonNullable<RunAgent
   };
 }
 
+type PromptImageInput = NonNullable<RunAgentOptions['promptImages']>[number];
+type MaterializedPromptImage = {
+  relativePath: string;
+  mediaType: PromptImageInput['mediaType'];
+  name?: string;
+  size: number;
+};
+
+const IMAGE_EXTENSIONS: Record<PromptImageInput['mediaType'], string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+};
+const ATTACHMENT_IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+const VISION_PREPROCESS_TIMEOUT_MS = 60_000;
+
+function cleanBase64Data(value: string) {
+  return value.trim().replace(/^data:[^;]+;base64,/i, '').replace(/\s/g, '');
+}
+
+function safeAttachmentBaseName(value: string | undefined, fallback: string) {
+  const parsed = path.parse(path.basename(String(value || '').replace(/\\/g, '/')));
+  const base = (parsed.name || fallback)
+    .normalize('NFKD')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  return base || fallback;
+}
+
+function materializePromptImages(cwd: string, images: PromptImageInput[]): MaterializedPromptImage[] {
+  if (!images.length) return [];
+  const attachmentsDir = path.join(cwd, 'attachments');
+  fs.mkdirSync(attachmentsDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  return images.map((image, index) => {
+    const extension = IMAGE_EXTENSIONS[image.mediaType] || '.png';
+    const buffer = Buffer.from(cleanBase64Data(image.data), 'base64');
+    const base = safeAttachmentBaseName(image.name, `image-${index + 1}`);
+    const suffix = crypto.randomBytes(3).toString('hex');
+    const fileName = `${stamp}-${index + 1}-${base}-${suffix}${extension}`;
+    const filePath = path.join(attachmentsDir, fileName);
+    fs.writeFileSync(filePath, buffer, { mode: 0o600 });
+    return {
+      relativePath: path.relative(cwd, filePath).replace(/\\/g, '/'),
+      mediaType: image.mediaType,
+      name: image.name,
+      size: buffer.byteLength,
+    };
+  });
+}
+
+function buildAnthropicMessagesUrl(baseUrl: string | undefined) {
+  const trimmed = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return 'https://api.anthropic.com/v1/messages';
+  if (/\/v1\/messages$/i.test(trimmed)) return trimmed;
+  if (/\/v1$/i.test(trimmed)) return `${trimmed}/messages`;
+  return `${trimmed}/v1/messages`;
+}
+
+function extractModelResponseText(data: unknown) {
+  if (!data || typeof data !== 'object') return '';
+  const content = (data as { content?: unknown }).content;
+  if (!Array.isArray(content)) return '';
+  return content.flatMap((block) => {
+    if (!block || typeof block !== 'object') return [];
+    const text = (block as { text?: unknown }).text;
+    return typeof text === 'string' && text.trim() ? [text.trim()] : [];
+  }).join('\n');
+}
+
+function summarizeHtmlModelResponse(raw: string, contentType: string) {
+  const trimmed = raw.trim();
+  if (!/html/i.test(contentType) && !/^<!doctype html/i.test(trimmed) && !/^<html[\s>]/i.test(trimmed)) return '';
+  const title = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1]?.replace(/\s+/g, ' ').trim();
+  return [
+    '模型网关返回了 HTML 页面而不是 JSON 响应。',
+    title ? `页面标题: ${title}。` : '',
+    '请检查 provider profile 的 Base URL 是否是 Anthropic-compatible API endpoint，而不是网页地址；也检查本机代理、Cloudflare 或网关鉴权是否拦截了请求。',
+  ].filter(Boolean).join(' ');
+}
+
+function formatMaterializedImageList(files: MaterializedPromptImage[]) {
+  return files.map((file, index) => (
+    `${index + 1}. ${file.relativePath} (${file.mediaType}, ${file.size} bytes${file.name ? `, original: ${file.name}` : ''})`
+  )).join('\n');
+}
+
+function workspaceHasAttachmentImages(cwd: string) {
+  const attachmentsDir = path.resolve(cwd, 'attachments');
+  try {
+    return fs.readdirSync(attachmentsDir).some((name) => ATTACHMENT_IMAGE_EXTENSIONS.has(path.extname(name).toLowerCase()));
+  } catch {
+    return false;
+  }
+}
+
+function uploadedAttachmentImageReadPath(toolName: string, input: unknown, cwd: string) {
+  if (toolName !== 'Read') return '';
+  const filePath = (input as Record<string, unknown> | null | undefined)?.file_path;
+  if (typeof filePath !== 'string' || !filePath.trim()) return '';
+  const rawPath = filePath.trim();
+  if (/^file:/i.test(rawPath)) return rawPath;
+  const resolved = path.resolve(path.isAbsolute(rawPath) ? rawPath : path.join(cwd, rawPath));
+  const attachmentsRoot = path.resolve(cwd, 'attachments');
+  if (resolved !== attachmentsRoot && !resolved.startsWith(`${attachmentsRoot}${path.sep}`)) return '';
+  if (!ATTACHMENT_IMAGE_EXTENSIONS.has(path.extname(resolved).toLowerCase())) return '';
+  return path.relative(cwd, resolved).replace(/\\/g, '/');
+}
+
+function normalizeAttachmentImagePathCandidate(value: string, cwd: string) {
+  const rawPath = value.trim()
+    .replace(/^["'(<]+/, '')
+    .replace(/[>"'),;]+$/, '');
+  if (!rawPath || /^file:/i.test(rawPath)) return '';
+  if (!rawPath.includes('attachments/')) return '';
+  const resolved = path.resolve(path.isAbsolute(rawPath) ? rawPath : path.join(cwd, rawPath.replace(/^\.\//, '')));
+  const attachmentsRoot = path.resolve(cwd, 'attachments');
+  if (resolved !== attachmentsRoot && !resolved.startsWith(`${attachmentsRoot}${path.sep}`)) return '';
+  if (!ATTACHMENT_IMAGE_EXTENSIONS.has(path.extname(resolved).toLowerCase())) return '';
+  return path.relative(cwd, resolved).replace(/\\/g, '/');
+}
+
+function uploadedAttachmentImageBashPath(toolName: string, input: unknown, cwd: string) {
+  if (toolName !== 'Bash') return '';
+  const command = (input as Record<string, unknown> | null | undefined)?.command;
+  if (typeof command !== 'string' || !command.trim()) return '';
+  if (!/(base64|python3?|PIL|Image\.open|cat|xxd|sips|convert|magick)/i.test(command)) return '';
+  const tokens = command.match(/[^\s]+/g) || [];
+  for (const token of tokens) {
+    const imagePath = normalizeAttachmentImagePathCandidate(token, cwd);
+    if (imagePath) return imagePath;
+  }
+  return '';
+}
+
+async function requestVisionPreprocess(
+  visual: NonNullable<RunAgentOptions['visualPreprocess']>,
+  images: PromptImageInput[],
+  files: MaterializedPromptImage[],
+  userPrompt: string,
+  signal?: AbortSignal,
+) {
+  const content: Array<Record<string, unknown>> = images.map((image) => ({
+    type: 'image',
+    source: {
+      type: 'base64',
+      media_type: image.mediaType,
+      data: cleanBase64Data(image.data),
+    },
+  }));
+  const fileList = formatMaterializedImageList(files);
+  const promptText = [
+    '你是 AgentMa 的独立视觉预处理器。请只基于图片中可见内容输出给后续 agent 使用的观察结果。',
+    '',
+    '输出要求:',
+    '1. 分图片列出可见对象、界面结构、图表/代码/表格等关键信息。',
+    '2. 尽量提取可读文字和数字；不确定的内容标注不确定。',
+    '3. 不要执行用户任务，只提供视觉识别结果。',
+    '',
+    '本地附件路径:',
+    fileList,
+    '',
+    '用户原始请求:',
+    userPrompt.trim().slice(0, 4000) || '请识别这些图片。',
+  ].join('\n');
+  content.push({ type: 'text', text: promptText });
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), VISION_PREPROCESS_TIMEOUT_MS);
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    const response = await fetch(buildAnthropicMessagesUrl(visual.baseUrl), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': visual.apiKey,
+        authorization: `Bearer ${visual.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: visual.model,
+        max_tokens: 2048,
+        messages: [{ role: 'user', content }],
+      }),
+      signal: controller.signal,
+    });
+    const raw = await response.text();
+    const htmlError = summarizeHtmlModelResponse(raw, response.headers.get('content-type') || '');
+    if (htmlError) {
+      throw new Error(response.ok ? htmlError : `视觉预处理失败 HTTP ${response.status}: ${htmlError}`);
+    }
+    let parsed: unknown = raw;
+    try {
+      parsed = raw ? JSON.parse(raw) : {};
+    } catch {
+      parsed = raw;
+    }
+    if (!response.ok) {
+      const message = typeof parsed === 'string' ? parsed : JSON.stringify(parsed);
+      throw new Error(`视觉预处理失败 HTTP ${response.status}: ${message.slice(0, 1200)}`);
+    }
+    const text = extractModelResponseText(parsed);
+    if (!text) throw new Error(`视觉预处理模型 ${visual.model} 未返回可用文本`);
+    return text;
+  } catch (error) {
+    if ((error as Error).name === 'AbortError') {
+      throw new Error(`视觉预处理超时(${VISION_PREPROCESS_TIMEOUT_MS / 1000}s)`, { cause: error });
+    }
+    throw error;
+  } finally {
+    signal?.removeEventListener('abort', abort);
+    clearTimeout(timeout);
+  }
+}
+
+function appendVisionPreprocessResult(
+  prompt: string,
+  model: string,
+  files: MaterializedPromptImage[],
+  visualText: string,
+) {
+  const fileList = formatMaterializedImageList(files);
+  return [
+    prompt.trim() || '请基于视觉预处理结果继续处理。',
+    '',
+    '[Uploaded images saved in workspace]',
+    fileList,
+    '这些是本地 workspace 相对路径；不要用 file:// URL、WebFetch 或把图片转成大段 base64。视觉预处理结果已在下方给出，优先使用它。',
+    '',
+    `[Vision preprocessing result: ${model}]`,
+    visualText.trim(),
+  ].join('\n');
+}
+
+function appendUploadedImagePaths(prompt: string, files: MaterializedPromptImage[], imageInspectAvailable: boolean) {
+  if (!files.length) return prompt;
+  const imageHandlingHint = imageInspectAvailable
+    ? '这些是本地 workspace 相对路径；需要读取图片内容时，优先调用内部 MCP 工具 mcp__image__inspect 并传 imagePath/imagePaths。不要用 file:// URL、WebFetch 或把图片转成大段 base64。'
+    : '这些是本地 workspace 相对路径；当前 Agent 模板未启用 image.inspect。不要用 Read/Bash/base64 读取图片；若当前模型无法直接查看图片，请开启视觉预处理，或在 Agent 模板里勾选 image.inspect。';
+  return [
+    prompt.trim() || '请分析这些图片。',
+    '',
+    '[Uploaded images saved in workspace]',
+    formatMaterializedImageList(files),
+    imageHandlingHint,
+  ].join('\n');
+}
+
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
   const cwd = opts.cwd || path.join('/tmp', `agentma-run-${opts.tenantId}-${Date.now()}`);
   fs.mkdirSync(cwd, { recursive: true });
@@ -893,6 +1140,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   env.HOME = runHome;
   env.ANTHROPIC_API_KEY = opts.apiKey;
   if (opts.baseUrl) env.ANTHROPIC_BASE_URL = opts.baseUrl;
+  const toolSearchRequested = opts.tools?.includes(TOOL_SEARCH_TOOL_NAME) === true;
+  if (toolSearchRequested) {
+    env.ENABLE_TOOL_SEARCH = resolveToolSearchEnvValue();
+    opts.emit({
+      type: 'run_log',
+      level: 'info',
+      scope: 'tool_search',
+      message: `ToolSearch 已请求启用: ENABLE_TOOL_SEARCH=${env.ENABLE_TOOL_SEARCH}`,
+    });
+    if (!isFirstPartyAnthropicBaseUrl(opts.baseUrl)) {
+      opts.emit({
+        type: 'run_log',
+        level: 'warn',
+        scope: 'tool_search',
+        message: '当前 ANTHROPIC_BASE_URL 不是 Anthropic 官方端点；ToolSearch 需要网关支持 tool_reference，否则请求可能失败或回退。',
+      });
+    }
+  }
 
   const customMcp = buildCustomToolsMcp(opts.requestTools || []);
   const hooks = buildTenantHooks(opts.tenantId, opts.emit);
@@ -918,21 +1183,59 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     ? listDatasources(opts.tenantId).filter((source) => source.enabled && requestedDatasourceIds.has(source.id))
     : [];
   const datasourceMcp = buildDatasourceMcp(datasources);
+  const internalToolRuntimeNames = new Map(listInternalTools().map((item) => [item.id, `mcp__${item.serverName}__${item.toolName}`]));
+  const configuredToolNames = new Set<string>((opts.tools || []).map((name) => String(name || '').trim()).filter(Boolean));
+  for (const agent of Object.values(opts.subagents || {})) {
+    for (const toolName of agent.tools || []) {
+      const normalized = String(toolName || '').trim();
+      if (normalized) configuredToolNames.add(normalized);
+    }
+  }
+  const modelRequestMcp = Array.from(configuredToolNames).some((name) => name === 'model.request' || name === internalToolRuntimeNames.get('model.request'))
+    ? buildModelRequestMcp(opts.tenantId)
+    : null;
+  const hasPromptImages = Boolean(opts.promptImages?.length);
+  const hasAttachmentImages = workspaceHasAttachmentImages(cwd);
+  const imageInspectConfigured = Array.from(configuredToolNames).some((name) => name === 'image.inspect' || name === internalToolRuntimeNames.get('image.inspect'));
+  const templateHasExplicitToolList = Boolean(opts.tools?.length);
+  const shouldAutoExposeImageInspect = (hasPromptImages || hasAttachmentImages) && !templateHasExplicitToolList;
+  const imageInspectMcp = (imageInspectConfigured || shouldAutoExposeImageInspect)
+    ? buildImageInspectMcp(opts.tenantId, cwd, opts.imageInspectModel || opts.visualPreprocess?.model || '')
+    : null;
+  const uploadedImageGuardEnabled = hasPromptImages || hasAttachmentImages || Boolean(imageInspectMcp);
   const datasourceSystemPrompt = datasources.length ? buildDatasourceSystemPrompt(datasources) : '';
   const skillsSystemPrompt = runSkills.length ? buildSkillsSystemPrompt(runSkills) : '';
   const askUserQuestionSystemPrompt = opts.tools?.includes('AskUserQuestion') ? buildAskUserQuestionSystemPrompt() : '';
-  const effectiveSystemPrompt = [opts.systemPrompt, buildRunIsolationSystemPrompt(), knowledgeSystemPrompt, datasourceSystemPrompt, skillsSystemPrompt, askUserQuestionSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
-  const agentNames = Object.keys(opts.subagents || {});
+  const toolSearchSystemPrompt = toolSearchRequested ? buildToolSearchSystemPrompt(env.ENABLE_TOOL_SEARCH || 'true') : '';
+  const modelRequestSystemPrompt = modelRequestMcp
+    ? '已启用内部工具 model.request。需要请求其他模型、视觉模型或专用小模型时，可以调用该工具；model 必须选择账户已配置且已启用的模型名，不要尝试传入 API Key 或 Base URL。若用户上传图片已保存为 attachments 路径，不要用 Read/Bash 读出 base64 再传给 model.request；应改用 image.inspect。'
+    : '';
+  const imageInspectSystemPrompt = imageInspectMcp
+    ? '已启用内部工具 image.inspect。用户上传的图片会保存到 workspace 的 attachments/ 下；需要读取图片像素或 OCR 时，调用 mcp__image__inspect，传 imagePath 或 imagePaths。不要使用 file://、WebFetch 或把图片转成大段 base64。model 必须选择账户已配置且已启用的模型名；如果工具页已配置默认模型，可以省略 model。'
+    : '';
+  const effectiveSystemPrompt = [opts.systemPrompt, buildRunIsolationSystemPrompt(), knowledgeSystemPrompt, datasourceSystemPrompt, skillsSystemPrompt, askUserQuestionSystemPrompt, toolSearchSystemPrompt, modelRequestSystemPrompt, imageInspectSystemPrompt].filter((part) => part && part.trim()).join('\n\n');
   const nativeMcpServerNames = new Set((opts.mcpServers || []).map((name) => name.trim()).filter((name) => /^[A-Za-z0-9._-]{1,128}$/.test(name)));
-  const subagentToolNames = new Set<string>();
-  for (const agent of Object.values(opts.subagents || {})) {
-    for (const toolName of agent.tools || []) subagentToolNames.add(toolName);
-  }
   let customNames = new Set<string>();
   if (customMcp) {
     let endpoints: any[] = [];
     try { endpoints = JSON.parse(fs.readFileSync('/tmp/agentma_custom_tools.json', 'utf-8')); } catch {}
     customNames = new Set(endpoints.filter((e) => e?.endpoint && e.name).map((e) => String(e.name)));
+  }
+  const sdkVisibleToolName = (name: string) => {
+    if (customNames.has(name)) return `mcp__custom__${name}`;
+    return internalToolRuntimeNames.get(name) || name;
+  };
+  const sdkSubagents = Object.fromEntries(Object.entries(opts.subagents || {}).map(([name, agent]) => [
+    name,
+    {
+      ...agent,
+      tools: Array.isArray(agent.tools) ? agent.tools.map(sdkVisibleToolName) : agent.tools,
+    },
+  ]));
+  const agentNames = Object.keys(sdkSubagents);
+  const subagentSdkToolNames = new Set<string>();
+  for (const agent of Object.values(sdkSubagents)) {
+    for (const toolName of agent.tools || []) subagentSdkToolNames.add(toolName);
   }
   // Resolve template tool names → SDK-visible names (prefix custom with mcp__custom__).
   const templateToolNames = new Set<string>();
@@ -940,13 +1243,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   if (opts.tools && opts.tools.length) {
     for (const t of opts.tools) {
       const isCustom = customNames.has(t);
-      templateToolNames.add(isCustom ? `mcp__custom__${t}` : t);
+      const isInternal = internalToolRuntimeNames.has(t);
+      templateToolNames.add(sdkVisibleToolName(t));
+      if (t === TOOL_SEARCH_TOOL_NAME) {
+        templateToolNames.add('tool_search');
+        continue;
+      }
       if (t === 'Agent') templateToolNames.add('Task');
       if (t === 'Task') templateToolNames.add('Agent');
-      if (!isCustom) sdkBuiltinTools.add(t);
+      if (!isCustom && !isInternal) sdkBuiltinTools.add(t);
     }
-    for (const t of subagentToolNames) {
-      if (!customNames.has(t) && !t.startsWith('mcp__')) sdkBuiltinTools.add(t);
+    for (const t of subagentSdkToolNames) {
+      if (!t.startsWith('mcp__')) sdkBuiltinTools.add(t);
     }
   }
   if (knowledgeSources.length) {
@@ -959,6 +1267,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     // 模板限定工具时也放行数据源 MCP 工具(随 datasourceIds 启用,不要求模板手填)。
     templateToolNames.add('mcp__datasource__list_datasources');
     templateToolNames.add('mcp__datasource__query_datasource');
+  }
+  if (imageInspectMcp) {
+    // image.inspect 显式启用，或开放模板上传图片时自动挂载。
+    templateToolNames.add('mcp__image__inspect');
   }
   if (nativeMcpServerNames.size) {
     for (const serverName of nativeMcpServerNames) {
@@ -977,7 +1289,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // when behavior is 'allow', even though the TS type marks it optional.
   const canUseTool: CanUseTool = async (toolName, input, callOpts) => {
     // 1. Template restriction — if template specifies tools and this isn't one of them, deny.
-    const allowedBySubagentDefinition = Boolean(callOpts.agentID && subagentToolNames.has(toolName));
+    const allowedBySubagentDefinition = Boolean(callOpts.agentID && subagentSdkToolNames.has(toolName));
     const allowedByNativeMcpServer = toolName.startsWith('mcp__') && Array.from(nativeMcpServerNames).some((serverName) => (
       toolName.startsWith(`mcp__${serverName}__`)
     ));
@@ -1006,6 +1318,36 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         reason: '知识库目录为只读',
       });
       return { behavior: 'deny', message: `知识库目录为只读，已阻止写入：${blockedKnowledgeWrite}` } as PermissionResult;
+    }
+    const uploadedImageReadPath = uploadedImageGuardEnabled ? uploadedAttachmentImageReadPath(toolName, input, cwd) : '';
+    if (uploadedImageReadPath) {
+      const message = /^file:/i.test(uploadedImageReadPath)
+        ? imageInspectMcp
+          ? '不要使用 file:// 读取本地图片；请改用 mcp__image__inspect，并传 attachments/... 相对路径。'
+          : '不要使用 file:// 读取本地图片；当前 Agent 模板未启用 image.inspect，请开启视觉预处理，或在 Agent 模板里勾选 image.inspect。'
+        : imageInspectMcp
+          ? `不要用 Read 读取上传图片 ${uploadedImageReadPath}；Read 会把图片转成大段 base64 并可能截断。请调用 mcp__image__inspect，输入 {"imagePath":"${uploadedImageReadPath}"}。`
+          : `不要用 Read 读取上传图片 ${uploadedImageReadPath}；Read 会把图片转成大段 base64 并可能截断。当前 Agent 模板未启用 image.inspect，请开启视觉预处理，或在 Agent 模板里勾选 image.inspect。`;
+      opts.emit({
+        type: 'permission_resolved',
+        toolName,
+        decision: 'deny',
+        reason: message,
+      });
+      return { behavior: 'deny', message } as PermissionResult;
+    }
+    const uploadedImageBashPath = uploadedImageGuardEnabled ? uploadedAttachmentImageBashPath(toolName, input, cwd) : '';
+    if (uploadedImageBashPath) {
+      const message = imageInspectMcp
+        ? `不要用 Bash/Python/base64 读取或压缩上传图片 ${uploadedImageBashPath} 后再发给模型；这会经过工具输出并可能截断。请调用 mcp__image__inspect，输入 {"imagePath":"${uploadedImageBashPath}"}。`
+        : `不要用 Bash/Python/base64 读取或压缩上传图片 ${uploadedImageBashPath} 后再发给模型；这会经过工具输出并可能截断。当前 Agent 模板未启用 image.inspect，请开启视觉预处理，或在 Agent 模板里勾选 image.inspect。`;
+      opts.emit({
+        type: 'permission_resolved',
+        toolName,
+        decision: 'deny',
+        reason: message,
+      });
+      return { behavior: 'deny', message } as PermissionResult;
     }
     if (toolName === 'AskUserQuestion') {
       const questions = normalizeAskUserQuestions(input);
@@ -1048,7 +1390,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     }
     // 3. Safe auto-allow (read-only). Strip MCP prefix to check the bare name.
     const bareName = toolName.startsWith('mcp__') ? (toolName.split('__').pop() || toolName) : toolName;
-    if (SAFE_AUTO_ALLOW_TOOLS.has(bareName)) {
+    if (SAFE_AUTO_ALLOW_TOOLS.has(toolName) || SAFE_AUTO_ALLOW_TOOLS.has(bareName)) {
       return { behavior: 'allow', updatedInput: input } as PermissionResult;
     }
     // 4. Interactive: ask the user via SSE.
@@ -1070,6 +1412,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   const startTime = Date.now();
   let inTok = 0, outTok = 0, finalText = '', status = 'success', outcome: RunOutcome = 'completed', sdkSessionId = opts.resumeSdkSessionId || '', structuredOutput: unknown = undefined;
   let emittedThinking = false;
+  let runPrompt = opts.prompt;
+  let runPromptImages = opts.promptImages || [];
   const emitThinking = (text: string) => {
     if (!text) return;
     emittedThinking = true;
@@ -1077,14 +1421,45 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   };
 
   try {
-    const selectedSkillCommand = getSelectedSkillSlashCommand(opts.prompt, runSkills);
+    if (runPromptImages.length) {
+      const imageFiles = materializePromptImages(cwd, runPromptImages);
+      opts.emit({
+        type: 'run_log',
+        level: 'info',
+        scope: 'skill',
+        message: `图片已保存: ${imageFiles.map((file) => file.relativePath).join(', ')}`,
+      });
+      if (opts.visualPreprocess?.enabled) {
+        if (!opts.visualPreprocess.model.trim()) throw new Error('视觉预处理已开启，但未配置视觉识别模型');
+        if (!opts.visualPreprocess.apiKey.trim()) throw new Error(`视觉识别模型 ${opts.visualPreprocess.model} 所属供应商未配置 API Key`);
+        opts.emit({
+          type: 'run_log',
+          level: 'info',
+          scope: 'skill',
+          message: `视觉预处理: ${runPromptImages.length} 张图片 -> ${opts.visualPreprocess.model}`,
+        });
+        const visualText = await requestVisionPreprocess(
+          opts.visualPreprocess,
+          runPromptImages,
+          imageFiles,
+          runPrompt,
+          opts.abortController?.signal,
+        );
+        runPrompt = appendVisionPreprocessResult(runPrompt, opts.visualPreprocess.model, imageFiles, visualText);
+        runPromptImages = [];
+      } else {
+        runPrompt = appendUploadedImagePaths(runPrompt, imageFiles, Boolean(imageInspectMcp));
+      }
+    }
+
+    const selectedSkillCommand = getSelectedSkillSlashCommand(runPrompt, runSkills);
     if (selectedSkillCommand) {
       const args = selectedSkillCommand.args ? ` ${selectedSkillCommand.args.slice(0, 160)}` : '';
       opts.emit({ type: 'run_log', level: 'info', scope: 'skill', message: `/${selectedSkillCommand.command}${args} -> ${selectedSkillCommand.skill}` });
     }
-    const queryPrompt = opts.promptImages?.length
-      ? buildUserPromptStream(opts.prompt, opts.promptImages)
-      : opts.prompt;
+    const queryPrompt = runPromptImages.length
+      ? buildUserPromptStream(runPrompt, runPromptImages)
+      : runPrompt;
     for await (const msg of query({
       prompt: queryPrompt,
       options: {
@@ -1096,6 +1471,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         ...(opts.tools?.includes('AskUserQuestion') ? { toolConfig: { askUserQuestion: { previewFormat: 'markdown' } } } : {}),
         includePartialMessages: true,
         maxTurns: Number(opts.maxTurns) || 20,
+        ...(opts.effort ? { effort: opts.effort } : {}),
         thinking: { type: 'adaptive', display: 'summarized' },
         cwd,
         settingSources: RUN_SETTING_SOURCES,
@@ -1107,7 +1483,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
           },
         } : {}),
         ...(additionalDirectories.length ? { additionalDirectories } : {}),
-        ...(agentNames.length ? { agents: opts.subagents, forwardSubagentText: true, agentProgressSummaries: true } : {}),
+        ...(agentNames.length ? { agents: sdkSubagents, forwardSubagentText: true, agentProgressSummaries: true } : {}),
         ...(opts.resumeSdkSessionId ? { resume: opts.resumeSdkSessionId } : {}),
         ...(opts.outputFormat ? { outputFormat: opts.outputFormat } : {}),
         ...(opts.enableFileCheckpointing ? { enableFileCheckpointing: true } : {}),
@@ -1115,10 +1491,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         env,
         settings: { showThinkingSummaries: true },
         ...(hooks ? { hooks, includeHookEvents: true } : {}),
-        ...(customMcp || datasourceMcp ? {
+        ...(customMcp || datasourceMcp || modelRequestMcp || imageInspectMcp ? {
           mcpServers: {
             ...(customMcp ? { custom: customMcp } : {}),
             ...(datasourceMcp ? { datasource: datasourceMcp } : {}),
+            ...(modelRequestMcp ? { model: modelRequestMcp } : {}),
+            ...(imageInspectMcp ? { image: imageInspectMcp } : {}),
           },
         } : {}),
         ...(effectiveSystemPrompt ? { systemPrompt: effectiveSystemPrompt } : {}),
@@ -1156,6 +1534,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         const u = m.usage || {};
         inTok = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
         outTok = u.output_tokens || 0;
+      } else if (m.type === 'system' && m.subtype === 'compact_boundary') {
+        opts.emit({
+          type: 'context_compaction',
+          subtype: 'compact_boundary',
+          message: typeof m.message === 'string' ? m.message : 'SDK 已触发上下文自动压缩边界',
+          sdkSessionId: m.session_id || sdkSessionId || undefined,
+          timestamp: Date.now(),
+        });
       } else if (m.type === 'system' && m.subtype === 'task_started') {
         opts.emit({
           type: 'task_started',
