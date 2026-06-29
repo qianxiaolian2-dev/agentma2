@@ -17,6 +17,7 @@ import { fetchProviderModels, listProviderModels, loadProviderProfiles, resolveP
 import JsonViewer from '../components/common/JsonViewer';
 import ChatMessageBubble from '../components/ChatMessageBubble';
 import ChatModelPicker from '../components/ChatModelPicker';
+import VisualFrame from '../components/artifacts/VisualFrame';
 import {
   deriveRunPhase,
   isWaitingPhase,
@@ -38,6 +39,7 @@ import {
   getChatImageSrc,
   uniqueChatImageFiles,
 } from '../utils/chat-attachments-ui';
+import { extractVisualPreviewTargets, type VisualPreviewTarget } from '../utils/visual-preview-links';
 import {
   bootstrapChatSessions,
   createChatSessionTitle,
@@ -124,6 +126,22 @@ async function readChatError(response: Response) {
   }
 }
 
+async function readJson<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  const data = text ? JSON.parse(text) as T : null;
+  if (!response.ok) {
+    const message = data && typeof data === 'object' && 'error' in (data as Record<string, unknown>)
+      ? String((data as Record<string, unknown>).error || '请求失败')
+      : `HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return data as T;
+}
+
+function formatVisualTime(value?: number) {
+  return value ? new Date(value).toLocaleString() : '';
+}
+
 function formatShortId(value?: string | null) {
   return value ? value.slice(0, 5) : '-';
 }
@@ -154,6 +172,28 @@ type ResumeVisualContext = {
   attachment: ChatFileAttachment;
 };
 
+type VisualPreviewPayload = {
+  id?: string;
+  title?: string;
+  html: string;
+  createdAt?: number;
+  mtimeMs?: number;
+  sourceVisualId?: string;
+};
+
+type ConversationVisualPreview = {
+  target: VisualPreviewTarget;
+  status: 'loading' | 'ready' | 'error';
+  title?: string;
+  html?: string;
+  createdAt?: number;
+  mtimeMs?: number;
+  sourceVisualId?: string;
+  error?: string;
+  saving?: boolean;
+  saveError?: string;
+};
+
 function slugifyVisualFileName(title?: string) {
   return (title || 'saved-visual')
     .toLowerCase()
@@ -173,6 +213,24 @@ function buildResumeVisualPrompt(context: ResumeVisualContext, userRequest: stri
     '不要通过 pwd、ls、find、grep 去寻找旧项目路径；这次运行使用的是新的临时工作区。',
     userRequest ? `[本轮修改要求]\n${userRequest}` : '如果用户暂时没有补充要求，先概述你理解到的现有页面结构，再询问要改哪一部分。',
   ].join('\n\n');
+}
+
+function savedVisualTarget(id: string): VisualPreviewTarget {
+  return {
+    key: `id:${id}`,
+    href: `/viz?id=${encodeURIComponent(id)}`,
+    id,
+  };
+}
+
+function latestVisualPreviewTarget(messages: ChatMessage[]) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== 'assistant' || !message.content) continue;
+    const targets = extractVisualPreviewTargets(message.content);
+    if (targets.length > 0) return targets[targets.length - 1];
+  }
+  return null;
 }
 
 function compareChatSessions(a: ChatSession, b: ChatSession) {
@@ -246,6 +304,7 @@ export default function Conversations() {
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [resumeVisualError, setResumeVisualError] = useState('');
   const [resumeVisualContext, setResumeVisualContext] = useState<ResumeVisualContext | null>(null);
+  const [activeVisualPreview, setActiveVisualPreview] = useState<ConversationVisualPreview | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -257,6 +316,7 @@ export default function Conversations() {
   const abortRef = useRef<AbortController | null>(null);
   const observingRunIdRef = useRef('');
   const activeItemRef = useRef<HTMLDivElement>(null);
+  const visualPreviewLoadSeqRef = useRef(0);
   const provider = useRef<ProviderConfig>(resolveProviderForModel().provider);
   const currentAgent = templates.find(t => t.id === selectedAgentId);
   const activeSession = activeSessionId ? sessions.find(s => s.id === activeSessionId) || null : null;
@@ -272,6 +332,86 @@ export default function Conversations() {
       textareaRef.current.focus();
     });
   }, []);
+  const loadVisualPreview = useCallback(async (target: VisualPreviewTarget) => {
+    const seq = ++visualPreviewLoadSeqRef.current;
+    setActiveVisualPreview({
+      target,
+      status: 'loading',
+      title: target.id ? '已保存页面' : target.path,
+    });
+
+    try {
+      if (!target.id && (!target.cid || !target.path)) throw new Error('缺少可视化参数');
+      const url = target.id
+        ? `/api/visuals/${encodeURIComponent(target.id)}`
+        : `/api/visuals/file?cid=${encodeURIComponent(target.cid || '')}&path=${encodeURIComponent(target.path || '')}`;
+      const response = await fetch(url, { headers: getAuthHeaders() });
+      const data = await readJson<VisualPreviewPayload>(response);
+      if (visualPreviewLoadSeqRef.current !== seq) return;
+      setActiveVisualPreview({
+        target,
+        status: 'ready',
+        title: data.title || target.path || '未命名页面',
+        html: data.html,
+        createdAt: data.createdAt,
+        mtimeMs: data.mtimeMs,
+        sourceVisualId: target.id || target.sourceVisualId || data.sourceVisualId,
+      });
+    } catch (error) {
+      if (visualPreviewLoadSeqRef.current !== seq) return;
+      setActiveVisualPreview({
+        target,
+        status: 'error',
+        title: target.id ? '已保存页面' : target.path,
+        error: (error as Error).message || '可视化读取失败',
+      });
+    }
+  }, []);
+  const saveActiveVisualPreview = useCallback(async () => {
+    const preview = activeVisualPreview;
+    if (!preview || preview.status !== 'ready' || !preview.target.cid || !preview.target.path || preview.saving) return;
+    setActiveVisualPreview(prev => prev ? { ...prev, saving: true, saveError: '' } : prev);
+    try {
+      const response = await fetch('/api/visuals', {
+        method: 'POST',
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          cid: preview.target.cid,
+          path: preview.target.path,
+          title: preview.title,
+          sourceVisualId: preview.sourceVisualId || preview.target.sourceVisualId,
+        }),
+      });
+      const data = await readJson<{ id: string }>(response);
+      const target = savedVisualTarget(data.id);
+      setActiveVisualPreview(prev => prev ? {
+        ...prev,
+        target,
+        sourceVisualId: data.id,
+        saving: false,
+        saveError: '',
+      } : prev);
+    } catch (error) {
+      setActiveVisualPreview(prev => prev ? {
+        ...prev,
+        saving: false,
+        saveError: (error as Error).message || '保存失败',
+      } : prev);
+    }
+  }, [activeVisualPreview]);
+  const continueFromActiveVisualPreview = useCallback(() => {
+    const visualId = activeVisualPreview?.target.id || '';
+    if (!visualId) return;
+    navigate(`/conversations?agent=viz-agent&visualId=${encodeURIComponent(visualId)}`);
+  }, [activeVisualPreview, navigate]);
+  const latestPreviewTarget = useMemo(() => latestVisualPreviewTarget(messages), [messages]);
+  const activeVisualPreviewTime = formatVisualTime(activeVisualPreview?.createdAt || activeVisualPreview?.mtimeMs);
+  const canSaveActiveVisualPreview = Boolean(
+    activeVisualPreview?.status === 'ready'
+    && activeVisualPreview.target.cid
+    && activeVisualPreview.target.path,
+  );
+  const canContinueActiveVisualPreview = Boolean(activeVisualPreview?.target.id);
 
   const [botEvents, setBotEvents] = useState<Array<{ type: string; source?: string; username?: string; message?: string; health?: number; timestamp: number }>>([]);
   const [eventSources, setEventSources] = useState<EventSourceConfig[]>([]);
@@ -397,6 +537,7 @@ export default function Conversations() {
     setSessionLoadError('');
     setResumeVisualError('');
     setResumeVisualContext(null);
+    setActiveVisualPreview(null);
     setInput('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     setAttachments([]);
@@ -817,6 +958,7 @@ export default function Conversations() {
     setSessionLoadError('');
     setResumeVisualError('');
     setResumeVisualContext(null);
+    setActiveVisualPreview(null);
     setActiveSessionId(null);
     setMessages([]);
     setPendingQuestions([]);
@@ -876,6 +1018,14 @@ export default function Conversations() {
             size: new TextEncoder().encode(visual.html).byteLength,
           },
         });
+        setActiveVisualPreview({
+          target: savedVisualTarget(requestedVisualId),
+          status: 'ready',
+          title: visual.title?.trim() || '未命名页面',
+          html: visual.html,
+          createdAt: visual.createdAt,
+          sourceVisualId: requestedVisualId,
+        });
         setAttachments([]);
         setAttachmentError('');
         setInput([
@@ -894,6 +1044,7 @@ export default function Conversations() {
         completed = true;
         setResumeVisualError((error as Error).message || '读取已保存页面失败');
         setResumeVisualContext(null);
+        setActiveVisualPreview(null);
         setSearchParams((prev) => {
           const next = new URLSearchParams(prev);
           next.delete('visualId');
@@ -914,6 +1065,18 @@ export default function Conversations() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestedVisualId]);
+
+  useEffect(() => {
+    if (isStreaming || !latestPreviewTarget) return;
+    if (activeVisualPreview?.target.key === latestPreviewTarget.key && activeVisualPreview.status !== 'error') return;
+    void loadVisualPreview(latestPreviewTarget);
+  }, [
+    activeVisualPreview?.status,
+    activeVisualPreview?.target.key,
+    isStreaming,
+    latestPreviewTarget,
+    loadVisualPreview,
+  ]);
 
   const updateScrollBottomVisibility = useCallback(() => {
     const el = messagesRef.current;
@@ -1003,6 +1166,7 @@ export default function Conversations() {
     setSessionLoadError('');
     setResumeVisualError('');
     setResumeVisualContext(null);
+    setActiveVisualPreview(null);
     setActiveSessionId(null);
     setMessages([]);
     setPendingQuestions([]);
@@ -1034,6 +1198,7 @@ export default function Conversations() {
     setSelectedAgentId(agentId);
     setResumeVisualError('');
     setResumeVisualContext(null);
+    setActiveVisualPreview(null);
     setSessionSearch('');
     setPendingQuestions([]);
     setPendingPermissions([]);
@@ -1783,7 +1948,7 @@ export default function Conversations() {
               >
                 历史
               </button>
-              <div style={{ fontWeight: 700, fontSize: '.95em' }}>{currentAgent?.name}</div>
+              <div className="conversation-agent-title" style={{ fontWeight: 700, fontSize: '.95em' }}>{currentAgent?.name}</div>
               <div className="flex gap-2" style={{ flexWrap: 'wrap', flex: 1 }}>
                 <span
                   className="conversation-id-badge"
@@ -1977,7 +2142,7 @@ export default function Conversations() {
                 </div>
               )}
               {messages.map((msg, i) => (
-                <ChatMessageBubble key={msg.id || i} message={msg} />
+                <ChatMessageBubble key={msg.id || i} message={msg} onVisualPreviewLink={loadVisualPreview} />
               ))}
               {agentTasks.length > 0 && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -2150,6 +2315,80 @@ export default function Conversations() {
           </>
         )}
       </div>
+      {activeVisualPreview && selectedAgentId && (
+        <aside className="conversation-visual-panel" aria-label="HTML 预览">
+          <div className="conversation-visual-panel-header">
+            <div className="conversation-visual-title-block">
+              <span className={`badge ${activeVisualPreview.target.id ? 'badge-success' : 'badge-warning'}`}>
+                {activeVisualPreview.target.id ? '已保存' : '临时'}
+              </span>
+              <div>
+                <h2>{activeVisualPreview.title || '未命名页面'}</h2>
+                <p>
+                  {activeVisualPreview.target.id
+                    ? `素材 ${formatShortId(activeVisualPreview.target.id)}`
+                    : activeVisualPreview.target.path || '会话产物'}
+                  {activeVisualPreviewTime ? ` · ${activeVisualPreviewTime}` : ''}
+                </p>
+              </div>
+            </div>
+            <button
+              className="btn btn-sm"
+              type="button"
+              onClick={() => setActiveVisualPreview(null)}
+              aria-label="关闭预览"
+              title="关闭预览"
+            >
+              ×
+            </button>
+          </div>
+
+          <div className="conversation-visual-actions">
+            <button
+              className="btn btn-sm"
+              type="button"
+              onClick={() => window.open(activeVisualPreview.target.href, '_blank', 'noopener,noreferrer')}
+              disabled={activeVisualPreview.status === 'loading'}
+            >
+              新页打开
+            </button>
+            {canSaveActiveVisualPreview && (
+              <button
+                className="btn btn-sm btn-primary"
+                type="button"
+                onClick={() => void saveActiveVisualPreview()}
+                disabled={activeVisualPreview.saving}
+              >
+                {activeVisualPreview.saving ? '保存中…' : activeVisualPreview.sourceVisualId ? '保存更新' : '保存'}
+              </button>
+            )}
+            {canContinueActiveVisualPreview && (
+              <button className="btn btn-sm btn-primary" type="button" onClick={continueFromActiveVisualPreview}>
+                继续修改
+              </button>
+            )}
+          </div>
+
+          {activeVisualPreview.saveError && (
+            <div className="visual-inline-error conversation-visual-error">{activeVisualPreview.saveError}</div>
+          )}
+
+          <div className="conversation-visual-body">
+            {activeVisualPreview.status === 'loading' && (
+              <div className="conversation-visual-state">正在载入 HTML 预览…</div>
+            )}
+            {activeVisualPreview.status === 'error' && (
+              <div className="conversation-visual-state conversation-visual-state-error">
+                <strong>预览读取失败</strong>
+                <span>{activeVisualPreview.error || '可视化读取失败'}</span>
+              </div>
+            )}
+            {activeVisualPreview.status === 'ready' && activeVisualPreview.html && (
+              <VisualFrame html={activeVisualPreview.html} />
+            )}
+          </div>
+        </aside>
+      )}
     </div>
   );
 }

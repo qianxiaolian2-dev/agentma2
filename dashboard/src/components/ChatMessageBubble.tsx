@@ -3,9 +3,11 @@ import type { MouseEvent } from 'react';
 import type { ChatAttachment, ChatMessage, ChatImageAttachment } from '../simulator/types';
 import { renderMarkdown } from '../utils/render-markdown';
 import { normalizeMessageOutcome, outcomeBadgeClass, outcomeColor, outcomeLabel } from '../simulator/run-state';
+import { extractVisualPreviewTargets, parseVisualPreviewTarget, type VisualPreviewTarget } from '../utils/visual-preview-links';
 
 type Props = {
   message: ChatMessage;
+  onVisualPreviewLink?: (target: VisualPreviewTarget) => void;
 };
 
 function ImageGrid({ attachments }: { attachments: ChatImageAttachment[] }) {
@@ -80,7 +82,7 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function ChatMessageBubble({ message }: Props) {
+function ChatMessageBubble({ message, onVisualPreviewLink }: Props) {
   const isThinkingActive = message.status === 'streaming' && !!message.thinking;
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const isPending = message.role === 'assistant' && message.status === 'pending' && !message.content && !message.thinking;
@@ -96,10 +98,23 @@ function ChatMessageBubble({ message }: Props) {
     if (!useMarkdown) return '';
     return renderMarkdown(message.content);
   }, [useMarkdown, message.content]);
+  const visualTargets = useMemo(() => {
+    if (message.role !== 'assistant' || !message.content) return [];
+    return extractVisualPreviewTargets(message.content);
+  }, [message.role, message.content]);
 
   const handleMarkdownClick = (event: MouseEvent<HTMLDivElement>) => {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
+    const anchor = target.closest<HTMLAnchorElement>('a[href]');
+    if (anchor && onVisualPreviewLink) {
+      const visualTarget = parseVisualPreviewTarget(anchor.getAttribute('href') || '');
+      if (visualTarget) {
+        event.preventDefault();
+        onVisualPreviewLink(visualTarget);
+        return;
+      }
+    }
     const copyButton = target.closest<HTMLButtonElement>('.chat-code-copy');
     const code = copyButton?.dataset.code;
     if (!copyButton || code == null) return;
@@ -181,6 +196,21 @@ function ChatMessageBubble({ message }: Props) {
         </span>
       )}
 
+      {onVisualPreviewLink && visualTargets.length > 0 && (
+        <div className="chat-visual-actions">
+          {visualTargets.map((target) => (
+            <button
+              key={target.key}
+              type="button"
+              className="btn btn-sm btn-primary"
+              onClick={() => onVisualPreviewLink(target)}
+            >
+              右侧预览
+            </button>
+          ))}
+        </div>
+      )}
+
       {isComplete && <CopyButton text={message.content} />}
 
       {message.timestamp > 0 && (message.role === 'user' || isComplete) && (
@@ -193,6 +223,7 @@ function ChatMessageBubble({ message }: Props) {
 }
 
 function areMessagePropsEqual(prev: Props, next: Props): boolean {
+  if (prev.onVisualPreviewLink !== next.onVisualPreviewLink) return false;
   const a = prev.message;
   const b = next.message;
 

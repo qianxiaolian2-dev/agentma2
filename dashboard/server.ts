@@ -1607,8 +1607,8 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
       effectiveSystemPrompt,
       [
         '[可视化预览] 生成可视化页面时，用 Write 工具把 HTML 写到 ./viz/<slug>.html（<slug> 替换为英文短横线连接的页面描述），',
-        `然后给用户这个 markdown 链接: ${visualPreviewPath}（把 <slug> 替换成你实际写的文件名）`,
-        '预览页面加载后会在右上角显示"保存"按钮，用户点击即可保存到素材库。',
+        `然后给用户这个 markdown 链接: [右侧预览](${visualPreviewPath})（把 <slug> 替换成你实际写的文件名）`,
+        '会话页会自动在右侧打开这个 HTML 预览；独立预览页仍会显示"保存"按钮，用户点击即可保存到素材库。',
       ].join('\n'),
     ].filter(Boolean).join('\n\n');
   }

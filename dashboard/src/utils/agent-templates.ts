@@ -241,7 +241,7 @@ function createVizAgentTemplate(model: string): AgentTemplate {
 
 function upgradeVizAgentTemplate(template: AgentTemplate): AgentTemplate {
   const systemPrompt = createVizAgentSystemPrompt(template.systemPrompt);
-  const skills = [];  // 不再依赖 agentma-visual skill
+  const skills: string[] = [];  // 不再依赖 agentma-visual skill
   const tools = mergeStringArrays(template.tools, VIZ_AGENT_REQUIRED_TOOLS);
 
   if (
