@@ -47,6 +47,7 @@ import {
   listDashboards,
   listDashboardVersions,
   listHookRules,
+  listInternalToolSettings,
   listKnowledgeSources,
   listPermissionRules,
   listProviderProfiles,
@@ -75,6 +76,7 @@ import {
   testKnowledgeSource,
   updateChatSession,
   updateChatSessionCollaboration,
+  updateInternalToolSetting,
   updatePublicSkill,
   updateQuota,
   updateTenant,
@@ -91,6 +93,7 @@ import {
   resolveAskUserQuestion,
 } from './server-agent.ts';
 import type { AgentEvent } from './server-agent.ts';
+import type { Role } from './server-store.ts';
 import {
   importDatasourceUpload,
   runDatasourceQuery,
@@ -110,6 +113,7 @@ import {
   loadDashboard,
 } from './server-dashboard.ts';
 import { generateLayoutByLLMWithProvider, askQuestionWithProvider, editDashboardByChatWithProvider, generateHtmlVisual, classifyChatIntent, summarizeQueryResult } from './server-dashboard-llm.ts';
+import { listInternalTools } from './server-internal-tools.ts';
 import { mapResultSubtypeToOutcome, outcomeToMessageStatus, type RunOutcome } from './src/simulator/run-state.ts';
 
 const app = express();
@@ -195,6 +199,7 @@ function appendAssistantForServerRun(run: ServerOwnedRun, content: string, outco
       timestamp: run.assistantTimestamp,
       ...(run.thinking ? { thinking: run.thinking } : {}),
       ...(run.outcomeDetail ? { outcomeDetail: run.outcomeDetail } : {}),
+      ...(run.runStats ? { runStats: run.runStats } : {}),
       runId: run.id,
     },
   ];
@@ -660,6 +665,48 @@ function extractTitle(html: string) {
   return normalizedH1 ? normalizedH1.slice(0, 160) : undefined;
 }
 
+function normalizeMarkdownHeadingText(value: string) {
+  return normalizeHtmlText(
+    value
+      .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+      .replace(/[`*_~]/g, ''),
+  );
+}
+
+function titleFromVisualPath(relPath?: string) {
+  const basename = path.basename(String(relPath || '')).replace(/\.(html|md|markdown)$/i, '');
+  return basename ? basename.slice(0, 160) : undefined;
+}
+
+function extractMarkdownTitle(markdown: string, relPath?: string) {
+  const lines = markdown.split(/\r?\n/);
+  let inFence = false;
+  let firstHeading = '';
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const match = line.match(/^(#{1,6})(?!#)\s*(.+?)\s*#*\s*$/);
+    if (!match) continue;
+    const title = normalizeMarkdownHeadingText(match[2]);
+    if (!title) continue;
+    if (match[1].length === 1) return title.slice(0, 160);
+    firstHeading ||= title;
+  }
+  return titleFromVisualPath(relPath) || (firstHeading ? firstHeading.slice(0, 160) : undefined);
+}
+
+function visualFormatFromPath(relPath: string): 'html' | 'markdown' {
+  return /\.(md|markdown)$/i.test(relPath) ? 'markdown' : 'html';
+}
+
+function extractVisualTitle(content: string, format: 'html' | 'markdown', relPath?: string) {
+  return format === 'markdown' ? extractMarkdownTitle(content, relPath) : extractTitle(content);
+}
+
 function readWorkspaceVisual(auth: any, cid: string, relPath: string) {
   const sessionId = parseConversationIdInput(cid);
   if (!sessionId) throw makeHttpError('need cid', 400);
@@ -667,7 +714,7 @@ function readWorkspaceVisual(auth: any, cid: string, relPath: string) {
   if (!session) throw makeHttpError('对话不存在或无权访问', 404);
   const sdkCwd = typeof session.sdkCwd === 'string' ? session.sdkCwd.trim() : '';
   if (!sdkCwd) throw makeHttpError('该对话没有 workspace', 404);
-  if (!/^viz\/[A-Za-z0-9._-]+\.html$/.test(relPath)) throw makeHttpError('非法路径', 400);
+  if (!/^viz\/[A-Za-z0-9._-]+\.(html|md|markdown)$/i.test(relPath)) throw makeHttpError('非法路径', 400);
 
   const cwdInput = path.resolve(expandLocalPath(sdkCwd));
   if (!fs.existsSync(cwdInput)) throw makeHttpError('workspace 不存在', 404);
@@ -682,6 +729,8 @@ function readWorkspaceVisual(auth: any, cid: string, relPath: string) {
   if (stat.size > MAX_VISUAL_BYTES) throw makeHttpError('文件过大', 413);
   return {
     html: fs.readFileSync(realFile, 'utf8'),
+    format: visualFormatFromPath(relPath),
+    sourceSlug: relPath,
     mtimeMs: stat.mtimeMs,
     sourceVisualId: session.sourceVisualId,
   };
@@ -1121,6 +1170,10 @@ function normalizeAgentTemplateForApi(value: unknown): Record<string, unknown> {
   for (const key of ['tools', 'mcpServers', 'eventSources', 'skills', 'knowledgeSourceIds', 'datasourceIds']) {
     if (Array.isArray(template[key])) template[key] = normalizeStringArray(template[key]) || [];
   }
+  template.visualPreprocessDefault = template.visualPreprocessDefault === true ? true : undefined;
+  template.visualPreprocessModel = typeof template.visualPreprocessModel === 'string' && template.visualPreprocessModel.trim()
+    ? template.visualPreprocessModel.trim()
+    : undefined;
 
   if (template.subagents && typeof template.subagents === 'object' && !Array.isArray(template.subagents)) {
     const normalizedSubagents = Object.entries(template.subagents as Record<string, unknown>).flatMap(([name, agent]) => {
@@ -1136,6 +1189,26 @@ function normalizeAgentTemplateForApi(value: unknown): Record<string, unknown> {
   }
 
   return template;
+}
+
+function agentTemplateActor(auth: { sub: string; email?: string }) {
+  return auth.email || auth.sub;
+}
+
+type AgentTemplateAuth = { tenantId: string; sub: string; email?: string; role?: Role | null };
+
+function listVisibleAgentTemplates(auth: AgentTemplateAuth) {
+  return listAgentTemplates(auth.tenantId, agentTemplateActor(auth), auth.role).map(normalizeAgentTemplateForApi);
+}
+
+function getVisibleAgentTemplate(auth: AgentTemplateAuth, templateId: string) {
+  const id = templateId.trim();
+  if (!id) return null;
+  return listVisibleAgentTemplates(auth).find((template) => String(template.id || '') === id) || null;
+}
+
+function canManageAgentTemplate(auth: { sub: string; email?: string; role?: Role | null }, template: Record<string, unknown>) {
+  return auth.role === 'tenant_admin' || String(template.createdBy || '') === agentTemplateActor(auth);
 }
 
 type ClaudeMdPreviewSource = 'user' | 'project' | 'local';
@@ -1187,6 +1260,8 @@ function buildEffectiveClaudeMdPreview(files: ClaudeMdPreviewFile[]) {
 
 type ChatImageMimeType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
 type ChatImageInput = {
+  id?: string;
+  name?: string;
   mediaType: ChatImageMimeType;
   data: string;
   size: number;
@@ -1244,7 +1319,13 @@ function normalizeChatImages(value: unknown): { images: ChatImageInput[]; error?
     if (!/^[A-Za-z0-9+/=\s]+$/.test(data)) return { images: [], error: '图片 base64 数据无效' };
     const size = Number(raw.size) || base64SizeBytes(data);
     if (size > MAX_CHAT_IMAGE_BYTES) return { images: [], error: '单张图片不能超过 5MB' };
-    images.push({ mediaType, data, size });
+    images.push({
+      id: typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : undefined,
+      name: normalizeChatFileName(raw.name),
+      mediaType,
+      data,
+      size,
+    });
   }
   return { images };
 }
@@ -1535,9 +1616,8 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   const { prompt, messages: inputMessages, systemPrompt, model, provider, tools: requestTools } = req.body || {};
   const subagents = normalizeSubagents(req.body?.subagents);
   const templateId = typeof req.body?.templateId === 'string' ? req.body.templateId.trim() : '';
-  const template = templateId
-    ? listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi).find((item) => String(item.id || '') === templateId)
-    : null;
+  const template = templateId ? getVisibleAgentTemplate(req.auth, templateId) : null;
+  if (templateId && !template) { res.status(404).json({ error: 'agent not found' }); return; }
   const sessionId = typeof req.body?.sessionId === 'string' && req.body.sessionId.trim()
     ? req.body.sessionId.trim()
     : `chat-${Date.now()}`;
@@ -1561,7 +1641,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   // Fold multi-turn history into systemPrompt so the model sees prior context.
   // When an SDK transcript id is available, resume that transcript and send
   // only the latest turn to avoid duplicating history.
-  let runPrompt = '';
+  let runPrompt: string;
   let promptImages: ChatImageInput[] = [];
   let effectiveSystemPrompt = typeof systemPrompt === 'string' ? systemPrompt : '';
   if (Array.isArray(inputMessages) && inputMessages.length) {
@@ -1619,6 +1699,32 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   if (!selectedModel) { res.status(400).json({ error: 'no model configured' }); return; }
   const runtimeProvider = resolveRuntimeProvider(req.auth.tenantId, selectedModel, provider, undefined, req.body?.providerProfiles);
   if (!runtimeProvider.apiKey) { res.status(400).json({ error: 'no ANTHROPIC_AUTH_TOKEN' }); return; }
+  const visualPreprocessEnabled = typeof req.body?.visualPreprocessEnabled === 'boolean'
+    ? req.body.visualPreprocessEnabled === true
+    : template?.visualPreprocessDefault === true;
+  const visualPreprocessModel = [
+    req.body?.visualPreprocessModel,
+    template?.visualPreprocessModel,
+  ].find(value => typeof value === 'string' && value.trim())?.trim() || '';
+  let visualPreprocess: Parameters<typeof runAgent>[0]['visualPreprocess'] | undefined;
+  if (visualPreprocessEnabled && promptImages.length) {
+    if (!visualPreprocessModel) { res.status(400).json({ error: '视觉预处理已开启，但未配置视觉识别模型' }); return; }
+    const visualRuntimeProvider = resolveRuntimeProvider(req.auth.tenantId, visualPreprocessModel, undefined, undefined, req.body?.providerProfiles);
+    if (visualRuntimeProvider.source === 'request') {
+      res.status(400).json({ error: `视觉识别模型未在 provider profile 中配置: ${visualPreprocessModel}` });
+      return;
+    }
+    if (!visualRuntimeProvider.apiKey) {
+      res.status(400).json({ error: `视觉识别模型 ${visualPreprocessModel} 所属供应商未配置 API Key` });
+      return;
+    }
+    visualPreprocess = {
+      enabled: true,
+      model: visualPreprocessModel,
+      baseUrl: visualRuntimeProvider.baseUrl,
+      apiKey: visualRuntimeProvider.apiKey,
+    };
+  }
   console.log(`[provider-route] chat model=${selectedModel} source=${runtimeProvider.source} baseUrl=${describeBaseUrl(runtimeProvider.baseUrl)}`);
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -1644,6 +1750,8 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
       templateId: templateId || String(req.body?.templateId || ''),
       title: typeof req.body?.title === 'string' ? req.body.title : '新对话',
       model: selectedModel,
+      visualPreprocessEnabled,
+      visualPreprocessModel: visualPreprocessModel || undefined,
       sdkSessionId: resumeSdkSessionId || undefined,
       sdkCwd: sdkCwd || undefined,
       sourceVisualId: sourceVisualId || undefined,
@@ -1706,6 +1814,8 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
   void runAgent({
     prompt: runPrompt,
     promptImages,
+    visualPreprocess,
+    imageInspectModel: visualPreprocessModel || undefined,
     systemPrompt: effectiveSystemPrompt || undefined,
     model: selectedModel,
     baseUrl: runtimeProvider.baseUrl,
@@ -1724,6 +1834,7 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     knowledgeSourceIds,
     datasourceIds,
     outputFormat: outputSchema ? { type: 'json_schema', schema: outputSchema } : undefined,
+    effort: (typeof req.body?.effort === 'string' ? req.body.effort : template?.effort) as EffortLevel | undefined,
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
     role: req.auth.role,
@@ -2082,16 +2193,172 @@ app.put('/api/providers', authMiddleware, requireAdmin, (req: any, res) => {
   res.json(saved);
 });
 
-app.get('/api/provider-models', authMiddleware, (req: any, res) => {
+function providerModelsEndpoint(baseUrl: string) {
+  const raw = String(baseUrl || '').trim();
+  if (!raw) return '';
+  try {
+    const url = new URL(raw);
+    const pathName = url.pathname.replace(/\/+$/, '');
+    if (/\/v1\/models$/i.test(pathName)) return url.toString();
+    url.pathname = pathName.endsWith('/v1') ? `${pathName}/models` : `${pathName}/v1/models`;
+    url.search = '';
+    return url.toString();
+  } catch {
+    return '';
+  }
+}
+
+function numericContextWindow(value: unknown) {
+  const tokens = Number(value);
+  return Number.isFinite(tokens) && tokens > 0 ? Math.floor(tokens) : undefined;
+}
+
+function modelContextWindowFromApiItem(item: Record<string, unknown>) {
+  const nested = item.capabilities && typeof item.capabilities === 'object'
+    ? item.capabilities as Record<string, unknown>
+    : {};
+  return numericContextWindow(item.max_input_tokens)
+    || numericContextWindow(item.context_window)
+    || numericContextWindow(item.contextWindow)
+    || numericContextWindow(item.context_window_tokens)
+    || numericContextWindow(item.input_context_window)
+    || numericContextWindow(item.context_length)
+    || numericContextWindow(item.max_context_tokens)
+    || numericContextWindow(nested.max_input_tokens)
+    || numericContextWindow(nested.context_window)
+    || numericContextWindow(nested.context_length);
+}
+
+function parseProviderModelsPayload(payload: unknown) {
+  const list = Array.isArray(payload)
+    ? payload
+    : payload && typeof payload === 'object' && Array.isArray((payload as { data?: unknown[] }).data)
+      ? (payload as { data: unknown[] }).data
+      : payload && typeof payload === 'object' && Array.isArray((payload as { models?: unknown[] }).models)
+        ? (payload as { models: unknown[] }).models
+        : [];
+  const availableModels: string[] = [];
+  const modelContextWindows: Record<string, number> = {};
+  for (const item of list) {
+    if (typeof item === 'string') {
+      const model = item.trim();
+      if (model && !model.includes('*')) availableModels.push(model);
+      continue;
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const raw = item as Record<string, unknown>;
+    const model = String(raw.id || raw.model || raw.name || '').trim();
+    if (!model || model.includes('*')) continue;
+    availableModels.push(model);
+    const contextWindow = modelContextWindowFromApiItem(raw);
+    if (contextWindow) modelContextWindows[model] = contextWindow;
+  }
+  return {
+    availableModels: Array.from(new Set(availableModels)),
+    modelContextWindows,
+  };
+}
+
+async function discoverProviderModels(profile: ReturnType<typeof listProviderProfiles>[number]) {
+  const endpoint = providerModelsEndpoint(profile.ANTHROPIC_BASE_URL);
+  if (!endpoint) return { availableModels: [], modelContextWindows: {} as Record<string, number> };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4500);
+  try {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    const token = String(profile.ANTHROPIC_AUTH_TOKEN || '').trim();
+    if (token) {
+      headers['x-api-key'] = token;
+      if (!/\.anthropic\.com$/i.test(new URL(endpoint).hostname)) headers.Authorization = `Bearer ${token}`;
+    }
+    if (/\.anthropic\.com$/i.test(new URL(endpoint).hostname)) headers['anthropic-version'] = '2023-06-01';
+    const response = await fetch(endpoint, { headers, signal: controller.signal });
+    if (!response.ok) return { availableModels: [], modelContextWindows: {} as Record<string, number> };
+    const payload = await response.json().catch(() => null);
+    return parseProviderModelsPayload(payload);
+  } catch {
+    return { availableModels: [], modelContextWindows: {} as Record<string, number> };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function providerProfileForClient(profile: ReturnType<typeof listProviderProfiles>[number]) {
+  return {
+    id: profile.id,
+    name: profile.name,
+    ANTHROPIC_AUTH_TOKEN: '',
+    ANTHROPIC_BASE_URL: profile.ANTHROPIC_BASE_URL,
+    availableModels: profile.availableModels,
+    modelContextWindows: profile.modelContextWindows || {},
+    enabled: profile.enabled,
+    isDefault: profile.isDefault,
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt,
+  };
+}
+
+app.get('/api/provider-models', authMiddleware, async (req: any, res) => {
   const profiles = listProviderProfiles(req.auth.tenantId);
   const enabled = profiles.filter(profile => profile.enabled);
+  const usable = enabled.length ? enabled : profiles;
+  const discovered = await Promise.all(usable.map(async (profile) => {
+    const remote = await discoverProviderModels(profile);
+    return {
+      ...profile,
+      availableModels: Array.from(new Set([...profile.availableModels, ...remote.availableModels])),
+      modelContextWindows: {
+        ...(profile.modelContextWindows || {}),
+        ...remote.modelContextWindows,
+      },
+    };
+  }));
   const values = new Set<string>();
-  for (const profile of enabled.length ? enabled : profiles) {
+  for (const profile of discovered) {
     for (const model of profile.availableModels) {
       if (model.trim()) values.add(model.trim());
     }
   }
-  res.json(Array.from(values));
+  res.json({
+    models: Array.from(values),
+    profiles: discovered.map(providerProfileForClient),
+  });
+});
+
+app.get('/api/internal-tools', authMiddleware, (_req: any, res) => {
+  res.json(listInternalTools());
+});
+
+app.get('/api/internal-tool-settings', authMiddleware, (req: any, res) => {
+  res.json(listInternalToolSettings(req.auth.tenantId));
+});
+
+app.put('/api/internal-tool-settings/:toolId', authMiddleware, requireAdmin, (req: any, res) => {
+  const toolId = String(req.params.toolId || '').trim();
+  const knownToolIds = new Set(listInternalTools().map((item) => item.id));
+  if (!knownToolIds.has(toolId)) { res.status(404).json({ error: 'internal tool not found' }); return; }
+
+  const input = req.body?.settings && typeof req.body.settings === 'object' && !Array.isArray(req.body.settings)
+    ? req.body.settings as Record<string, unknown>
+    : req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body as Record<string, unknown>
+      : {};
+  const settings: Record<string, unknown> = {};
+  if (toolId === 'model.request' || toolId === 'image.inspect') {
+    const defaultModel = typeof input.defaultModel === 'string' ? input.defaultModel.trim() : '';
+    if (defaultModel) {
+      const profile = resolveProviderProfileForModel(req.auth.tenantId, defaultModel);
+      if (!profile || !profile.enabled) {
+        res.status(400).json({ error: `模型未在当前账户中启用或配置: ${defaultModel}` });
+        return;
+      }
+      settings.defaultModel = defaultModel;
+    }
+  }
+
+  const saved = updateInternalToolSetting(req.auth.tenantId, toolId, settings);
+  audit(req.auth.tenantId, 'update_internal_tool_setting', req.auth.sub, 'internal_tool', `internal_tool:${toolId}`, settings);
+  res.json(saved);
 });
 
 // ═══ Quota Routes ═══
@@ -3297,9 +3564,9 @@ app.post('/api/skills/workspace/install', authMiddleware, (req: any, res) => {
   }
 });
 
-// ═══ Agent Templates Routes (tenant-shared) ═══
+// ═══ Agent Templates Routes (personal + published) ═══
 app.get('/api/agents', authMiddleware, (req: any, res) => {
-  res.json(listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi));
+  res.json(listVisibleAgentTemplates(req.auth));
 });
 
 app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any, res) => {
@@ -3307,7 +3574,7 @@ app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any
     const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : [];
     if (!files.length) { res.status(400).json({ error: '请选择要导入的项目目录' }); return; }
 
-    const currentTemplates = listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi);
+    const currentTemplates = listVisibleAgentTemplates(req.auth);
     const mode = String(req.body?.mode || 'new').trim();
     const mergeTargetId = mode.startsWith('merge:')
       ? mode.slice('merge:'.length).trim()
@@ -3326,7 +3593,7 @@ app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any
     const nextTemplates = mergeTargetId
       ? currentTemplates.map((item) => String(item.id || '') === templateId ? template : item)
       : [template, ...currentTemplates.filter((item) => String(item.id || '') !== templateId)];
-    const saved = replaceAgentTemplates(req.auth.tenantId, nextTemplates).map(normalizeAgentTemplateForApi);
+    const saved = replaceAgentTemplates(req.auth.tenantId, nextTemplates, agentTemplateActor(req.auth), req.auth.role).map(normalizeAgentTemplateForApi);
     const savedTemplate = saved.find((item) => String(item.id || '') === templateId) || template;
     audit(req.auth.tenantId, 'import_agent', req.auth.sub, 'agent', templateId, summarizeAgentImportReport(report));
     res.json({ template: savedTemplate, report });
@@ -3338,9 +3605,7 @@ app.post('/api/agents/import', authMiddleware, parseAgentImportUpload, (req: any
 
 app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
   const agentId = String(req.params.id || '').trim();
-  const agent = listAgentTemplates(req.auth.tenantId)
-    .map(normalizeAgentTemplateForApi)
-    .find((template) => String(template.id || '') === agentId);
+  const agent = getVisibleAgentTemplate(req.auth, agentId);
   if (!agent) { res.status(404).json({ error: 'agent not found' }); return; }
 
   const latestSession = getLatestAgentRuntimeSession(req.auth.tenantId, getChatOwnerSub(req.auth), agentId);
@@ -3382,16 +3647,18 @@ app.get('/api/agents/:id/claude-md', authMiddleware, (req: any, res) => {
 
 app.put('/api/agents', authMiddleware, (req: any, res) => {
   const list = Array.isArray(req.body) ? req.body.map(normalizeAgentTemplateForApi) : [];
+  const actor = agentTemplateActor(req.auth);
   const previous = listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi);
-  const saved = replaceAgentTemplates(req.auth.tenantId, list);
-  const savedIds = new Set(saved.map((template) => String((template as Record<string, unknown>).id || '')));
+  const saved = replaceAgentTemplates(req.auth.tenantId, list, actor, req.auth.role);
+  const allAfterSave = listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi);
+  const savedIds = new Set(allAfterSave.map((template) => String((template as Record<string, unknown>).id || '')));
   for (const template of previous) {
     const templateId = String(template.id || '');
-    if (!templateId || savedIds.has(templateId) || typeof template.seedDir !== 'string') continue;
+    if (!templateId || savedIds.has(templateId) || !canManageAgentTemplate(req.auth, template) || typeof template.seedDir !== 'string') continue;
     fs.rmSync(agentSeedDir(req.auth.tenantId, templateId), { recursive: true, force: true });
   }
   audit(req.auth.tenantId, 'replace_agents', req.auth.sub, 'user', `agents:${req.auth.tenantId}`, { count: saved.length });
-  res.json(saved);
+  res.json(saved.map(normalizeAgentTemplateForApi));
 });
 
 // ═══ Visual Artifacts Routes ═══
@@ -3400,7 +3667,7 @@ app.get('/api/visuals/file', authMiddleware, (req: any, res) => {
     const cid = typeof req.query?.cid === 'string' ? req.query.cid : '';
     const relPath = typeof req.query?.path === 'string' ? req.query.path : '';
     const result = readWorkspaceVisual(req.auth, cid, relPath);
-    res.json({ ...result, title: extractTitle(result.html) });
+    res.json({ ...result, title: extractVisualTitle(result.html, result.format, result.sourceSlug) });
   } catch (error) {
     const err = error as Error & { status?: number };
     res.status(err.status || 500).json({ error: err.message || '读取临时可视化失败' });
@@ -3417,13 +3684,13 @@ app.post('/api/visuals', authMiddleware, (req: any, res) => {
     const explicitTitle = typeof req.body?.title === 'string' && req.body.title.trim()
       ? req.body.title.trim()
       : undefined;
-    const { html, sourceVisualId: sessionSourceVisualId } = readWorkspaceVisual(req.auth, cid, relPath);
+    const { html, format, sourceSlug, sourceVisualId: sessionSourceVisualId } = readWorkspaceVisual(req.auth, cid, relPath);
     const sourceVisualId = requestedSourceVisualId || sessionSourceVisualId || '';
     if (Buffer.byteLength(html) > MAX_VISUAL_BYTES) throw makeHttpError('文件过大', 413);
     const payload = {
-      title: explicitTitle || extractTitle(html),
+      title: explicitTitle || extractVisualTitle(html, format, sourceSlug),
       html,
-      sourceSlug: relPath,
+      sourceSlug,
     };
     const result = sourceVisualId
       ? updateVisual(req.auth.tenantId, getChatOwnerSub(req.auth), sourceVisualId, payload) || createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), payload)
@@ -3446,6 +3713,8 @@ app.get('/api/visuals/:id', authMiddleware, (req: any, res) => {
     id: visual.id,
     title: visual.title,
     html: visual.html,
+    format: visualFormatFromPath(visual.sourceSlug || ''),
+    sourceSlug: visual.sourceSlug,
     createdAt: visual.createdAt,
   });
 });
@@ -4082,8 +4351,12 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
   if (!prompt || typeof prompt !== 'string') { res.status(400).json({ error: 'need prompt' }); return; }
   const tmpl = template || {};
   const storedTemplate = typeof tmpl?.id === 'string' && tmpl.id.trim()
-    ? listAgentTemplates(req.auth.tenantId).map(normalizeAgentTemplateForApi).find((item) => String(item.id || '') === tmpl.id.trim())
+    ? getVisibleAgentTemplate(req.auth, tmpl.id.trim())
     : null;
+  if (typeof tmpl?.id === 'string' && tmpl.id.trim() && !storedTemplate) {
+    res.status(404).json({ error: 'agent not found' });
+    return;
+  }
   const subagents = normalizeSubagents(tmpl?.subagents);
   const knowledgeSourceIds = normalizeStringArray(tmpl?.knowledgeSourceIds) || [];
   const datasourceIds = normalizeStringArray(tmpl?.datasourceIds ?? storedTemplate?.datasourceIds) || [];
@@ -4134,6 +4407,7 @@ app.post('/api/agents/run', authMiddleware, async (req: any, res) => {
     knowledgeSourceIds,
     datasourceIds,
     maxTurns: Number(tmpl?.maxTurns) || 20,
+    effort: (tmpl?.effort as EffortLevel | undefined),
     tenantId: req.auth.tenantId,
     sub: req.auth.sub,
     role: req.auth.role,

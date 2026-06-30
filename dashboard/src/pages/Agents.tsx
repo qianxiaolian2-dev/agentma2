@@ -6,6 +6,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
 import { getAuthHeaders } from '../utils/client-runtime';
 import { listProviderModels, resolveProviderForModel } from '../utils/providers';
+import ModelPicker from '../components/common/ModelPicker';
 
 type KnowledgeSource = {
   id: string;
@@ -13,6 +14,32 @@ type KnowledgeSource = {
   path: string;
   enabled: boolean;
 };
+
+function normalizeInternalTools(items: unknown): RegisteredTool[] {
+  if (!Array.isArray(items)) return [];
+  return items.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const raw = item as Record<string, unknown>;
+    const id = typeof raw.id === 'string' ? raw.id : '';
+    const serverName = typeof raw.serverName === 'string' ? raw.serverName : '';
+    const toolName = typeof raw.toolName === 'string' ? raw.toolName : '';
+    const description = typeof raw.description === 'string' ? raw.description : '';
+    if (!id || !serverName || !toolName || !description) return [];
+    return [{
+      name: id,
+      description,
+      category: typeof raw.category === 'string' ? raw.category : '内部工具',
+      inputSchema: raw.inputSchema && typeof raw.inputSchema === 'object' && !Array.isArray(raw.inputSchema)
+        ? raw.inputSchema as Record<string, unknown>
+        : {},
+      annotations: raw.annotations && typeof raw.annotations === 'object' && !Array.isArray(raw.annotations)
+        ? raw.annotations as RegisteredTool['annotations']
+        : undefined,
+      source: 'internal',
+      mcpServer: serverName,
+    }];
+  });
+}
 
 type ClaudeMdPreviewFile = {
   source: 'user' | 'project' | 'local';
@@ -131,6 +158,10 @@ function cloneTemplate(source: AgentTemplate, templates: AgentTemplate[]): Agent
     ...cloned,
     id: getCloneTemplateId(templates, now),
     name: getCloneTemplateName(source.name, templates),
+    createdBy: undefined,
+    publishedAt: null,
+    archivedAt: null,
+    deletedAt: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -147,130 +178,12 @@ const TOOL_CATEGORIES = [
 ];
 const KNOWLEDGE_TOOLS = ['Read', 'Grep', 'Glob'];
 
-type ModelPickerProps = {
-  value: string;
-  models: string[];
-  onChange: (value: string) => void;
-  allowEmpty?: boolean;
-  placeholder?: string;
-};
+function userAgentActor(user: { email?: string; id?: string } | null) {
+  return user?.email || user?.id || '';
+}
 
-function ModelPicker({ value, models, onChange, allowEmpty = false, placeholder = '选择模型' }: ModelPickerProps) {
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const normalizedQuery = query.trim().toLowerCase();
-  const filteredModels = models.filter(model => model.toLowerCase().includes(normalizedQuery));
-  const displayValue = open ? query : value;
-  const disabled = models.length === 0 && !allowEmpty;
-
-  const choose = (model: string) => {
-    onChange(model);
-    setQuery('');
-    setOpen(false);
-  };
-
-  return (
-    <div style={{ position: 'relative' }}>
-      <input
-        value={displayValue}
-        onFocus={() => {
-          setOpen(true);
-          setQuery('');
-        }}
-        onChange={event => {
-          setQuery(event.target.value);
-          setOpen(true);
-        }}
-        onBlur={() => window.setTimeout(() => setOpen(false), 120)}
-        onKeyDown={event => {
-          if (event.key === 'Enter' && open) {
-            event.preventDefault();
-            const first = filteredModels[0] || (allowEmpty && !query.trim() ? '' : undefined);
-            if (first !== undefined) choose(first);
-          }
-          if (event.key === 'Escape') setOpen(false);
-        }}
-        placeholder={models.length ? placeholder : '先到账户管理配置可用模型'}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        disabled={disabled}
-        style={{ fontFamily: 'var(--font-mono)', paddingRight: 34 }}
-      />
-      <button
-        type="button"
-        className="btn btn-sm"
-        onMouseDown={event => event.preventDefault()}
-        onClick={() => {
-          if (!disabled) {
-            setOpen(current => !current);
-            setQuery('');
-          }
-        }}
-        disabled={disabled}
-        aria-label="展开模型列表"
-        style={{ position: 'absolute', right: 5, top: 5, width: 26, height: 26, padding: 0 }}
-      >
-        ▾
-      </button>
-      {open && !disabled && (
-        <div
-          role="listbox"
-          style={{
-            position: 'absolute',
-            zIndex: 120,
-            top: 'calc(100% + 4px)',
-            left: 0,
-            right: 0,
-            maxHeight: 220,
-            overflowY: 'auto',
-            border: '1px solid var(--border)',
-            borderRadius: 6,
-            background: 'var(--bg-card)',
-            boxShadow: '0 12px 32px rgba(0, 0, 0, .18)',
-          }}
-        >
-          {allowEmpty && !normalizedQuery && (
-            <button
-              type="button"
-              role="option"
-              className="btn btn-sm"
-              onMouseDown={event => event.preventDefault()}
-              onClick={() => choose('')}
-              style={{ width: '100%', justifyContent: 'flex-start', border: 0, borderRadius: 0 }}
-            >
-              继承主模型
-            </button>
-          )}
-          {filteredModels.map(model => (
-            <button
-              type="button"
-              role="option"
-              aria-selected={model === value}
-              key={model}
-              className="btn btn-sm"
-              onMouseDown={event => event.preventDefault()}
-              onClick={() => choose(model)}
-              style={{
-                width: '100%',
-                justifyContent: 'flex-start',
-                border: 0,
-                borderRadius: 0,
-                fontFamily: 'var(--font-mono)',
-                background: model === value ? 'var(--accent-bg)' : 'transparent',
-              }}
-            >
-              {model}
-            </button>
-          ))}
-          {filteredModels.length === 0 && (
-            <div style={{ padding: '8px 10px', color: 'var(--ink-muted)', fontSize: '.78em' }}>
-              没有匹配的可用模型
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
+function isPublishedAgent(template: AgentTemplate) {
+  return Boolean(template.publishedAt) && !template.archivedAt && !template.deletedAt;
 }
 
 export default function Agents() {
@@ -303,6 +216,15 @@ export default function Agents() {
   const selectedModel = form.model.trim();
   const selectedModelAvailable = selectedModel ? availableModelSet.has(selectedModel) : false;
   const providerMatch = selectedModelAvailable ? resolveProviderForModel(selectedModel) : null;
+  const visualModel = (form.visualPreprocessModel || '').trim();
+  const visualModelAvailable = visualModel ? availableModelSet.has(visualModel) : false;
+  const visualProviderMatch = visualModelAvailable ? resolveProviderForModel(visualModel) : null;
+  const actor = userAgentActor(user || null);
+  const canManageTemplate = (template: AgentTemplate) => user?.role === 'tenant_admin' || Boolean(actor && template.createdBy === actor);
+  const publicTemplates = templates.filter(template => isPublishedAgent(template));
+  const mineTemplates = templates.filter(template => canManageTemplate(template));
+  const visibleTemplateIds = new Set([...publicTemplates, ...mineTemplates].map(template => template.id));
+  const hiddenTemplateCount = templates.length - visibleTemplateIds.size;
 
   useEffect(() => {
     fetch('/api/events/sources', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'list' }) })
@@ -317,6 +239,7 @@ export default function Agents() {
       .catch(() => setLiveKnowledgeSources([]));
   }, [user?.tenantId]);
   const [liveCustomTools, setLiveCustomTools] = useState<RegisteredTool[]>(() => initCustomTools());
+  const [liveInternalTools, setLiveInternalTools] = useState<RegisteredTool[]>([]);
   const subagentEntries = Object.entries(form.subagents || {});
 
   useEffect(() => {
@@ -355,6 +278,16 @@ export default function Agents() {
     window.addEventListener('storage', onStorage);
     return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('storage', onStorage); };
   }, []);
+
+  useEffect(() => {
+    if (!user?.tenantId) return;
+    let cancelled = false;
+    fetch('/api/internal-tools', { headers: getAuthHeaders() })
+      .then(response => response.ok ? response.json() : [])
+      .then(data => { if (!cancelled) setLiveInternalTools(normalizeInternalTools(data)); })
+      .catch(() => { if (!cancelled) setLiveInternalTools([]); });
+    return () => { cancelled = true; };
+  }, [user?.tenantId]);
 
   useEffect(() => {
     if (!user?.tenantId) return;
@@ -470,6 +403,14 @@ export default function Agents() {
       setError(`子代理 ${crossProviderSubagent[0]} 的模型属于另一个供应商；同一次 SDK 运行只能使用一个供应商`);
       return;
     }
+    if (form.visualPreprocessDefault && !visualModel) {
+      setError('默认开启视觉预处理时必须选择视觉识别模型');
+      return;
+    }
+    if (visualModel && !availableModelSet.has(visualModel)) {
+      setError('视觉识别模型不在供应商可用模型中');
+      return;
+    }
     const now = Date.now();
     const selectedKnowledgeIds = (form.knowledgeSourceIds || []).filter(Boolean);
     const selectedSkills = form.skills || [];
@@ -482,8 +423,14 @@ export default function Agents() {
       id: form.id || `agent-${now}`,
       name: form.name.trim(),
       model: selectedModel,
+      createdBy: form.createdBy || actor || null,
+      publishedAt: form.publishedAt || null,
+      archivedAt: form.archivedAt || null,
+      deletedAt: form.deletedAt || null,
       knowledgeSourceIds: selectedKnowledgeIds,
       useKnowledge: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge || undefined,
+      visualPreprocessDefault: form.visualPreprocessDefault === true ? true : undefined,
+      visualPreprocessModel: visualModel || undefined,
       providerOverrides: undefined,
       tools: selectedKnowledgeIds.length > 0 || hasLegacyAllKnowledge
         ? Array.from(new Set([...effectiveTools, ...KNOWLEDGE_TOOLS]))
@@ -509,8 +456,58 @@ export default function Agents() {
     }
   };
 
+  const handlePublish = async (source: AgentTemplate) => {
+    if (!user?.tenantId || !canManageTemplate(source)) return;
+    const published: AgentTemplate = {
+      ...source,
+      createdBy: source.createdBy || actor || null,
+      publishedAt: Date.now(),
+      archivedAt: null,
+      deletedAt: null,
+      updatedAt: Date.now(),
+    };
+    const nextTemplates = templates.map(template => template.id === source.id ? published : template);
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      setTemplates(persisted);
+      setForm(current => current.id === source.id ? (persisted.find(template => template.id === source.id) || published) : current);
+      setError('');
+    } catch (saveError) {
+      setError((saveError as Error).message || '发布 Agent 失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleUnpublish = async (source: AgentTemplate) => {
+    if (!user?.tenantId || !canManageTemplate(source)) return;
+    const unpublished: AgentTemplate = {
+      ...source,
+      publishedAt: null,
+      updatedAt: Date.now(),
+    };
+    const nextTemplates = templates.map(template => template.id === source.id ? unpublished : template);
+    setIsSaving(true);
+    try {
+      const persisted = await replaceAgentTemplates(user.tenantId, nextTemplates);
+      setTemplates(persisted);
+      setForm(current => current.id === source.id ? (persisted.find(template => template.id === source.id) || unpublished) : current);
+      setError('');
+    } catch (saveError) {
+      setError((saveError as Error).message || '撤回 Agent 失败');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   const handleDelete = async (id: string) => {
     if (!user?.tenantId) return;
+    const target = templates.find(template => template.id === id);
+    if (target && !canManageTemplate(target)) {
+      setError('只能删除自己创建的 Agent');
+      return;
+    }
     const nextTemplates = templates.filter(t => t.id !== id);
     setIsSaving(true);
     try {
@@ -704,6 +701,114 @@ export default function Agents() {
     return `${Math.round((bytes || 0) / 1024)} KB`;
   };
 
+  const renderTemplateCard = (t: AgentTemplate, scope: 'public' | 'mine') => {
+    const manageable = canManageTemplate(t);
+    const published = isPublishedAgent(t);
+    const ownerLabel = t.createdBy
+      ? (t.createdBy === actor ? '你创建' : `创建人 ${t.createdBy}`)
+      : '创建人未知';
+    return (
+      <div
+        key={`${scope}-${t.id}`}
+        className={`agent-card ${form.id === t.id ? 'selected' : ''}`}
+        onClick={() => manageable ? handleSelect(t) : undefined}
+        style={{ cursor: manageable ? 'pointer' : 'default' }}
+      >
+        <div className="agent-card-head">
+          <div style={{ minWidth: 0 }}>
+            <div className="agent-card-name">{t.name}</div>
+            <div className="agent-card-owner">{ownerLabel}</div>
+          </div>
+          <div className="agent-card-actions">
+            <span className="agent-card-date">
+              {new Date(t.updatedAt).toLocaleDateString()}
+            </span>
+            <button
+              type="button"
+              className="btn btn-sm agent-card-preview-btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                void openClaudeMdPreview(t);
+              }}
+              disabled={isSaving || !t.id}
+              title={`预览 ${t.name} 运行时生效的 CLAUDE.md`}
+            >
+              CLAUDE.md
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm agent-card-clone-btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                void handleClone(t);
+              }}
+              disabled={isSaving || !t.id}
+              title={`克隆 ${t.name} 为新 Agent 模板`}
+            >
+              克隆
+            </button>
+            {manageable && (
+              <>
+                {published ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleUnpublish(t);
+                    }}
+                    disabled={isSaving || !t.id}
+                  >
+                    撤回
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-primary"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handlePublish(t);
+                    }}
+                    disabled={isSaving || !t.id}
+                  >
+                    发布
+                  </button>
+                )}
+              </>
+            )}
+            <button
+              type="button"
+              className="btn btn-sm btn-primary agent-card-chat-btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                startChat(t.id);
+              }}
+              disabled={isSaving || !t.id}
+              title={`和 ${t.name} 开始对话`}
+            >
+              开始对话
+            </button>
+          </div>
+        </div>
+        <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
+        <div className="agent-card-tags">
+          <span className="badge badge-muted">{t.model}</span>
+          <span className={`badge ${published ? 'badge-success' : 'badge-muted'}`}>{published ? '公共' : '个人'}</span>
+          {manageable ? <span className="badge badge-info">可编辑</span> : <span className="badge badge-muted">只读</span>}
+          {t.seedDir && <span className="badge badge-warning">本地项目 seed</span>}
+          {t.visualPreprocessDefault && <span className="badge badge-info">视觉预处理</span>}
+          {((t.knowledgeSourceIds || []).length > 0 || t.useKnowledge) && (
+            <span className="badge badge-success">
+              知识库×{(t.knowledgeSourceIds || []).length || liveKnowledgeSources.filter(source => source.enabled).length || '全部'}
+            </span>
+          )}
+          {t.tools.slice(0, 3).map(tool => <span key={tool} className="badge badge-info">{tool}</span>)}
+          {t.tools.length > 3 && <span className="badge badge-muted">+{t.tools.length - 3}</span>}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div>
       <div className="page-header">
@@ -751,71 +856,45 @@ export default function Agents() {
               暂无 Agent，点击上方按钮创建
             </div>
           ) : (
-            <div className="agents-list-grid">
-              {templates.map(t => (
-                <div
-                  key={t.id}
-                  className={`agent-card ${form.id === t.id ? 'selected' : ''}`}
-                  onClick={() => handleSelect(t)}
-                >
-                  <div className="agent-card-head">
-                    <div className="agent-card-name">{t.name}</div>
-                    <div className="agent-card-actions">
-                      <span className="agent-card-date">
-                        {new Date(t.updatedAt).toLocaleDateString()}
-                      </span>
-                      <button
-                        type="button"
-                        className="btn btn-sm agent-card-preview-btn"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void openClaudeMdPreview(t);
-                        }}
-                        disabled={isSaving || !t.id}
-                        title={`预览 ${t.name} 运行时生效的 CLAUDE.md`}
-                      >
-                        CLAUDE.md
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm agent-card-clone-btn"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void handleClone(t);
-                        }}
-                        disabled={isSaving || !t.id}
-                        title={`克隆 ${t.name} 为新 Agent 模板`}
-                      >
-                        克隆
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-primary agent-card-chat-btn"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          startChat(t.id);
-                        }}
-                        disabled={isSaving || !t.id}
-                        title={`和 ${t.name} 开始对话`}
-                      >
-                        开始对话
-                      </button>
-                    </div>
-                  </div>
-                  <div className="agent-card-desc">{t.description || t.systemPrompt.slice(0, 80)}</div>
-                  <div className="agent-card-tags">
-                    <span className="badge badge-muted">{t.model}</span>
-                    {t.seedDir && <span className="badge badge-warning">本地项目 seed</span>}
-                    {((t.knowledgeSourceIds || []).length > 0 || t.useKnowledge) && (
-                      <span className="badge badge-success">
-                        知识库×{(t.knowledgeSourceIds || []).length || liveKnowledgeSources.filter(source => source.enabled).length || '全部'}
-                      </span>
-                    )}
-                    {t.tools.slice(0, 3).map(tool => <span key={tool} className="badge badge-info">{tool}</span>)}
-                    {t.tools.length > 3 && <span className="badge badge-muted">+{t.tools.length - 3}</span>}
+            <div className="agents-market-sections">
+              <section className="agents-market-section">
+                <div className="agents-section-head">
+                  <div>
+                    <div className="card-header" style={{ marginBottom: 3 }}>公共 Agent</div>
+                    <div className="tool-card-desc">已发布 {publicTemplates.length} 个，租户内成员都可以看到并使用。</div>
                   </div>
                 </div>
-              ))}
+                {publicTemplates.length === 0 ? (
+                  <div className="agents-empty-panel">
+                    还没有公共 Agent。可以从“我的 Agent”发布一个。
+                  </div>
+                ) : (
+                  <div className="agents-list-grid">
+                    {publicTemplates.map(template => renderTemplateCard(template, 'public'))}
+                  </div>
+                )}
+              </section>
+
+              <section className="agents-market-section">
+                <div className="agents-section-head">
+                  <div>
+                    <div className="card-header" style={{ marginBottom: 3 }}>我的 Agent</div>
+                    <div className="tool-card-desc">
+                      已拥有 {mineTemplates.length} 个。未发布的 Agent 只有创建人可见；发布后会出现在公共 Agent 中。
+                      {hiddenTemplateCount > 0 ? ` 另有 ${hiddenTemplateCount} 个不可编辑的公共项仅显示在上方。` : ''}
+                    </div>
+                  </div>
+                </div>
+                {mineTemplates.length === 0 ? (
+                  <div className="agents-empty-panel">
+                    暂无个人 Agent，点击上方按钮创建或克隆公共 Agent。
+                  </div>
+                ) : (
+                  <div className="agents-list-grid">
+                    {mineTemplates.map(template => renderTemplateCard(template, 'mine'))}
+                  </div>
+                )}
+              </section>
             </div>
           )}
         </div>
@@ -1110,6 +1189,37 @@ export default function Agents() {
               </div>
             </div>
 
+            <div className="grid-2">
+              <div className="form-group">
+                <label className="flex gap-2" style={{ alignItems: 'center' }}>
+                  视觉识别模型
+                  {visualModel
+                    ? visualModelAvailable && visualProviderMatch
+                      ? <span className="badge badge-muted">{visualProviderMatch.profile.name}</span>
+                      : <span className="badge badge-warning">不可用</span>
+                    : <span className="badge badge-muted">未配置</span>}
+                </label>
+                <ModelPicker
+                  value={form.visualPreprocessModel || ''}
+                  models={modelSuggestions}
+                  onChange={model => setForm({ ...form, visualPreprocessModel: model || undefined })}
+                  placeholder="选择视觉模型"
+                />
+              </div>
+              <div className="form-group">
+                <label>视觉预处理</label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 38 }}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(form.visualPreprocessDefault)}
+                    onChange={e => setForm({ ...form, visualPreprocessDefault: e.target.checked || undefined })}
+                    style={{ width: 'auto' }}
+                  />
+                  <span style={{ fontSize: '.85em' }}>新会话默认开启</span>
+                </label>
+              </div>
+            </div>
+
             {/* 结构化输出 */}
             <details>
               <summary style={{ cursor: 'pointer', fontSize: '.82em', color: 'var(--ink-secondary)', marginBottom: 8 }}>
@@ -1265,6 +1375,37 @@ export default function Agents() {
                           />
                           {tool.name}
                           {tool.endpoint && <span style={{ fontSize: '.8em', opacity: .6 }}>🔗</span>}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {liveInternalTools.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: '.72em', fontWeight: 600, color: 'var(--info)', marginBottom: 4, textTransform: 'uppercase' }}>
+                      内部 · <a href="/tools" style={{ color: 'var(--accent)', fontWeight: 400, textTransform: 'none' }}>查看</a>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {liveInternalTools.map(tool => (
+                        <label
+                          key={tool.name}
+                          style={{
+                            display: 'inline-flex', alignItems: 'center', gap: 4,
+                            padding: '3px 8px', borderRadius: 4,
+                            fontSize: '.76em', cursor: 'pointer',
+                            background: form.tools.includes(tool.name) ? 'var(--accent-bg)' : 'var(--bg-hover)',
+                            color: form.tools.includes(tool.name) ? 'var(--accent)' : 'var(--ink-secondary)',
+                            border: `1px solid ${form.tools.includes(tool.name) ? 'var(--accent)' : 'transparent'}`,
+                          }}
+                          title={tool.description}
+                        >
+                          <input
+                            type="checkbox" checked={form.tools.includes(tool.name)}
+                            onChange={() => toggleTool(tool.name)}
+                            style={{ width: 'auto', margin: 0 }}
+                          />
+                          {tool.name}
+                          <span style={{ fontSize: '.8em', opacity: .6 }}>MCP</span>
                         </label>
                       ))}
                     </div>

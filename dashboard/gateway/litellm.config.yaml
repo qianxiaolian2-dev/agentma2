@@ -1,0 +1,32 @@
+# Anthropic Messages → OpenAI Chat 翻译网关（LiteLLM Proxy）
+#
+# 作用：dashboard 的 Claude Agent SDK 发 Anthropic /v1/messages → 本网关翻译成
+#       OpenAI Chat Completions → 调上游（这里是 aicodemirror 的 codex OpenAI 接口）。
+#       无需改运行时，只把 provider profile 的 ANTHROPIC_BASE_URL 指到本网关即可。
+#
+# 上游已验证可用：
+#   POST https://api.aicodemirror.com/api/codex/v1/chat/completions  (model=gpt-5.5) → 正常
+#
+# 启动（zero-install）：
+#   export AICODEMIRROR_TOKEN="sk-ant-...你的 aicodemirror token"
+#   uvx litellm --config dashboard/gateway/litellm.config.yaml --port 4000
+#
+# dashboard provider profile 改成：
+#   ANTHROPIC_BASE_URL  = http://127.0.0.1:4000
+#   ANTHROPIC_AUTH_TOKEN = <下方 master_key 的值；不设 master_key 则填任意非空>
+#   可用模型             = gpt-5.5
+
+model_list:
+  - model_name: gpt-5.5            # 必须与 provider profile 的「可用模型」一致
+    litellm_params:
+      model: openai/gpt-5.5        # openai/ 前缀 = 走 Chat Completions
+      api_base: https://api.aicodemirror.com/api/codex/v1
+      api_key: os.environ/AICODEMIRROR_TOKEN
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  # 入站鉴权：dashboard 必须带此 key 才能用网关。值由 run-gateway.sh 从
+  # gateway/master-key（600，gitignored）注入；同值存在 profile 的 ANTHROPIC_AUTH_TOKEN。
+  master_key: os.environ/LITELLM_MASTER_KEY

@@ -1,5 +1,6 @@
 import type { ProviderConfig, ProviderProfile } from '../simulator/types';
 import { getAuthHeaders } from './client-runtime';
+import { normalizeProviderModelContextWindows } from './model-context';
 import { getDefaultProviderConfig } from '../simulator/mock-data';
 
 export const LS_PROVIDER = 'agentma_provider_config';
@@ -32,7 +33,9 @@ function legacyProviderConfig(): ProviderConfig {
   try {
     const raw = localStorage.getItem(LS_PROVIDER);
     if (raw) return normalizeProviderConfig(JSON.parse(raw));
-  } catch {}
+  } catch {
+    // Ignore invalid legacy provider config and fall back to defaults.
+  }
   return getDefaultProviderConfig();
 }
 
@@ -100,6 +103,10 @@ function mergeProviderProfile(left: ProviderProfile, right: ProviderProfile) {
     ANTHROPIC_AUTH_TOKEN: trimString(right.ANTHROPIC_AUTH_TOKEN) || trimString(left.ANTHROPIC_AUTH_TOKEN),
     ANTHROPIC_BASE_URL: trimString(right.ANTHROPIC_BASE_URL) || trimString(left.ANTHROPIC_BASE_URL),
     availableModels: mergeModels(left.availableModels, right.availableModels),
+    modelContextWindows: {
+      ...normalizeProviderModelContextWindows(left),
+      ...normalizeProviderModelContextWindows(right),
+    },
     enabled: right.enabled !== false,
     isDefault: right.isDefault === true,
     createdAt: Math.min(Number(left.createdAt || Date.now()), Number(right.createdAt || Date.now())),
@@ -122,6 +129,7 @@ export function createProviderProfile(seed?: Partial<ProviderProfile>): Provider
     id: trimString(seed?.id) || `provider-${now}`,
     name: trimString(seed?.name) || '默认供应商',
     availableModels: normalizeAvailableModels(seed),
+    modelContextWindows: normalizeProviderModelContextWindows(seed),
     enabled: seed?.enabled !== false,
     isDefault: seed?.isDefault === true,
     createdAt: Number(seed?.createdAt || now),
@@ -157,7 +165,9 @@ export function loadProviderProfiles(): ProviderProfile[] {
       const profiles = normalizeProviderProfiles(JSON.parse(raw));
       if (profiles.length) return profiles;
     }
-  } catch {}
+  } catch {
+    // Ignore invalid provider profiles and fall back to the legacy profile.
+  }
   return [defaultProfileFromLegacy()];
 }
 
@@ -176,7 +186,7 @@ export function saveProviderProfiles(profiles: ProviderProfile[]): ProviderProfi
   return next;
 }
 
-export function mergeProviderProfiles(existing: ProviderProfile[], incoming: ProviderProfile[]): ProviderProfile[] {
+export function mergeProviderProfiles(existing: ProviderProfile[], incoming: Array<Partial<ProviderProfile>>): ProviderProfile[] {
   const merged = normalizeProviderProfiles(existing);
   for (const profile of normalizeProviderProfiles(incoming)) {
     const index = merged.findIndex(current => sameProviderIdentity(current, profile));
@@ -230,14 +240,27 @@ export function listProviderModels() {
   return Array.from(values);
 }
 
-export async function fetchProviderModels(): Promise<string[]> {
-  const response = await fetch('/api/provider-models', { headers: getAuthHeaders() });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const data = await response.json().catch(() => []);
-  if (!Array.isArray(data)) return [];
-  return Array.from(new Set(data.flatMap((item) => {
+function normalizeProviderModelList(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value.flatMap((item) => {
     if (typeof item !== 'string') return [];
     const model = item.trim();
     return model && !model.includes('*') ? [model] : [];
   })));
+}
+
+export async function fetchProviderModels(): Promise<string[]> {
+  const response = await fetch('/api/provider-models', { headers: getAuthHeaders() });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json().catch(() => []);
+  if (Array.isArray(data)) return normalizeProviderModelList(data);
+
+  if (!data || typeof data !== 'object') return [];
+  const payload = data as { models?: unknown; profiles?: unknown };
+  if (Array.isArray(payload.profiles)) {
+    const merged = mergeProviderProfiles(loadProviderProfiles(), payload.profiles as Partial<ProviderProfile>[]);
+    saveProviderProfiles(merged);
+  }
+  const models = normalizeProviderModelList(payload.models);
+  return models.length ? models : listProviderModels();
 }

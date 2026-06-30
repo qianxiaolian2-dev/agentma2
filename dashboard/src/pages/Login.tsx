@@ -2,6 +2,8 @@ import type { FormEvent } from 'react';
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import AgentMaMark from '../components/AgentMaMark';
+import CosmicBackground from '../components/CosmicBackground';
+import { useTilt } from '../hooks/useTilt';
 import { useAuth } from '../contexts/AuthContext';
 
 export default function Login() {
@@ -14,6 +16,7 @@ export default function Login() {
   const [name, setName] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const cardRef = useTilt<HTMLDivElement>(10);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -26,7 +29,8 @@ export default function Login() {
   };
 
   return (
-    <div className="login-page">
+    <div className="login-page cosmic-route">
+      <CosmicBackground variant="login" fill="fixed" hero />
       <div className="login-shell">
         <div className="login-brand">
           <AgentMaMark className="login-mark" />
@@ -36,7 +40,7 @@ export default function Login() {
           </div>
         </div>
 
-        <div className="login-card">
+        <div className="login-card" ref={cardRef}>
           <form onSubmit={handleSubmit}>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               {isRegister && (

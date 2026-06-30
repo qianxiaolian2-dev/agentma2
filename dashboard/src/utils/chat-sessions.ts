@@ -1,6 +1,7 @@
 import type { ChatAttachment, ChatImageAttachment, ChatMessage, ChatSession } from '../simulator/types';
 import { getAuthHeaders } from './client-runtime';
 import { normalizeChatMessageStatus, normalizeMessageOutcome, outcomeToMessageStatus } from '../simulator/run-state';
+import { normalizeChatRunStats } from './chat-run-stats';
 
 const LEGACY_SESSION_KEY = 'agentma_chat_sessions';
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
@@ -82,6 +83,7 @@ function normalizeMessage(message: unknown): ChatMessage | null {
   const thinking = typeof raw.thinking === 'string' && raw.thinking ? raw.thinking : undefined;
   const outcomeDetail = typeof raw.outcomeDetail === 'string' && raw.outcomeDetail ? raw.outcomeDetail : undefined;
   const runId = typeof raw.runId === 'string' && raw.runId ? raw.runId : undefined;
+  const runStats = normalizeChatRunStats(raw.runStats);
   return {
     ...(id ? { id } : {}),
     role: role as ChatMessage['role'],
@@ -91,6 +93,7 @@ function normalizeMessage(message: unknown): ChatMessage | null {
     ...(outcome ? { outcome } : {}),
     ...(outcomeDetail ? { outcomeDetail } : {}),
     ...(runId ? { runId } : {}),
+    ...(runStats ? { runStats } : {}),
     ...(attachments.length ? { attachments } : {}),
     timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
   };
@@ -106,6 +109,7 @@ function normalizeSession(session: unknown): ChatSession | null {
   const sdkSessionId = String((session as { sdkSessionId?: unknown }).sdkSessionId || '');
   const sdkCwd = String((session as { sdkCwd?: unknown }).sdkCwd || '');
   const sourceVisualId = String((session as { sourceVisualId?: unknown }).sourceVisualId || '');
+  const visualPreprocessModel = String((session as { visualPreprocessModel?: unknown }).visualPreprocessModel || '');
   const forkedFromSessionId = String((session as { forkedFromSessionId?: unknown }).forkedFromSessionId || '');
   const forkedFromTitle = String((session as { forkedFromTitle?: unknown }).forkedFromTitle || '');
   const collaborationRole = String((session as { collaborationRole?: unknown }).collaborationRole || '');
@@ -132,6 +136,8 @@ function normalizeSession(session: unknown): ChatSession | null {
     sdkSessionId: sdkSessionId || undefined,
     sdkCwd: sdkCwd || undefined,
     sourceVisualId: sourceVisualId || undefined,
+    visualPreprocessEnabled: Boolean((session as { visualPreprocessEnabled?: unknown }).visualPreprocessEnabled),
+    visualPreprocessModel: visualPreprocessModel || undefined,
     forkedFromSessionId: forkedFromSessionId || undefined,
     forkedFromTitle: forkedFromTitle || undefined,
     pinned: Boolean((session as { pinned?: unknown }).pinned),
@@ -221,7 +227,7 @@ export async function saveChatSession(session: ChatSession): Promise<ChatSession
 
 export async function patchChatSession(
   sessionId: string,
-  patch: Partial<Pick<ChatSession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'sourceVisualId'>>,
+  patch: Partial<Pick<ChatSession, 'title' | 'pinned' | 'templateId' | 'model' | 'sdkSessionId' | 'sdkCwd' | 'sourceVisualId' | 'visualPreprocessEnabled' | 'visualPreprocessModel'>>,
 ): Promise<ChatSession> {
   const res = await fetch(`/api/chat-sessions/${encodeURIComponent(sessionId)}`, {
     method: 'PATCH',

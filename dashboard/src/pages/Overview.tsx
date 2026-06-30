@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom';
 import { MODELS, BUILT_IN_TOOLS, HOOK_EVENTS } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import AgentMaMark from '../components/AgentMaMark';
-import LineIcon from '../components/LineIcon';
+import CosmicBackground from '../components/CosmicBackground';
+import CapabilityUniverse from '../components/CapabilityUniverse';
 import type { LineIconName } from '../components/LineIcon';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates } from '../utils/agent-templates';
 import type { AgentTemplate } from '../simulator/types';
@@ -46,7 +47,9 @@ export default function Overview() {
   }, [token]);
 
   return (
-    <div>
+    <div className="cosmic-route cosmic-overview">
+      <CosmicBackground variant="overview" fill="absolute" />
+      <div className="cosmic-content">
       <div className="page-header">
         <h1 className="overview-title">
           <AgentMaMark className="overview-title-mark" />
@@ -79,21 +82,9 @@ export default function Overview() {
         </div>
       </div>
 
-      {/* 模块导航 */}
-      <div className="section-title">功能模块</div>
-      <div className="grid-3 mb-4">
-        {SECTIONS.map(s => (
-          <Link key={s.path} to={s.path} style={{ textDecoration: 'none' }}>
-            <div className="tool-card" style={{ borderTop: `3px solid ${s.color}` }}>
-              <div className="overview-module-icon" style={{ color: s.color }}>
-                <LineIcon name={s.icon} />
-              </div>
-              <div className="tool-card-name" style={{ color: s.color }}>{s.title}</div>
-              <div className="tool-card-desc">{s.desc}</div>
-            </div>
-          </Link>
-        ))}
-      </div>
+      {/* 功能宇宙 — 每个能力是一颗行星 */}
+      <div className="section-title">功能宇宙</div>
+      <CapabilityUniverse sections={SECTIONS} />
 
       {/* SDK 架构概览 */}
       <div className="section">
@@ -165,6 +156,7 @@ export default function Overview() {
             ))
           )}
         </div>
+      </div>
       </div>
     </div>
   );

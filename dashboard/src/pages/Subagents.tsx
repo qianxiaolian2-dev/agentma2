@@ -3,6 +3,8 @@ import type { AgentDefinition, AgentTemplate, EffortLevel, PermissionMode } from
 import { EFFORT_LEVELS, PERMISSION_MODES } from '../simulator/mock-data';
 import { useAuth } from '../contexts/AuthContext';
 import { bootstrapAgentTemplates, loadCachedAgentTemplates, replaceAgentTemplates } from '../utils/agent-templates';
+import { listProviderModels, resolveProviderForModel } from '../utils/providers';
+import ModelPicker from '../components/common/ModelPicker';
 import StatusBadge from '../components/common/StatusBadge';
 import JsonViewer from '../components/common/JsonViewer';
 
@@ -46,6 +48,14 @@ function fromForm(form: SubagentForm): AgentDefinition {
   };
 }
 
+function userAgentActor(user: { email?: string; id?: string } | null) {
+  return user?.email || user?.id || '';
+}
+
+function canManageTemplate(user: { email?: string; id?: string; role?: string } | null, template: AgentTemplate) {
+  return user?.role === 'tenant_admin' || Boolean(userAgentActor(user) && template.createdBy === userAgentActor(user));
+}
+
 export default function Subagents() {
   const { user } = useAuth();
   const [templates, setTemplates] = useState<AgentTemplate[]>(() => loadCachedAgentTemplates(user?.tenantId));
@@ -54,6 +64,8 @@ export default function Subagents() {
   const [form, setForm] = useState<SubagentForm>(newSubagentForm());
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
+  const modelSuggestions = listProviderModels();
+  const availableModelSet = new Set(modelSuggestions);
 
   useEffect(() => {
     if (!user?.tenantId) return;
@@ -69,17 +81,31 @@ export default function Subagents() {
     return () => { cancelled = true; };
   }, [user?.tenantId, user?.role]);
 
-  useEffect(() => {
-    if (selectedTemplateId || templates.length === 0) return;
-    setSelectedTemplateId(templates[0].id);
-  }, [templates, selectedTemplateId]);
+  const editableTemplates = useMemo(
+    () => templates.filter((template) => canManageTemplate(user || null, template)),
+    [templates, user],
+  );
+  const activeTemplateId = selectedTemplateId && editableTemplates.some((template) => template.id === selectedTemplateId)
+    ? selectedTemplateId
+    : editableTemplates[0]?.id || '';
 
   const selectedTemplate = useMemo(
-    () => templates.find((template) => template.id === selectedTemplateId) || null,
-    [templates, selectedTemplateId],
+    () => editableTemplates.find((template) => template.id === activeTemplateId) || null,
+    [editableTemplates, activeTemplateId],
   );
 
   const subagentEntries = Object.entries(selectedTemplate?.subagents || {});
+  const selectedSubagentModel = form.model?.trim() || '';
+  const selectedTemplateModel = selectedTemplate?.model?.trim() || '';
+  const selectedSubagentModelAvailable = selectedSubagentModel ? availableModelSet.has(selectedSubagentModel) : false;
+  const subagentProviderMatch = selectedSubagentModelAvailable ? resolveProviderForModel(selectedSubagentModel) : null;
+  const templateProviderMatch = selectedTemplateModel ? resolveProviderForModel(selectedTemplateModel) : null;
+  const crossProviderModel = Boolean(
+    selectedSubagentModel
+    && subagentProviderMatch
+    && templateProviderMatch
+    && subagentProviderMatch.profile.id !== templateProviderMatch.profile.id,
+  );
 
   const handleSelectSubagent = (name: string, agent: AgentDefinition) => {
     setSelectedAgentName(name);
@@ -93,6 +119,14 @@ export default function Subagents() {
 
   const saveSubagent = async () => {
     if (!user?.tenantId || !selectedTemplate || !form.name.trim() || !form.description.trim() || !form.prompt.trim()) return;
+    if (selectedSubagentModel && !selectedSubagentModelAvailable) {
+      setError('请选择供应商中已配置的可用模型，或留空继承主模型');
+      return;
+    }
+    if (crossProviderModel) {
+      setError('子代理模型属于另一个供应商；同一次 SDK 运行只能使用一个供应商');
+      return;
+    }
     const name = form.name.trim();
     const agent = fromForm(form);
     const nextTemplates = templates.map((template) => {
@@ -160,10 +194,15 @@ export default function Subagents() {
           <div className="card">
             <div className="form-group">
               <label>Agent 模板</label>
-              <select value={selectedTemplateId} onChange={e => { setSelectedTemplateId(e.target.value); handleNewSubagent(); }}>
-                {templates.length === 0 && <option value="">暂无 Agent 模板</option>}
-                {templates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}
+              <select value={activeTemplateId} onChange={e => { setSelectedTemplateId(e.target.value); handleNewSubagent(); }}>
+                {editableTemplates.length === 0 && <option value="">暂无可编辑 Agent 模板</option>}
+                {editableTemplates.map(template => <option key={template.id} value={template.id}>{template.name}</option>)}
               </select>
+              {templates.length > editableTemplates.length && (
+                <div style={{ marginTop: 6, color: 'var(--ink-muted)', fontSize: '.74em' }}>
+                  公共 Agent 只能克隆或对话，不能在这里直接编辑子代理。
+                </div>
+              )}
             </div>
 
             <div className="flex-between" style={{ marginBottom: 12 }}>
@@ -222,8 +261,25 @@ export default function Subagents() {
                 <input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="code-reviewer" style={{ fontFamily: 'var(--font-mono)' }} />
               </div>
               <div className="form-group">
-                <label>模型覆盖</label>
-                <input value={form.model || ''} onChange={e => setForm({ ...form, model: e.target.value })} placeholder="留空继承主模型" style={{ fontFamily: 'var(--font-mono)' }} />
+                <label className="flex gap-2" style={{ alignItems: 'center' }}>
+                  模型覆盖
+                  {selectedSubagentModel
+                    ? (
+                        crossProviderModel
+                          ? <span className="badge badge-warning">跨供应商</span>
+                          : selectedSubagentModelAvailable && subagentProviderMatch
+                            ? <span className="badge badge-muted">{subagentProviderMatch.profile.name}</span>
+                            : <span className="badge badge-warning">不可用</span>
+                      )
+                    : <span className="badge badge-muted">继承</span>}
+                </label>
+                <ModelPicker
+                  value={form.model || ''}
+                  models={modelSuggestions}
+                  onChange={model => setForm({ ...form, model })}
+                  allowEmpty
+                  placeholder="留空继承主模型"
+                />
               </div>
             </div>
 

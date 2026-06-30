@@ -21,6 +21,7 @@ function runTsx(label, code, env = {}) {
 runTsx('composeSrcdoc', `
   import assert from 'node:assert/strict';
   import { composeSrcdoc, VISUAL_CSP, VISUAL_HEIGHT_SCRIPT } from './src/components/artifacts/composeSrcdoc.ts';
+  import { extractMarkdownTitle, isLikelyMarkdownMindMap, parseMarkdownMindMap } from './src/utils/markdown-mindmap.ts';
 
   const fragment = composeSrcdoc('<h1>hi</h1>', {
     '--bg': '#fff',
@@ -45,6 +46,22 @@ runTsx('composeSrcdoc', `
   assert.equal((full.match(/<body/gi) || []).length, 1);
   assert.ok(full.includes('<title>x</title><meta http-equiv="Content-Security-Policy"'));
   assert.ok(full.includes('__agentmaVisual'));
+
+  const sampleMindMap = [
+    '# Transformer 架构',
+    '## 一、网页目标与性质',
+    '### 核心目标：直观解释Transformer架构',
+    '## 二、Transformer 核心处理流程',
+    '### 1. Embedding (嵌入) - 文本预处理',
+    '#### Tokenization (分词)',
+    '##### 作用：将句子拆分为Token',
+  ].join('\\n');
+  const tree = parseMarkdownMindMap(sampleMindMap, 'fallback');
+  assert.equal(tree.root.title, 'Transformer 架构');
+  assert.equal(tree.headingCount, 7);
+  assert.equal(tree.root.children[1].children[0].children[0].children[0].title, '作用：将句子拆分为Token');
+  assert.equal(isLikelyMarkdownMindMap(sampleMindMap), true);
+  assert.equal(extractMarkdownTitle(sampleMindMap), 'Transformer 架构');
 `);
 
 const frameSource = fs.readFileSync(path.join(root, 'src/components/artifacts/VisualFrame.tsx'), 'utf8');
@@ -59,6 +76,8 @@ const vizPreviewSource = fs.readFileSync(path.join(root, 'src/pages/VizPreview.t
 assert.ok(vizPreviewSource.includes('requestFullscreen'));
 assert.ok(vizPreviewSource.includes('fullscreenchange'));
 assert.ok(vizPreviewSource.includes('visual-fullscreen-btn'));
+assert.ok(vizPreviewSource.includes('MarkdownMindMap'));
+assert.ok(vizPreviewSource.includes('visual-mode-toggle'));
 
 const layoutSource = fs.readFileSync(path.join(root, 'src/components/Layout.tsx'), 'utf8');
 assert.ok(layoutSource.includes("location.pathname === '/viz'"));
@@ -69,9 +88,12 @@ assert.ok(cssSource.includes('.visual-preview-main .console-topbar'));
 assert.ok(cssSource.includes('max-width: none'));
 assert.ok(cssSource.includes('.visual-page:fullscreen'));
 assert.ok(cssSource.includes('--visual-frame-min-height'));
+assert.ok(cssSource.includes('.mindmap-canvas'));
+assert.ok(cssSource.includes('.markdown-reader'));
 
 const agentTemplateSource = fs.readFileSync(path.join(root, 'src/utils/agent-templates.ts'), 'utf8');
-assert.ok(agentTemplateSource.includes('agentma-visual-quality-v4'));
+assert.ok(agentTemplateSource.includes('agentma-visual-quality-v5'));
+assert.ok(agentTemplateSource.includes('./viz/<slug>.md'));
 assert.ok(agentTemplateSource.includes('外层全屏都不得重算或重置 scale'));
 assert.ok(agentTemplateSource.includes('只能在首次渲染和用户明确点击'));
 assert.ok(agentTemplateSource.includes('默认折叠态必须只显示中心主题和一级分支'));
@@ -111,6 +133,14 @@ try {
     assert.ok((updatedRow?.html || '').includes('<h1>new</h1>'));
     assert.equal(deleteVisual(tenantId, ownerSub, created.id), true);
     assert.equal(getVisual(tenantId, ownerSub, created.id), null);
+
+    const markdown = createVisual(tenantId, ownerSub, {
+      title: 'Smoke MindMap',
+      html: '# Smoke MindMap\\n\\n## Branch\\n### Leaf',
+      sourceSlug: 'viz/smoke.md',
+    });
+    assert.equal(getVisual(tenantId, ownerSub, markdown.id)?.sourceSlug, 'viz/smoke.md');
+    assert.equal(deleteVisual(tenantId, ownerSub, markdown.id), true);
   `, { AGENTMA_DATA_DIR: dataDir });
 
   runTsx('workspace bootstrap', `

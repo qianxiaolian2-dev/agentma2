@@ -6,7 +6,7 @@ const CACHE_KEY_PREFIX = 'agentma_templates:';
 const DEFAULT_MODEL = '';
 const DEFAULT_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'];
 const VIZ_AGENT_ID = 'viz-agent';
-const VIZ_AGENT_PROMPT_VERSION = 'agentma-visual-quality-v4';
+const VIZ_AGENT_PROMPT_VERSION = 'agentma-visual-quality-v5';
 const VIZ_AGENT_REQUIRED_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob', 'Skill'];
 
 function getCacheKey(tenantId?: string) {
@@ -96,7 +96,15 @@ function normalizeAgentTemplate(value: unknown): AgentTemplate | null {
     enableFileCheckpointing: raw.enableFileCheckpointing === true ? true : undefined,
     useKnowledge: raw.useKnowledge === true ? true : undefined,
     knowledgeSourceIds: normalizeStringArray(raw.knowledgeSourceIds),
+    visualPreprocessDefault: raw.visualPreprocessDefault === true ? true : undefined,
+    visualPreprocessModel: typeof raw.visualPreprocessModel === 'string' && raw.visualPreprocessModel.trim()
+      ? raw.visualPreprocessModel.trim()
+      : undefined,
     seedDir: typeof raw.seedDir === 'string' && raw.seedDir.trim() ? raw.seedDir : undefined,
+    createdBy: typeof raw.createdBy === 'string' && raw.createdBy.trim() ? raw.createdBy : null,
+    publishedAt: Number(raw.publishedAt) || null,
+    archivedAt: Number(raw.archivedAt) || null,
+    deletedAt: Number(raw.deletedAt) || null,
     createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
     updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
   };
@@ -195,6 +203,7 @@ function createVizAgentSystemPrompt(existingPrompt?: string) {
     '你是 AgentMa 的可视化助手。',
     '当用户要求图表、看板、报告页、结构化表格、流程图或可视化摘要时,用 Write 工具生成自包含的 HTML 页面。',
     '把 HTML 写到当前会话 workspace 的 ./viz/<slug>.html,然后给出服务端注入的预览链接。',
+    '当用户要求思维导图/mind map 时,优先把标准 Markdown 标题层级写到 ./viz/<slug>.md;可视化页会自动提供“思维导图/MD”双视图。',
     'HTML 必须自包含,不要引用外部资源;需要交互时使用内联脚本。',
     '回复要简洁,说明临时预览未保存时可能失效,预览页可点击保存。',
   ].join('\n')).trim();
@@ -204,11 +213,13 @@ function createVizAgentSystemPrompt(existingPrompt?: string) {
   const qualityGate = [
     `[${VIZ_AGENT_PROMPT_VERSION}]`,
     '先判断可视化类型再选形态:图表、表格、看板、流程图、路线图、思维导图不要互相冒充。',
-    '用户明确要求思维导图/mind map 时,必须生成标准 mindmap:中心主题、左右分支、曲线父子连线、+/- 折叠、画布拖动/缩放、节点可拖动。',
-    '思维导图布局必须按子树高度排布,父节点居中对齐子树;横向层级步进必须大于节点宽度,禁止二级节点与父节点重叠或堆叠。',
-    '思维导图交互必须保护用户当前视口:点击 +/-、全部展开/收起、搜索自动展开、自动排版、窗口 resize、外层全屏都不得重算或重置 scale;只允许重新布局/重绘连线并保留当前 pan/zoom。',
-    '思维导图只能在首次渲染和用户明确点击“居中/适配”按钮时自动 fit;其它交互不要调用 fit/resetZoom/autoScale。',
-    '思维导图默认折叠态必须只显示中心主题和一级分支;实现时可把一级分支节点设为 collapsed,但不能隐藏一级分支本身。',
+    '用户明确要求思维导图/mind map 且内容适合层级表达时,优先生成 .md:用 #/##/###/#### 表示层级,不要额外生成复杂 HTML;交付 Markdown 思维导图预览链接。',
+    'Markdown 思维导图内容应以中心主题作为 # 一级标题;如果没有明确中心主题,用文件主题或用户问题概括一个一级标题。',
+    '只有当用户明确要求自定义交互式 HTML 思维导图时,才生成标准 HTML mindmap:中心主题、左右分支、曲线父子连线、+/- 折叠、画布拖动/缩放、节点可拖动。',
+    '自定义 HTML 思维导图布局必须按子树高度排布,父节点居中对齐子树;横向层级步进必须大于节点宽度,禁止二级节点与父节点重叠或堆叠。',
+    '自定义 HTML 思维导图交互必须保护用户当前视口:点击 +/-、全部展开/收起、搜索自动展开、自动排版、窗口 resize、外层全屏都不得重算或重置 scale;只允许重新布局/重绘连线并保留当前 pan/zoom。',
+    '自定义 HTML 思维导图只能在首次渲染和用户明确点击“居中/适配”按钮时自动 fit;其它交互不要调用 fit/resetZoom/autoScale。',
+    '自定义 HTML 思维导图默认折叠态必须只显示中心主题和一级分支;实现时可把一级分支节点设为 collapsed,但不能隐藏一级分支本身。',
     '紧凑只能减少空白,不能牺牲具体信息;节点至少保留标题和一行说明。',
     '生成可视化时不要在正文输出 HTML 或长篇过程;先用 Write 写文件,最后只给预览链接和简短说明。',
     '交付链接前尽量做 smoke:默认/全展开节点与连线数量匹配、无节点重叠、无缺坐标、截图非空且关键文本不被裁切;失败先自修。',

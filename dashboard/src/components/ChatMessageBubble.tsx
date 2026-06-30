@@ -4,10 +4,13 @@ import type { ChatAttachment, ChatMessage, ChatImageAttachment } from '../simula
 import { renderMarkdown } from '../utils/render-markdown';
 import { normalizeMessageOutcome, outcomeBadgeClass, outcomeColor, outcomeLabel } from '../simulator/run-state';
 import { extractVisualPreviewTargets, parseVisualPreviewTarget, type VisualPreviewTarget } from '../utils/visual-preview-links';
+import WaitingHint from './WaitingHint';
 
 type Props = {
   message: ChatMessage;
   onVisualPreviewLink?: (target: VisualPreviewTarget) => void;
+  /** 等待回复时显示的用户可读阶段（整理思路/调用工具…）；仅 pending 气泡使用 */
+  waitingLabel?: string;
 };
 
 function ImageGrid({ attachments }: { attachments: ChatImageAttachment[] }) {
@@ -82,7 +85,7 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function ChatMessageBubble({ message, onVisualPreviewLink }: Props) {
+function ChatMessageBubble({ message, onVisualPreviewLink, waitingLabel }: Props) {
   const isThinkingActive = message.status === 'streaming' && !!message.thinking;
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
   const isPending = message.role === 'assistant' && message.status === 'pending' && !message.content && !message.thinking;
@@ -130,6 +133,14 @@ function ChatMessageBubble({ message, onVisualPreviewLink }: Props) {
       }, 1500);
     });
   };
+
+  if (isPending) {
+    return (
+      <div className="chat-msg assistant" style={{ position: 'relative' }}>
+        <WaitingHint label={waitingLabel} />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -228,15 +239,17 @@ function areMessagePropsEqual(prev: Props, next: Props): boolean {
   const b = next.message;
 
   return (
-    a === b ||
-    (
-      a.id === b.id &&
-      a.role === b.role &&
-      a.content === b.content &&
-      a.thinking === b.thinking &&
-      a.status === b.status &&
-      a.timestamp === b.timestamp &&
-      a.attachments === b.attachments
+    prev.waitingLabel === next.waitingLabel && (
+      a === b ||
+      (
+        a.id === b.id &&
+        a.role === b.role &&
+        a.content === b.content &&
+        a.thinking === b.thinking &&
+        a.status === b.status &&
+        a.timestamp === b.timestamp &&
+        a.attachments === b.attachments
+      )
     )
   );
 }

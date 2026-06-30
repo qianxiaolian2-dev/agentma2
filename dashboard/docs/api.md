@@ -455,7 +455,7 @@ Owner 删除会话及其全部消息。
 
 ### `GET /api/agents`
 
-读取当前租户共享的 Agent 模板列表。
+读取当前用户可见的 Agent 模板列表：自己创建的个人 Agent、已发布的公共 Agent，以及管理员可见的租户内全部 Agent。未发布且不属于当前用户的 Agent 不会返回。
 
 ### `GET /api/agents/:id/claude-md`
 
@@ -463,7 +463,7 @@ Owner 删除会话及其全部消息。
 
 ### `PUT /api/agents`
 
-整段替换当前租户的 Agent 模板列表。
+保存当前用户的 Agent 模板列表。服务端按 `createdBy` 合并保存：普通用户只能修改、发布、撤回或删除自己创建的 Agent；其他用户已发布的公共 Agent 会保留但不会被本次保存改写。模板设置 `publishedAt` 后会进入公共 Agent 列表，撤回时清空 `publishedAt`。
 
 ## 11. Skills 公共目录
 

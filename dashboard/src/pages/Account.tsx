@@ -114,6 +114,7 @@ export default function Account() {
 function ProviderManager() {
   const [providers, setProviders] = useState<ProviderProfile[]>(loadProviderProfiles);
   const [draftProvider, setDraftProvider] = useState<ProviderProfile | null>(null);
+  const [showToken, setShowToken] = useState(false);
   const [saved, setSaved] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const activeProvider = draftProvider;
@@ -300,7 +301,7 @@ function ProviderManager() {
               <button className="btn btn-sm" onClick={() => updateDraftProvider('isDefault', true)} disabled={activeProvider.isDefault}>设为默认</button>
               <button className="btn btn-sm btn-danger" onClick={() => removeProvider(activeProvider.id)} disabled={providers.length <= 1}>删除</button>
               <button className="btn btn-sm btn-primary" onClick={saveDraftProvider}>保存</button>
-              <button className="btn btn-sm" onClick={() => setDraftProvider(null)}>关闭</button>
+              <button className="btn btn-sm" onClick={() => { setShowToken(false); setDraftProvider(null); }}>关闭</button>
             </div>
 
             <div className="grid-2">
@@ -315,13 +316,23 @@ function ProviderManager() {
               </div>
               <div className="form-group">
                 <label>ANTHROPIC_AUTH_TOKEN</label>
-                <input
-                  type="password"
-                  value={activeProvider.ANTHROPIC_AUTH_TOKEN}
-                  onChange={e => updateDraftProvider('ANTHROPIC_AUTH_TOKEN', e.target.value)}
-                  placeholder="sk-..."
-                  style={{ fontFamily: 'var(--font-mono)' }}
-                />
+                <div className="flex gap-2" style={{ alignItems: 'center' }}>
+                  <input
+                    type={showToken ? 'text' : 'password'}
+                    value={activeProvider.ANTHROPIC_AUTH_TOKEN}
+                    onChange={e => updateDraftProvider('ANTHROPIC_AUTH_TOKEN', e.target.value)}
+                    placeholder="sk-..."
+                    style={{ fontFamily: 'var(--font-mono)', flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => setShowToken(v => !v)}
+                    title={showToken ? '隐藏' : '显示'}
+                  >
+                    {showToken ? '隐藏' : '显示'}
+                  </button>
+                </div>
               </div>
               <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                 <label>可用模型</label>

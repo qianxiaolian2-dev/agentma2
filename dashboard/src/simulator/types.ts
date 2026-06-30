@@ -329,6 +329,7 @@ export interface ProviderProfile {
   id: string;
   name: string;
   availableModels: string[];
+  modelContextWindows?: Record<string, number>;
   enabled: boolean;
   isDefault?: boolean;
   createdAt?: number;
@@ -416,8 +417,15 @@ export interface AgentTemplate {
   // 知识库：允许 agent 只读访问租户配置的本地笔记目录
   useKnowledge?: boolean;
   knowledgeSourceIds?: string[];
+  // 视觉预处理：开启后图片先由独立视觉模型识别，再把结果交给 agent。
+  visualPreprocessDefault?: boolean;
+  visualPreprocessModel?: string;
   // 导入本地 Claude Code 项目时生成的模板级 seed 仓路径。
   seedDir?: string;
+  createdBy?: string | null;
+  publishedAt?: number | null;
+  archivedAt?: number | null;
+  deletedAt?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -436,7 +444,7 @@ export interface RegisteredTool {
   category: string;
   inputSchema: Record<string, unknown>;
   annotations?: ToolAnnotations;
-  source?: string; // 'local' | 'github'
+  source?: string; // 'local' | 'github' | 'internal'
   sourceUrl?: string;
   endpoint?: ToolEndpoint; // API 端点调用配置（handler 的实现方式之一）
   mcpServer?: string; // 所属 MCP 服务器名，SDK 调用格式: mcp__{server}__{name}
@@ -492,6 +500,13 @@ export interface ChatFileAttachment {
 
 export type ChatAttachment = ChatImageAttachment | ChatFileAttachment;
 
+export type ChatRunStats = {
+  costUsd?: number;
+  durationMs?: number;
+  inTok?: number;
+  outTok?: number;
+};
+
 export interface ChatMessage {
   id?: string;
   role: 'user' | 'assistant' | 'system';
@@ -501,6 +516,7 @@ export interface ChatMessage {
   outcome?: RunOutcome;
   outcomeDetail?: string;
   runId?: string;
+  runStats?: ChatRunStats;
   attachments?: ChatAttachment[];
   timestamp: number;
 }
@@ -526,6 +542,8 @@ export interface ChatSession {
   sdkSessionId?: string;
   sdkCwd?: string;
   sourceVisualId?: string;
+  visualPreprocessEnabled?: boolean;
+  visualPreprocessModel?: string;
   forkedFromSessionId?: string;
   forkedFromTitle?: string;
   collaborationEnabled?: boolean;
