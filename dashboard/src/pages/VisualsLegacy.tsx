@@ -7,6 +7,10 @@ type VisualListItem = {
   title?: string;
   createdAt: number;
   sizeBytes: number;
+  bundleId?: string;
+  bundleTitle?: string;
+  bundleIndex?: number;
+  bundleSize?: number;
 };
 
 type VisualsLegacyProps = {
@@ -35,6 +39,43 @@ function formatTime(value: number) {
   return value ? new Date(value).toLocaleString() : '未知';
 }
 
+type VisualBundle = {
+  key: string;
+  title: string;
+  createdAt: number;
+  items: VisualListItem[];
+};
+
+function groupVisuals(items: VisualListItem[]): VisualBundle[] {
+  const bundles = new Map<string, VisualBundle>();
+  for (const item of items) {
+    const key = item.bundleId || `single:${item.id}`;
+    const existing = bundles.get(key);
+    if (existing) {
+      existing.items.push(item);
+      if (item.createdAt > existing.createdAt) existing.createdAt = item.createdAt;
+      continue;
+    }
+    bundles.set(key, {
+      key,
+      title: item.bundleTitle || item.title || '未命名页面',
+      createdAt: item.createdAt,
+      items: [item],
+    });
+  }
+  return [...bundles.values()]
+    .map((bundle) => ({
+      ...bundle,
+      items: [...bundle.items].sort((a, b) => {
+        const aIndex = typeof a.bundleIndex === 'number' ? a.bundleIndex : Number.MAX_SAFE_INTEGER;
+        const bIndex = typeof b.bundleIndex === 'number' ? b.bundleIndex : Number.MAX_SAFE_INTEGER;
+        if (aIndex !== bIndex) return aIndex - bIndex;
+        return b.createdAt - a.createdAt;
+      }),
+    }))
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
 export default function VisualsLegacy({
   embedded = false,
 }: VisualsLegacyProps) {
@@ -42,6 +83,7 @@ export default function VisualsLegacy({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [deletingId, setDeletingId] = useState('');
+  const bundles = groupVisuals(items);
 
   const loadVisuals = useCallback(async () => {
     setLoading(true);
@@ -104,28 +146,35 @@ export default function VisualsLegacy({
           <Link className="btn btn-primary" to="/conversations?agent=viz-agent">去会话生成页面</Link>
         </div>
       ) : (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>标题</th>
-                <th>创建时间</th>
-                <th>大小</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.map((item) => (
-                <tr key={item.id}>
-                  <td>
-                    <div className="visuals-title-cell">
-                      <strong>{item.title || '未命名'}</strong>
-                      <span>{item.id}</span>
+        <div className="visuals-bundle-list">
+          {bundles.map((bundle) => (
+            <section key={bundle.key} className="visuals-bundle-card">
+              <div className="visuals-bundle-header">
+                <div className="visuals-bundle-copy">
+                  <div className="visuals-bundle-kicker">
+                    {bundle.items.length > 1 ? `一套 ${bundle.items.length} 层页面` : '单页素材'}
+                  </div>
+                  <strong>{bundle.title}</strong>
+                  <span>{formatTime(bundle.createdAt)}</span>
+                </div>
+              </div>
+              <div className="visuals-bundle-items">
+                {bundle.items.map((item) => (
+                  <article key={item.id} className="visuals-bundle-item">
+                    <div className="visuals-bundle-item-main">
+                      <div className="visuals-title-cell">
+                        <strong>
+                          {typeof item.bundleIndex === 'number'
+                            ? `第${item.bundleIndex}层 · ${item.title || '未命名'}`
+                            : (item.title || '未命名')}
+                        </strong>
+                        <span>{item.id}</span>
+                      </div>
+                      <div className="visuals-bundle-meta">
+                        <span>{formatBytes(item.sizeBytes)}</span>
+                        <span>{formatTime(item.createdAt)}</span>
+                      </div>
                     </div>
-                  </td>
-                  <td>{formatTime(item.createdAt)}</td>
-                  <td>{formatBytes(item.sizeBytes)}</td>
-                  <td>
                     <div className="visual-row-actions">
                       <Link className="btn btn-sm btn-primary" to={`/conversations?agent=viz-agent&visualId=${encodeURIComponent(item.id)}`}>
                         继续修改
@@ -140,16 +189,14 @@ export default function VisualsLegacy({
                         {deletingId === item.id ? '删除中…' : '删除'}
                       </button>
                     </div>
-                  </td>
-                </tr>
-              ))}
-              {loading && (
-                <tr>
-                  <td colSpan={4} style={{ color: 'var(--ink-muted)', textAlign: 'center', padding: '20px 0' }}>加载中…</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+                  </article>
+                ))}
+              </div>
+            </section>
+          ))}
+          {loading && (
+            <div style={{ color: 'var(--ink-muted)', textAlign: 'center', padding: '20px 0' }}>加载中…</div>
+          )}
         </div>
       )}
     </>

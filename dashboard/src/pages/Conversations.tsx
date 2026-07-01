@@ -1171,10 +1171,7 @@ export default function Conversations() {
         });
         setAttachments([]);
         setAttachmentError('');
-        setInput([
-          `基于《${visual.title?.trim() || '未命名页面'}》继续修改。`,
-          '直接告诉我这轮要改什么，比如：加时间趋势图、改成左右布局、替换主色、补一个指标卡。',
-        ].filter(Boolean).join('\n'));
+        setInput('');
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         syncConversationUrl(null);
         setSearchParams((prev) => {
@@ -2503,63 +2500,59 @@ export default function Conversations() {
 
             {/* 输入区域 */}
             <div className="conversation-composer">
-              <div className="chat-input-area" style={{ padding: 0, borderTop: 'none' }}>
-                {resumeVisualContext && (
-                  <div
-                    style={{
-                      margin: '0 0 8px',
-                      padding: '10px 12px',
-                      border: '1.5px solid var(--accent)',
-                      borderRadius: 12,
-                      background: 'var(--accent-bg)',
-                      color: 'var(--ink)',
-                    }}
-                  >
-                    <div style={{ fontWeight: 700, marginBottom: 4 }}>
-                      当前基于已保存页面继续修改：{resumeVisualContext.title}
-                    </div>
-                    <div style={{ fontSize: '.8em', color: 'var(--ink-secondary)', lineHeight: 1.6 }}>
-                      这份 HTML 会在发送时自动带给模型，不需要你重复解释“基于哪个页面改”。
-                    </div>
-                    <div className="flex gap-2" style={{ marginTop: 8, flexWrap: 'wrap' }}>
-                      <button className="btn btn-sm" type="button" onClick={() => navigate(`/viz?id=${encodeURIComponent(resumeVisualContext.visualId)}`)}>
-                        打开原页面
-                      </button>
-                      <button className="btn btn-sm" type="button" onClick={() => setResumeVisualContext(null)}>
-                        解除上下文
-                      </button>
-                    </div>
+              {resumeVisualContext && (
+                <div className="conversation-composer-context">
+                  <div className="conversation-composer-context-title">
+                    当前基于已保存页面继续修改：{resumeVisualContext.title}
                   </div>
-                )}
-                {(attachments.length > 0 || attachmentError) && (
-                  <div style={{ padding: '4px 8px' }}>
-                    {attachmentError && <div style={{ color: 'var(--danger)', fontSize: '.75em', marginBottom: 4 }}>{attachmentError}</div>}
-                    {attachments.length > 0 && (
-                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                        {attachments.map(item => (
-                          <div key={item.id} style={{ position: 'relative' }}>
-                            {item.type === 'image' ? (
-                              <img src={getChatImageSrc(item)} alt={item.name}
-                                style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)' }} />
-                            ) : (
-                              <div
-                                className="badge badge-info"
-                                title={`${item.name} · ${formatAttachmentBytes(item.size)}`}
-                                style={{ maxWidth: 220, height: 28, display: 'flex', alignItems: 'center', paddingRight: 22, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-                              >
-                                {item.name} · {formatAttachmentBytes(item.size)}
-                              </div>
-                            )}
-                            <button onClick={() => setAttachments(prev => prev.filter(a => a.id !== item.id))}
-                              style={{ position: 'absolute', top: -4, right: -4, width: 16, height: 16, borderRadius: '50%', background: 'var(--danger)', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 10, lineHeight: '16px', padding: 0 }}>
-                              ×
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                  <div className="conversation-composer-context-body">
+                    这份 HTML 会在发送时自动带给模型，不需要你重复解释“基于哪个页面改”。
                   </div>
-                )}
+                  <div className="conversation-composer-context-actions">
+                    <button className="btn btn-sm" type="button" onClick={() => navigate(`/viz?id=${encodeURIComponent(resumeVisualContext.visualId)}`)}>
+                      打开原页面
+                    </button>
+                    <button className="btn btn-sm" type="button" onClick={() => setResumeVisualContext(null)}>
+                      解除上下文
+                    </button>
+                  </div>
+                </div>
+              )}
+              {(attachments.length > 0 || attachmentError) && (
+                <div className="conversation-composer-meta">
+                  {attachmentError && <div className="conversation-composer-error">{attachmentError}</div>}
+                  {attachments.length > 0 && (
+                    <div className="conversation-composer-attachments">
+                      {attachments.map(item => (
+                        <div key={item.id} className="conversation-composer-attachment">
+                          {item.type === 'image' ? (
+                            <img
+                              src={getChatImageSrc(item)}
+                              alt={item.name}
+                              style={{ width: 48, height: 48, objectFit: 'cover', borderRadius: 4, border: '1px solid var(--border)' }}
+                            />
+                          ) : (
+                            <div
+                              className="badge badge-info"
+                              title={`${item.name} · ${formatAttachmentBytes(item.size)}`}
+                              style={{ maxWidth: 220, height: 28, display: 'flex', alignItems: 'center', paddingRight: 22, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                            >
+                              {item.name} · {formatAttachmentBytes(item.size)}
+                            </div>
+                          )}
+                          <button
+                            className="conversation-composer-attachment-remove"
+                            onClick={() => setAttachments(prev => prev.filter(a => a.id !== item.id))}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              <div className="chat-input-area conversation-composer-row" style={{ padding: 0, borderTop: 'none' }}>
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -2592,7 +2585,9 @@ export default function Conversations() {
                   onCompositionStart={() => { isInputComposingRef.current = true; }}
                   onCompositionEnd={() => { isInputComposingRef.current = false; }}
                   onPaste={handlePaste}
-                  placeholder="输入消息，Enter 发送，Shift+Enter 换行，可粘贴图片，也可上传文件"
+                  placeholder={resumeVisualContext
+                    ? `继续修改《${resumeVisualContext.title}》\n直接告诉我这轮要改什么，比如：加时间趋势图、改成左右布局、替换主色、补一个指标卡。`
+                    : '输入消息，Enter 发送，Shift+Enter 换行，可粘贴图片，也可上传文件'}
                   style={{ resize: 'none', overflowY: 'hidden', minHeight: 38, maxHeight: 200 }}
                   disabled={isStreaming || isSessionDetailLoading}
                 />

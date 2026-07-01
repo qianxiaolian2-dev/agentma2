@@ -105,6 +105,9 @@
 .visuals-page.visuals-page-embedded {
   padding: 0;
   background: transparent;
+  max-width: none;
+  width: 100%;
+  margin: 0;
 }
 
 .visuals-library-toolbar {

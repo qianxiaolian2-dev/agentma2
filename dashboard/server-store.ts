@@ -309,10 +309,14 @@ export type VisualRow = {
   html: string;
   sizeBytes: number;
   sourceSlug?: string;
+  bundleId?: string;
+  bundleTitle?: string;
+  bundleIndex?: number;
+  bundleSize?: number;
   createdAt: number;
 };
 
-export type VisualListRow = Pick<VisualRow, 'id' | 'title' | 'sizeBytes' | 'createdAt'>;
+export type VisualListRow = Pick<VisualRow, 'id' | 'title' | 'sizeBytes' | 'createdAt' | 'bundleId' | 'bundleTitle' | 'bundleIndex' | 'bundleSize'>;
 
 export type DashboardRecord = {
   id: string;
@@ -713,9 +717,14 @@ function initSchema() {
       html TEXT NOT NULL,
       size_bytes INTEGER NOT NULL,
       source_slug TEXT,
+      bundle_id TEXT,
+      bundle_title TEXT,
+      bundle_index INTEGER,
+      bundle_size INTEGER,
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_visuals_owner ON visuals (tenant_id, owner_sub, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_visuals_bundle ON visuals (tenant_id, owner_sub, bundle_id, bundle_index, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS datasources (
       id TEXT PRIMARY KEY,
@@ -814,6 +823,10 @@ function initSchema() {
   ensureColumn('knowledge_sources', 'published_at', 'INTEGER');
   ensureColumn('knowledge_sources', 'archived_at', 'INTEGER');
   ensureColumn('knowledge_sources', 'deleted_at', 'INTEGER');
+  ensureColumn('visuals', 'bundle_id', 'TEXT');
+  ensureColumn('visuals', 'bundle_title', 'TEXT');
+  ensureColumn('visuals', 'bundle_index', 'INTEGER');
+  ensureColumn('visuals', 'bundle_size', 'INTEGER');
   // Legacy knowledge sources predate per-creator ownership. Attribute them to the
   // tenant admin so the admin's agents retain write access (subject to read_only),
   // while everyone else stays read-only. Idempotent: only fills NULL rows.
@@ -2868,6 +2881,10 @@ function mapVisualRow(row: {
   html: string;
   size_bytes: number;
   source_slug: string | null;
+  bundle_id: string | null;
+  bundle_title: string | null;
+  bundle_index: number | null;
+  bundle_size: number | null;
   created_at: number;
 }): VisualRow {
   return {
@@ -2878,6 +2895,10 @@ function mapVisualRow(row: {
     html: row.html,
     sizeBytes: row.size_bytes,
     sourceSlug: row.source_slug || undefined,
+    bundleId: row.bundle_id || undefined,
+    bundleTitle: row.bundle_title || undefined,
+    bundleIndex: typeof row.bundle_index === 'number' ? row.bundle_index : undefined,
+    bundleSize: typeof row.bundle_size === 'number' ? row.bundle_size : undefined,
     createdAt: row.created_at,
   };
 }
@@ -2885,7 +2906,7 @@ function mapVisualRow(row: {
 export function createVisual(
   tenantId: string,
   ownerSub: string,
-  input: { title?: string; html: string; sourceSlug?: string },
+  input: { title?: string; html: string; sourceSlug?: string; bundleId?: string; bundleTitle?: string; bundleIndex?: number; bundleSize?: number },
 ) {
   const html = String(input.html || '');
   const sizeBytes = Buffer.byteLength(html);
@@ -2896,10 +2917,14 @@ export function createVisual(
   const createdAt = now();
   const title = typeof input.title === 'string' && input.title.trim() ? input.title.trim() : null;
   const sourceSlug = typeof input.sourceSlug === 'string' && input.sourceSlug.trim() ? input.sourceSlug.trim() : null;
+  const bundleId = typeof input.bundleId === 'string' && input.bundleId.trim() ? input.bundleId.trim() : null;
+  const bundleTitle = typeof input.bundleTitle === 'string' && input.bundleTitle.trim() ? input.bundleTitle.trim() : null;
+  const bundleIndex = Number.isInteger(input.bundleIndex) ? Number(input.bundleIndex) : null;
+  const bundleSize = Number.isInteger(input.bundleSize) ? Number(input.bundleSize) : null;
   db.prepare(`
-    INSERT INTO visuals (id, tenant_id, owner_sub, title, html, size_bytes, source_slug, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, tenantId, ownerSub, title, html, sizeBytes, sourceSlug, createdAt);
+    INSERT INTO visuals (id, tenant_id, owner_sub, title, html, size_bytes, source_slug, bundle_id, bundle_title, bundle_index, bundle_size, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, tenantId, ownerSub, title, html, sizeBytes, sourceSlug, bundleId, bundleTitle, bundleIndex, bundleSize, createdAt);
   return { id };
 }
 
@@ -2907,7 +2932,7 @@ export function updateVisual(
   tenantId: string,
   ownerSub: string,
   id: string,
-  input: { title?: string; html: string; sourceSlug?: string },
+  input: { title?: string; html: string; sourceSlug?: string; bundleId?: string; bundleTitle?: string; bundleIndex?: number; bundleSize?: number },
 ) {
   const html = String(input.html || '');
   const sizeBytes = Buffer.byteLength(html);
@@ -2918,17 +2943,21 @@ export function updateVisual(
   if (!current) return null;
   const title = typeof input.title === 'string' && input.title.trim() ? input.title.trim() : null;
   const sourceSlug = typeof input.sourceSlug === 'string' && input.sourceSlug.trim() ? input.sourceSlug.trim() : null;
+  const bundleId = typeof input.bundleId === 'string' && input.bundleId.trim() ? input.bundleId.trim() : null;
+  const bundleTitle = typeof input.bundleTitle === 'string' && input.bundleTitle.trim() ? input.bundleTitle.trim() : null;
+  const bundleIndex = Number.isInteger(input.bundleIndex) ? Number(input.bundleIndex) : null;
+  const bundleSize = Number.isInteger(input.bundleSize) ? Number(input.bundleSize) : null;
   db.prepare(`
     UPDATE visuals
-    SET title = ?, html = ?, size_bytes = ?, source_slug = ?
+    SET title = ?, html = ?, size_bytes = ?, source_slug = ?, bundle_id = ?, bundle_title = ?, bundle_index = ?, bundle_size = ?
     WHERE tenant_id = ? AND owner_sub = ? AND id = ?
-  `).run(title, html, sizeBytes, sourceSlug, tenantId, ownerSub, id);
+  `).run(title, html, sizeBytes, sourceSlug, bundleId, bundleTitle, bundleIndex, bundleSize, tenantId, ownerSub, id);
   return { id };
 }
 
 export function getVisual(tenantId: string, ownerSub: string, id: string) {
   const row = db.prepare(`
-    SELECT id, tenant_id, owner_sub, title, html, size_bytes, source_slug, created_at
+    SELECT id, tenant_id, owner_sub, title, html, size_bytes, source_slug, bundle_id, bundle_title, bundle_index, bundle_size, created_at
     FROM visuals
     WHERE tenant_id = ? AND owner_sub = ? AND id = ?
   `).get(tenantId, ownerSub, id) as {
@@ -2939,6 +2968,10 @@ export function getVisual(tenantId: string, ownerSub: string, id: string) {
     html: string;
     size_bytes: number;
     source_slug: string | null;
+    bundle_id: string | null;
+    bundle_title: string | null;
+    bundle_index: number | null;
+    bundle_size: number | null;
     created_at: number;
   } | undefined;
   return row ? mapVisualRow(row) : null;
@@ -2946,22 +2979,44 @@ export function getVisual(tenantId: string, ownerSub: string, id: string) {
 
 export function listVisuals(tenantId: string, ownerSub: string): VisualListRow[] {
   const rows = db.prepare(`
-    SELECT id, title, size_bytes, created_at
+    SELECT id, title, size_bytes, bundle_id, bundle_title, bundle_index, bundle_size, created_at
     FROM visuals
     WHERE tenant_id = ? AND owner_sub = ?
-    ORDER BY created_at DESC
+    ORDER BY created_at DESC, COALESCE(bundle_index, 0) ASC
   `).all(tenantId, ownerSub) as Array<{
     id: string;
     title: string | null;
     size_bytes: number;
+    bundle_id: string | null;
+    bundle_title: string | null;
+    bundle_index: number | null;
+    bundle_size: number | null;
     created_at: number;
   }>;
   return rows.map((row) => ({
     id: row.id,
     title: row.title || undefined,
     sizeBytes: row.size_bytes,
+    bundleId: row.bundle_id || undefined,
+    bundleTitle: row.bundle_title || undefined,
+    bundleIndex: typeof row.bundle_index === 'number' ? row.bundle_index : undefined,
+    bundleSize: typeof row.bundle_size === 'number' ? row.bundle_size : undefined,
     createdAt: row.created_at,
   }));
+}
+
+export function findVisualByBundleSource(tenantId: string, ownerSub: string, bundleId: string, sourceSlug: string) {
+  const normalizedBundleId = String(bundleId || '').trim();
+  const normalizedSourceSlug = String(sourceSlug || '').trim();
+  if (!normalizedBundleId || !normalizedSourceSlug) return null;
+  const row = db.prepare(`
+    SELECT id
+    FROM visuals
+    WHERE tenant_id = ? AND owner_sub = ? AND bundle_id = ? AND source_slug = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(tenantId, ownerSub, normalizedBundleId, normalizedSourceSlug) as { id: string } | undefined;
+  return row ? { id: row.id } : null;
 }
 
 export function deleteVisual(tenantId: string, ownerSub: string, id: string) {

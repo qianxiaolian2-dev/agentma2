@@ -14,6 +14,10 @@ export type VisualListItem = {
   title?: string;
   createdAt: number;
   sizeBytes: number;
+  bundleId?: string;
+  bundleTitle?: string;
+  bundleIndex?: number;
+  bundleSize?: number;
 };
 
 export type VisualPayload = {

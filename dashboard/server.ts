@@ -25,6 +25,7 @@ import {
   deleteUser,
   deleteChatSession,
   deleteVisual,
+  findVisualByBundleSource,
   forkChatSession,
   getDataLocation,
   getDatasource,
@@ -705,6 +706,66 @@ function visualFormatFromPath(relPath: string): 'html' | 'markdown' {
 
 function extractVisualTitle(content: string, format: 'html' | 'markdown', relPath?: string) {
   return format === 'markdown' ? extractMarkdownTitle(content, relPath) : extractTitle(content);
+}
+
+type VisualBundleItem = {
+  path: string;
+  title?: string;
+  html: string;
+  sourceSlug: string;
+  bundleIndex: number;
+};
+
+function extractVisualLinksFromText(content: string) {
+  const regex = /(?:https?:\/\/[^\s<>"'`)]*)?\/viz\?([^\s<>"'`)]+)/g;
+  const paths: string[] = [];
+  for (const match of content.matchAll(regex)) {
+    const params = new URLSearchParams(match[1]);
+    const pathValue = String(params.get('path') || '').trim();
+    if (!/^viz\/[A-Za-z0-9._-]+\.(html|md|markdown)$/i.test(pathValue)) continue;
+    if (!paths.includes(pathValue)) paths.push(pathValue);
+  }
+  return paths;
+}
+
+function listVisualBundleItems(auth: any, cid: string, relPath: string): VisualBundleItem[] {
+  const sessionId = parseConversationIdInput(cid);
+  if (!sessionId) return [];
+  const session = getChatSession(auth.tenantId, getChatOwnerSub(auth), sessionId);
+  if (!session) return [];
+  const sdkCwd = typeof session.sdkCwd === 'string' ? session.sdkCwd.trim() : '';
+  if (!sdkCwd) return [];
+
+  const assistantMessage = [...session.messages].reverse().find((message: any) => (
+    message?.role === 'assistant'
+    && typeof message?.content === 'string'
+    && extractVisualLinksFromText(message.content).includes(relPath)
+  ));
+  if (!assistantMessage?.content) return [];
+
+  const cwdInput = path.resolve(expandLocalPath(sdkCwd));
+  if (!fs.existsSync(cwdInput)) return [];
+  const cwd = fs.realpathSync(cwdInput);
+
+  return extractVisualLinksFromText(String(assistantMessage.content || ''))
+    .map((pathValue, index) => {
+      const file = path.resolve(cwd, pathValue);
+      if (!isPathInside(file, cwd) || !fs.existsSync(file)) return null;
+      const realFile = fs.realpathSync(file);
+      if (!isPathInside(realFile, cwd)) return null;
+      const stat = fs.statSync(realFile);
+      if (!stat.isFile() || stat.size > MAX_VISUAL_BYTES) return null;
+      const html = fs.readFileSync(realFile, 'utf8');
+      const format = visualFormatFromPath(pathValue);
+      return {
+        path: pathValue,
+        title: extractVisualTitle(html, format, pathValue),
+        html,
+        sourceSlug: pathValue,
+        bundleIndex: index + 1,
+      } satisfies VisualBundleItem;
+    })
+    .filter((item): item is VisualBundleItem => Boolean(item));
 }
 
 function readWorkspaceVisual(auth: any, cid: string, relPath: string) {
@@ -3690,9 +3751,49 @@ app.post('/api/visuals', authMiddleware, (req: any, res) => {
       html,
       sourceSlug,
     };
+    const existingSourceVisual = sourceVisualId
+      ? getVisual(req.auth.tenantId, getChatOwnerSub(req.auth), sourceVisualId)
+      : null;
+    const bundleItems = listVisualBundleItems(req.auth, cid, relPath);
+    const activeBundleSize = bundleItems.length > 1 ? bundleItems.length : undefined;
+    const activeBundleIndex = bundleItems.findIndex((item) => item.path === relPath);
+    const bundleId = activeBundleSize
+      ? (existingSourceVisual?.bundleId || sourceVisualId || crypto.randomUUID())
+      : undefined;
+    const bundleTitle = activeBundleSize
+      ? (existingSourceVisual?.bundleTitle || payload.title)
+      : undefined;
+    const payloadWithBundle = {
+      ...payload,
+      bundleId,
+      bundleTitle,
+      bundleIndex: activeBundleSize ? (activeBundleIndex >= 0 ? activeBundleIndex + 1 : 1) : undefined,
+      bundleSize: activeBundleSize,
+    };
     const result = sourceVisualId
-      ? updateVisual(req.auth.tenantId, getChatOwnerSub(req.auth), sourceVisualId, payload) || createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), payload)
-      : createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), payload);
+      ? updateVisual(req.auth.tenantId, getChatOwnerSub(req.auth), sourceVisualId, payloadWithBundle) || createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), payloadWithBundle)
+      : createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), payloadWithBundle);
+
+    if (bundleItems.length > 1 && bundleId) {
+      for (const item of bundleItems) {
+        if (item.path === relPath) continue;
+        const siblingPayload = {
+          title: item.title,
+          html: item.html,
+          sourceSlug: item.sourceSlug,
+          bundleId,
+          bundleTitle,
+          bundleIndex: item.bundleIndex,
+          bundleSize: bundleItems.length,
+        };
+        const existingSibling = findVisualByBundleSource(req.auth.tenantId, getChatOwnerSub(req.auth), bundleId, item.sourceSlug);
+        if (existingSibling) {
+          updateVisual(req.auth.tenantId, getChatOwnerSub(req.auth), existingSibling.id, siblingPayload);
+        } else {
+          createVisual(req.auth.tenantId, getChatOwnerSub(req.auth), siblingPayload);
+        }
+      }
+    }
     res.json(result);
   } catch (error) {
     const err = error as Error & { status?: number };

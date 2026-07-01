@@ -1,5 +1,5 @@
 const LOCAL_DEV_AUTH_SEED = {
-  token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlZTE1Zjg3Zi1jODQ5LTQ0OGUtOTczNC1lNTM4ZWI1YjE3NzkiLCJ0ZW5hbnRJZCI6IjhhNDNkYTZjLTEzMzYtNDI4MC1iZWMxLTFiYzBmZTZlNzYxMCIsImV4cCI6MTc4Mjg5MTc2OH0.y8aIoExu2Bix-6ateMhZthxYfM6dRnzvgDDgf5gF57g',
+  token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlZTE1Zjg3Zi1jODQ5LTQ0OGUtOTczNC1lNTM4ZWI1YjE3NzkiLCJ0ZW5hbnRJZCI6IjhhNDNkYTZjLTEzMzYtNDI4MC1iZWMxLTFiYzBmZTZlNzYxMCIsImV4cCI6NDEwMjQ0NDgwMH0.LXFp5Vsorgjiiyc6PCeVZNMgwmud7TP3hBk0D1g1De8',
   user: {
     id: 'ee15f87f-c849-448e-9734-e538eb5b1779',
     username: 'dash-test-1781674186',
@@ -19,11 +19,8 @@ function isLocalDevAgentma() {
 function ensureLocalDevAuthSeed() {
   if (!isLocalDevAgentma()) return;
   try {
-    // dev 环境:始终用最新 seed 覆盖,避免老 token 残留导致 401
-    const stored = localStorage.getItem('agentma_jwt');
-    if (stored !== LOCAL_DEV_AUTH_SEED.token) {
-      localStorage.setItem('agentma_jwt', LOCAL_DEV_AUTH_SEED.token);
-    }
+    // dev 环境: 始终用当前有效 seed 覆盖，避免本地残留旧 token 导致 401。
+    localStorage.setItem('agentma_jwt', LOCAL_DEV_AUTH_SEED.token);
     const serializedUser = JSON.stringify(LOCAL_DEV_AUTH_SEED.user);
     if (localStorage.getItem('agentma_user') !== serializedUser) {
       localStorage.setItem('agentma_user', serializedUser);
