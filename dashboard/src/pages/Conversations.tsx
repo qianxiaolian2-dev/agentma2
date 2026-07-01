@@ -357,6 +357,7 @@ export default function Conversations() {
   const observingRunIdRef = useRef('');
   const activeItemRef = useRef<HTMLDivElement>(null);
   const visualPreviewLoadSeqRef = useRef(0);
+  const autoSyncedPreviewKeyRef = useRef<string>('');
   const provider = useRef<ProviderConfig>(resolveProviderForModel().provider);
   const currentAgent = templates.find(t => t.id === selectedAgentId);
   const activeSession = activeSessionId ? sessions.find(s => s.id === activeSessionId) || null : null;
@@ -1209,16 +1210,19 @@ export default function Conversations() {
   }, [requestedVisualId]);
 
   useEffect(() => {
-    if (isStreaming || !latestPreviewTarget) return;
+    if (isStreaming) return;
+    if (!latestPreviewTarget) {
+      autoSyncedPreviewKeyRef.current = '';
+      return;
+    }
+    // 仅当"最新产物 key"本身变化时自动同步一次，
+    // 避免用户手动点击其它层 → activeVisualPreview 变化 → effect 重跑 → 又被拉回 latest。
+    if (autoSyncedPreviewKeyRef.current === latestPreviewTarget.key) return;
+    autoSyncedPreviewKeyRef.current = latestPreviewTarget.key;
     if (activeVisualPreview?.target.key === latestPreviewTarget.key && activeVisualPreview.status !== 'error') return;
     void loadVisualPreview(latestPreviewTarget);
-  }, [
-    activeVisualPreview?.status,
-    activeVisualPreview?.target.key,
-    isStreaming,
-    latestPreviewTarget,
-    loadVisualPreview,
-  ]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isStreaming, latestPreviewTarget, loadVisualPreview]);
 
   const updateScrollBottomVisibility = useCallback(() => {
     const el = messagesRef.current;
