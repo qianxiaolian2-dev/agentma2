@@ -240,7 +240,7 @@ function createVizAgentTemplate(model: string): AgentTemplate {
     subagents: {},
     mcpServers: [],
     eventSources: [],
-    skills: [],
+    skills: ['agentma-visual'],
     effort: 'high',
     maxTurns: 50,
     permissionMode: 'default',
@@ -252,7 +252,7 @@ function createVizAgentTemplate(model: string): AgentTemplate {
 
 function upgradeVizAgentTemplate(template: AgentTemplate): AgentTemplate {
   const systemPrompt = createVizAgentSystemPrompt(template.systemPrompt);
-  const skills: string[] = [];  // 不再依赖 agentma-visual skill
+  const skills = mergeStringArrays(template.skills, ['agentma-visual']);
   const tools = mergeStringArrays(template.tools, VIZ_AGENT_REQUIRED_TOOLS);
 
   if (

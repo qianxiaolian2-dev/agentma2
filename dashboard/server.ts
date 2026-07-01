@@ -1682,14 +1682,12 @@ app.post('/api/chat', authMiddleware, async (req: any, res) => {
     res.status(400).json({ error: 'need prompt or messages' }); return;
   }
   if (sessionId) {
-    const visualPreviewPath = `/viz?cid=${encodeURIComponent(sessionId)}&path=viz/<slug>.html${sourceVisualId ? `&sourceVisualId=${encodeURIComponent(sourceVisualId)}` : ''}`;
+    // 只注入预览基址；如何生成可视化、怎么给链接、CSP/主题约定都在 agentma-visual skill 的 SKILL.md 里。
+    // sourceVisualId 注入支持覆盖保存链路：素材库"继续修改"流程下，预览页点保存能识别原 visual 并覆盖而非新建。
+    const visualPreviewBase = `/viz?cid=${encodeURIComponent(sessionId)}&path=${sourceVisualId ? `&sourceVisualId=${encodeURIComponent(sourceVisualId)}` : ''}`;
     effectiveSystemPrompt = [
       effectiveSystemPrompt,
-      [
-        '[可视化预览] 生成可视化页面时，用 Write 工具把 HTML 写到 ./viz/<slug>.html（<slug> 替换为英文短横线连接的页面描述），',
-        `然后给用户这个 markdown 链接: [右侧预览](${visualPreviewPath})（把 <slug> 替换成你实际写的文件名）`,
-        '会话页会自动在右侧打开这个 HTML 预览；独立预览页仍会显示"保存"按钮，用户点击即可保存到素材库。',
-      ].join('\n'),
+      `[可视化预览基址] ${visualPreviewBase}（生成可视化时按 agentma-visual skill 的约定，把 HTML 写到 ./viz/<slug>.html，然后用此基址拼上 viz/<slug>.html 作为 markdown 链接给用户）`,
     ].filter(Boolean).join('\n\n');
   }
   const selectedModel = [
